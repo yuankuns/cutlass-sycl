@@ -8,7 +8,7 @@ def is_close(refe: torch.Tensor,
     test = test.to(torch.float32)
     refe = refe.to(torch.float32)
     cosfactor = F.cosine_similarity(test.reshape(-1), refe.reshape(-1), dim=0) > 0.99
-    allclose = torch.allclose(test, refe, atol=2e-2, rtol=2e-2)
+    allclose = torch.allclose(test, refe, atol=1e-3, rtol=1e-3)
     return cosfactor or allclose
 
 def num_head_bcast(query: torch.Tensor,
@@ -78,6 +78,15 @@ def dropout_backward2(grad_y: torch.Tensor,
                       dropout_p: float):
     return dropout_backward(mask, grad_y, dropout_p)
 
+def dropout_forward(seed: int,
+                    dropout_p: float,
+                    x: torch.Tensor):
+    torch.manual_seed(seed)
+    mask = torch.empty_like(x).fill_(1 - dropout_p)
+    prob = torch.bernoulli(mask)
+    y = x * prob / (1 - dropout_p)
+    return y
+
 def softmax_causal_backward(y1: torch.Tensor,
                             y2: torch.Tensor,
                             grad_y: torch.Tensor):
@@ -120,8 +129,8 @@ class SDPA(nn.Module):
         self.v = v.clone()
         seq_len_q, seq_len_k = q.size(-2), k.size(-2)
         attn_bias = torch.zeros(seq_len_q, seq_len_k, dtype=dtype)
+        self.is_causal = is_causal
         if is_causal:
-            self.is_causal = True
             temp_mask = torch.ones(seq_len_q, seq_len_k, dtype=torch.bool).tril(diagonal=0)
             attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
             attn_bias.to(dtype)
@@ -132,28 +141,31 @@ class SDPA(nn.Module):
         # k_expand.register_hook(lambda x: dump_grad('k_expand_grad', k_expand))
         # v_expand.register_hook(lambda x: dump_grad('v_expand_grad', v_expand))
         #self.p = q@k_expand.transpose(-2, -1)
-        self.s = torch.matmul(q, k_expand.transpose(-1, -2))
-        self.s.register_hook(lambda x: dump_grad('s_grad', x))
-        softmax_scale = 1 / np.sqrt(self.head_size_q) if scale is None else scale
-        self.s2 = self.s * softmax_scale
-        self.s2.register_hook(lambda x: dump_grad('s2_grad', x))
-        self.s3 = self.s2 + attn_bias
-        self.s3.register_hook(lambda x: dump_grad('s3_grad', x))
+        s = torch.matmul(q, k_expand.transpose(-1, -2))
+        s.register_hook(lambda x: dump_grad('s_grad', x))
+        self.softmax_scale = 1 / np.sqrt(self.head_size_q) if scale is None else scale
+        s2 = s * self.softmax_scale
+        s2.register_hook(lambda x: dump_grad('s2_grad', x))
+        s3 = s2 + attn_bias
+        s3.register_hook(lambda x: dump_grad('s3_grad', x))
         # self.p3 = self.p2 + attn_bias
         # self.p3.register_hook(lambda x: dump_grad('p3_grad', x))
-        self.p = torch.softmax(self.s3, dim= -1).to(dtype)
-        dump_grad('p', self.p)
+        s3_fp32 = s3.to(torch.float32)
+        self.lse = torch.logsumexp(s3_fp32, dim=-1, keepdim=True)
+        p = torch.softmax(s3, dim= -1).to(dtype)
+        pp = torch.exp(s3_fp32 - self.lse)
+        dump_grad('p', p)
 
         if dropout_p > 0.0:
-            self.p.register_hook(lambda x: dump_grad('p2_grad', x))
-            self.p2 = self.do_m(self.p)
+            p.register_hook(lambda x: dump_grad('p2_grad', x))
+            self.p2 = self.do_m(p)
             dump_grad('p2', self.p2)
             self.dropout_p = dropout_p
             self.p2.register_hook(lambda x: dump_grad('p_grad', x))
             attn = torch.matmul(self.p2, v_expand)
         else:
-            self.p.register_hook(lambda x: dump_grad('p_grad', x))
-            attn = torch.matmul(self.p, v_expand)
+            p.register_hook(lambda x: dump_grad('p_grad', x))
+            attn = torch.matmul(p, v_expand)
         # attn = self.attn@v_expand
         attn.register_hook(lambda x: dump_grad('O_grad', x))
         return attn
@@ -164,16 +176,29 @@ class SDPA(nn.Module):
         k_grad = torch.empty_like(self.k)
         v_grad = torch.empty_like(self.v)
         k_expand, v_expand = num_head_bcast(self.q, self.k, self.v)
+        # forward
+        s = torch.matmul(self.q, k_expand.transpose(-1, -2))
+        dtype = self.q.dtype
+        seq_len_q, seq_len_k = q_grad.size(-2), k_grad.size(-2)
+        attn_bias = torch.zeros(seq_len_q, seq_len_k, dtype=dtype)
+        if self.is_causal:
+            temp_mask = torch.ones(seq_len_q, seq_len_k, dtype=torch.bool).tril(diagonal=0)
+            attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+            attn_bias.to(dtype)
+        s = s * self.softmax_scale + attn_bias
+        p = torch.exp(s.to(torch.float32) - self.lse).to(dtype)
+
+        # backward
         if hasattr(self, 'dropout_p'):
             v_grad = torch.matmul(self.p2.transpose(-1, -2), o_grad)
         else:
-            v_grad = torch.matmul(self.p.transpose(-1, -2), o_grad)
+            v_grad = torch.matmul(p.transpose(-1, -2), o_grad)
 
         p_grad = torch.matmul(o_grad, v_expand.transpose(-1, -2))
         if hasattr(self, 'dropout_p'):
-            s2_grad = softmax_causal_backward(self.p2, self.p, p_grad)
+            s2_grad = softmax_causal_backward(self.p2, p, p_grad)
         else:
-            s2_grad = softmax_backward(self.p, p_grad)
+            s2_grad = softmax_backward(p, p_grad)
         s_grad = s2_grad / np.sqrt(self.head_size_q)
         k_grad = torch.matmul(s_grad.transpose(-1, -2), self.q)
         q_grad = torch.matmul(s_grad, k_expand)
