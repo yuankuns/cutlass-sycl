@@ -8,7 +8,7 @@ def is_close(refe: torch.Tensor,
     test = test.to(torch.float32)
     refe = refe.to(torch.float32)
     cosfactor = F.cosine_similarity(test.reshape(-1), refe.reshape(-1), dim=0) > 0.99
-    allclose = torch.allclose(test, refe, atol=8e-3, rtol=8e-3)
+    allclose = torch.allclose(test, refe, atol=3e-3, rtol=3e-3)
     return cosfactor and allclose
 
 def num_head_bcast(query: torch.Tensor,
@@ -69,6 +69,22 @@ def softmax_backward(y: torch.Tensor,
     grad_x2 = ydy - y * sum_row
     grad_x = grad_x2.reshape(*rest_dim, dim) * scale
     return grad_x.to(orig_dtype)
+
+def softmax_backward_odo(p: torch.Tensor,
+                         dp: torch.Tensor,
+                         o: torch.Tensor,
+                         do: torch.Tensor,
+                         scale: float):
+    orig_dtype = p.dtype
+    o = o.to(torch.float32)
+    do = do.to(torch.float32)
+    p = p.to(torch.float32)
+    dp = dp.to(torch.float32)
+    odo = o * do
+    sum_odo = torch.sum(odo, dim= -1, keepdim=True)
+    ds = p * (dp - sum_odo) * scale
+    ds = ds.to(orig_dtype)
+    return ds
 
 def dropout_backward(mask: torch.Tensor,
                      grad_y: torch.Tensor,
@@ -147,16 +163,15 @@ class SDPA(nn.Module):
         s.register_hook(lambda x: dump_grad('s_grad', x))
         s = s.to(torch.float32)
         self.softmax_scale = 1 / np.sqrt(self.head_size_q) if scale is None else scale
-        s2 = s * self.softmax_scale
-        s3 = s2 + attn_bias
-        self.lse = torch.logsumexp(s3, dim=-1, keepdim=True)
-        p = torch.softmax(s3, dim= -1).to(dtype)
-        dump_grad('p', p)
-
+        s = s * self.softmax_scale + attn_bias
+        sum_row, _ = torch.max(s, dim= -1, keepdim=True)
+        s = s - sum_row
+        self.lse = torch.logsumexp(s, dim=-1, keepdim=True) + sum_row
+        p = torch.softmax(s, dim= -1).to(dtype)
         p.register_hook(lambda x: dump_grad('p_grad', x))
         attn = torch.matmul(p, v_expand)
-        # attn = self.attn@v_expand
         attn.register_hook(lambda x: dump_grad('O_grad', x))
+        self.o = attn
         return attn
 
     def backward_ref(self,
@@ -175,14 +190,14 @@ class SDPA(nn.Module):
             temp_mask = torch.ones(seq_len_q, seq_len_k, dtype=torch.bool).tril(diagonal=0)
             attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
             attn_bias.to(dtype)
-        s = s * self.softmax_scale
-        s = s + attn_bias
+        s = s * self.softmax_scale + attn_bias
         p = torch.exp(s - self.lse).to(dtype)
         # backward
         v_grad = torch.matmul(p.transpose(-1, -2), o_grad)
 
         p_grad = torch.matmul(o_grad, v_expand.transpose(-1, -2))
-        s_grad = softmax_backward(p, p_grad, self.softmax_scale)
+        s_grad = softmax_backward_odo(p, p_grad, self.o, o_grad, self.softmax_scale)
+        # s_grad = softmax_backward(p, p_grad, self.softmax_scale)
         k_grad = torch.matmul(s_grad.transpose(-1, -2), self.q)
         q_grad = torch.matmul(s_grad, k_expand)
         k_grad = num_head_reduce(k_grad, self.k)
@@ -234,6 +249,9 @@ def test_sdpa(dtype,
     q2 = q.clone()
     k2 = k.clone()
     v2 = v.clone()
+    q.retain_grad()
+    k.retain_grad()
+    v.retain_grad()
     q2.retain_grad()
     k2.retain_grad()
     v2.retain_grad()
@@ -255,7 +273,7 @@ def test_sdpa(dtype,
     print(f"seed {seed} bsz {batch} nh_q {num_heads_q} nh_kv {num_heads_kv} sl_qo {seq_len_qo} sl_kv {seq_len_kv} hs_qk {head_size_qk} hs_vo {head_size_vo} dp {dropout_p} is_causal {is_causal}")
     set_dict(dump_dict, 'grad', grad)
     set_dict(dump_dict, 'v_grad', v_grad)
-    set_dict(dump_dict, 'p', GRAD_DICT['p'])
+    set_dict(dump_dict, 'lse', test_model.lse)
     set_dict(dump_dict, 'p_grad', p_grad)
     set_dict(dump_dict, 's_grad', s_grad)
     set_dict(dump_dict, 'k_grad', k_grad)
@@ -290,13 +308,17 @@ def loop_run():
 if __name__ == '__main__':
     # test_sdpa(torch.bfloat16, 123, 128, 4, 4, 900, 900, 128, 128)
     # loop_run()
-    test_sdpa(torch.bfloat16, 123, 4, 4, 4, 512, 512, 128, 64, is_causal=True)
+    test_sdpa(torch.float16, 123, 4, 4, 4, 512, 768, 128, 128, is_causal=True)
     GRAD_DICT = {}
-    test_sdpa(torch.bfloat16, 123, 4, 4, 2, 512, 512, 128, 64, is_causal=True)
+    test_sdpa(torch.float16, 123, 4, 4, 4, 512, 768, 128, 128, is_causal=False)
     GRAD_DICT = {}
-    test_sdpa(torch.bfloat16, 123, 4, 4, 4, 512, 512, 128, 64, is_causal=False)
+    test_sdpa(torch.float16, 123, 4, 4, 2, 512, 768, 128, 128, is_causal=False)
     GRAD_DICT = {}
-    test_sdpa(torch.bfloat16, 123, 4, 4, 2, 512, 512, 128, 64, is_causal=False)
+    test_sdpa(torch.float16, 123, 4, 4, 2, 512, 768, 128, 128, is_causal=True)
+    GRAD_DICT = {}
+    test_sdpa(torch.float16, 123, 4, 4, 1, 512, 768, 128, 128, is_causal=False)
+    GRAD_DICT = {}
+    test_sdpa(torch.float16, 123, 4, 4, 1, 512, 768, 128, 128, is_causal=True)
     GRAD_DICT = {}
     # test_sdpa(torch.bfloat16, 123, 4, 4, 2, 512, 512, 128, 64, is_causal=True)
     # GRAD_DICT = {}
