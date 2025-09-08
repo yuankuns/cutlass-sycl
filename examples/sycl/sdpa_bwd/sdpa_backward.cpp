@@ -10,8 +10,8 @@
 #include "cutlass/util/GPU_Clock.hpp"
 #include "cnpy.h"
 #include "sdpa_util.hpp"
+#include "params.hpp"
 
-using namespace cute;
 
 void read_args(int argc, char**argv, int n, int64_t *p) {
     if (argc >= n + 1)
@@ -32,13 +32,14 @@ void print_t(T t) {
     print(t);
     for (int i = 0; i < size(t); ++i) {
         if (i % 8 == 0)
-            print("\n");
+            print("\n(%03d): ", i / 8);
         print("%10.7f ", (float)t(i));
     }
     print("\n");
 }
 
 using ProblemShapeRegular = cute::tuple<int, int, int, int, int, int, int>; // batch, num_head_q,num_head_kv,seq_len_qo,seq_len_kv,head_size_qk,head_size_vo
+
 template <typename T>
 struct OPS_tobf16{
     template <class Tensor>
@@ -57,157 +58,6 @@ struct OPS_tobf16{
 constexpr int tid = 0;
 constexpr int bid = 16;
 
-template <class T_, class ProblemShape_>
-struct MHA_TYPE {
-    using ProblemShape = ProblemShape_;
-    /*
-      Q BATCH,NUM_HEAD_Q,SEQ_LEN_QO,HEAD_SIZE_QK
-      K BATCH,NUM_HEAD_KV,SEQ_LEN_KV,HEAD_SIZE_QK
-      V BATCH,NUM_HEAD_KV,SEQ_LEN_KV,HEAD_SIZE_VO
-      P BATCH,NUM_HEAD_Q,SEQ_LEN_QO,SEQ_LEN_KV
-      O BATCH,NUM_HEAD_Q,SEQ_LEN_QO,HEAD_SIZE_VO
-    */
-    /*
-      dPs BATCH,NUM_HEAD_Q,SEQ_LEN_QO,SEQ_LEN_KV
-      dP BATCH,NUM_HEAD_Q,SEQ_LEN_QO,SEQ_LEN_KV
-      dP=softmax_backward(softmax, dPs)
-    */
-    using DType = T_;
-    using Stride1 = cute::tuple<long, cute::C<1>, long>;
-    using Stride0 = cute::tuple<cute::C<1>, long, long>;
-
-    static constexpr int bMi = 256;
-    static constexpr int bNi = 512;
-    static constexpr int bKi = 32;
-    static constexpr auto bM = Int<bMi>{};
-    static constexpr auto bN = Int<bNi>{};
-    static constexpr auto bK = Int<bKi>{};
-    static constexpr auto tile_mnk = make_shape(bM, bN, bK);
-    static constexpr auto bP = Int<2>{}; // Pipeline
-
-    /*
-      shape
-      Pt BATCH,NUM_HEAD_Q,SEQ_LEN_KV,SEQ_LEN_QO
-      dO BATCH,NUM_HEAD_Q,SEQ_LEN_QO,HEAD_SIZE_VO
-      dV BATCH,NUM_HEAD_KV,SEQ_LEN_KV,HEAD_SIZE_VO
-      M SEQ_LEN_KV
-      N HEAD_SIZE_VO
-      K SEQ_LEN_QO
-      dV=Pt*dO
-    */
-    using CopyPt = decltype(
-        make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U16x16x16_LD_T, Stride0>, DType>{},
-                        Layout<Shape<_1,_16>>{}, // Thr layout 1x16 k-major
-                        Layout<Shape<_16,_1>>{})); // Val layout  16x1
-    using CopygO = decltype(
-        make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U16x32x32_LD_N, Stride0>, DType>{},
-                        Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
-                        Layout<Shape<_32,_2>>{})); // Val layout  32x2);
-    using CopygV = decltype(
-        make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U16x8x16_ST_N, Stride1>, DType>{},
-                        Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
-                        Layout<Shape<_8,_1>>{})); // Val layout  8x1
-    /*
-      dO BATCH,NUM_HEAD_Q,SEQ_LEN_QO,HEAD_SIZE_VO
-      dV BATCH,NUM_HEAD_KV,HEAD_SIZE_VO,SEQ_LEN_KV
-      dPs BATCH,NUM_HEAD_Q,SEQ_LEN_QO,SEQ_LEN_KV
-      M SEQ_LEN_QO
-      N SEQ_LEN_KV
-      K HEAD_SIZE_VO
-      dPs=dO*Vt
-    */
-
-    using CopygOA = decltype(
-        make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U16x32x32_LD_N, Stride1>, DType>{},
-                        Layout<Shape<_1,_16>>{}, // Thr layout 1x16 k-major
-                        Layout<Shape<_32,_2>>{}));              // Val layout  32x2
-    using CopyVt = decltype(
-        make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U16x16x16_LD_T, Stride1>, DType>{},
-                        Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
-                        Layout<Shape<_16,_1>>{})); //Val layout 16x1
-    using CopygP = decltype(
-        make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U16x8x16_ST_N, Stride1>, DType>{},
-                        Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
-                        Layout<Shape<_8,_1>>{}));              // Val layout  8x1
-    using CopyP = decltype(
-        make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U16x8x16_LD_N, Stride1>, DType>{},
-                        Layout<Shape<_1, _16>>{},
-                        Layout<Shape<_8, _1>> {}));
-
-    /*
-     * dP BATCH,NUM_HEAD_Q,SEQ_LEN_QO,SEQ_LEN_KV
-     * Q BATCH,NUM_HEAD_Q,SEQ_LEN_QO,HEAD_SIZE_QK
-     * dK BATCH,NUM_HEAD_KV,SEQ_LEN_KV,HEAD_SIZE_QK
-     * M SEQ_LEN_KV
-     * N HEAD_SIZE_QK
-     * K SEQ_LEN_QO
-     * dK=dPt*Q
-     */
-    // copy_pst already defined at line 103
-    using CopyQ = decltype(
-        make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U16x32x32_LD_N, Stride0>, DType>{},
-                        Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
-                        Layout<Shape<_32,_2>>{}));              // Val layout  16x1
-    using CopygK = decltype(
-        make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U16x8x16_ST_N, Stride1>, DType>{},
-                        Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
-                        Layout<Shape<_8,_1>>{}));              // Val layout  8x1
-    /*
-     * dP BATCH,NUM_HEAD_Q,SEQ_LEN_QO,SEQ_LEN_KV
-     * K BATCH,NUM_HEAD_KV,SEQ_LEN_KV,HEAD_SIZE_QK
-     * dQ BATCH,NUM_HEAD_Q,SEQ_LEN_QO,HEAD_SIZE_QK
-     * M SEQ_LEN_QO
-     * N HEAD_SIZE_QK
-     * K SEQ_LEN_KV
-     * dQ=dP*K
-     */
-    using CopygPA = decltype(
-        make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U16x32x32_LD_N, Stride1>, DType>{},
-                        Layout<Shape<_1,_16>>{}, // Thr layout 1x16 k-major
-                        Layout<Shape<_32,_2>>{}));              // Val layout  32x2
-    using CopyK = decltype(
-        make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U16x32x32_LD_N, Stride0>, DType>{},
-                        Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
-                        Layout<Shape<_32,_2>>{}));              // Val layout  32x2
-    using CopygQ = decltype(
-        make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U16x8x16_ST_N, Stride1>, DType>{},
-                        Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
-                        Layout<Shape<_8,_1>>{}));              // Val layout  8x1
-
-    static constexpr TiledMMA mmaC = TiledMMAHelper<MMA_Atom<XE_8x16x16_F32BF16BF16F32_TT>, Layout<decltype(tile_mnk)>,
-                                                    Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>>::TiledMMA{};  // 256x128x16 TiledMMA
-    using TiledMma = decltype(mmaC);
-    static constexpr int SubgroupSize = 16;
-    static constexpr int smem_size = 0;
-
-    MHA_TYPE(ProblemShape_ mha_shape_)
-        :mha_shape(mha_shape_),
-         BATCH(get<0>(mha_shape)),
-         NUM_HEAD_Q(get<1>(mha_shape)),
-         NUM_HEAD_KV(get<2>(mha_shape)),
-         SEQ_LEN_QO(get<3>(mha_shape)),
-         SEQ_LEN_KV(get<4>(mha_shape)),
-         HEAD_SIZE_QK(get<5>(mha_shape)),
-         HEAD_SIZE_VO(get<6>(mha_shape)),
-         max_block_m(std::max(SEQ_LEN_KV, SEQ_LEN_QO)),
-         max_block_n(NUM_HEAD_KV),
-         block_n_chunk(NUM_HEAD_Q / NUM_HEAD_KV)
-        {}
-
-    // variables
-    ProblemShape mha_shape;
-    TiledMma tiled_mma;
-    const int64_t BATCH;
-    const int64_t NUM_HEAD_Q;
-    const int64_t NUM_HEAD_KV;
-    const int64_t SEQ_LEN_QO;
-    const int64_t SEQ_LEN_KV;
-    const int64_t HEAD_SIZE_QK;
-    const int64_t HEAD_SIZE_VO;
-    const int64_t max_block_m;
-    const int64_t max_block_n;
-    const int64_t block_n_chunk;
-};
 
 template<class T, class ThrMma,
          class YTensor, class CopyY,
@@ -255,6 +105,26 @@ void softmax_bwd_last(T &trait,
             auto sum_val = sum_buf(j);
             ydy_col(j) = (ydy_col(j) - y_col(j) * sum_val) * inv_scale;
         }
+    }
+}
+
+template<int k_tile = 0, typename Tensor0, typename Tensor1, typename Tensor2,
+         typename Tensor3, typename Tensor4,
+         typename Tensor5, typename Tensor6,
+         typename TiledMma, typename TiledCopyA, typename TiledCopyB,
+         typename ThrCopyA, typename ThrCopyB>
+void gemm_ker(Tensor0 &tCrC, Tensor1 &tCrA, Tensor2 &tCrB,
+              Tensor3 &tAgA, Tensor4 &tArA,
+              Tensor5 &tBgB, Tensor6 &tBrB, TiledMma &tiled_mma,
+              TiledCopyA &copy_a, TiledCopyB &copy_b,
+              ThrCopyA &thr_copy_a, ThrCopyB &thr_copy_b) {
+    constexpr int barrier_scope = 2;
+    for (int k = 0; k < size<3>(tAgA); ++k) {
+        barrier_arrive(barrier_scope);
+        cute::copy(copy_a, tAgA(_, _, _, k), tArA);
+        cute::copy(copy_b, tBgB(_, _, _, k), tBrB);
+        cute::gemm(tiled_mma, tCrA, tCrB, tCrC);
+        barrier_wait(barrier_scope);
     }
 }
 
@@ -676,209 +546,152 @@ void copy_tensor(T &src, V &dst) {
     }
 }
 
-template<class T, bool first>
+template<class Trait>
 void
-mha_backward(T trait,
-             typename T::DType const *go_d,
-             typename T::DType const *q_d,
-             typename T::DType const *k_d,
-             typename T::DType const *v_d,
-             typename T::DType const *ps_d,
-             typename T::DType *gq_d,
-             typename T::DType *gk_d,
-             typename T::DType *gv_d,
-             typename T::DType *gps_d) {
+dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
+                   const int bidb, const int bidh, const int n_block) {
+    using T = typename Trait::DType;
+    constexpr int kHeadDim = Trait::kHeadDim;
+    constexpr int kBlockM = Trait::kBlockM;
+    constexpr int kBlockN = Trait::kBlockN;
+    constexpr int kBlockK = Trait::kBlockK;
     auto sg = syclcompat::get_nd_item<1>().get_sub_group();
     auto first_thread_in_sg_idx = sg.get_group_linear_id() * trait.SubgroupSize;
-    auto thr_mma = trait.tiled_mma.get_slice(first_thread_in_sg_idx);
+    // auto dA = make_stride(K, Int<1>{}, _0);
+    // auto dB = make_stride(Int<1>{}, N, _0);
+    auto bofst = Boffset(param);
+    const index_t q_offset = bofst.q_offset(bidb, bidh, 0);
+    const index_t k_offset = bofst.k_offset(bidb, bidh, 0);
+    const index_t s_offset = bofst.ps_offset(bidb, bidh, 0, 0);
+
+    Shape shapeQ = make_shape(param.seq_len_q, Int<kHeadDim>{}, Int<1>{});
+        // Shape<Int<kBlockM>, Int<kHeadDim>>{};
+    Shape shapeK = make_shape(param.seq_len_kv, Int<kHeadDim>{}, Int<1>{});
+        // Shape<Int<kBlockN>, Int<kHeadDim>>{};
+    Shape shapeS = make_shape(param.seq_len_q, param.seq_len_kv, Int<1>{});
+        // Shape<Int<kBlockM>, Int<kBlockN>>{};
+    Tensor mQ = make_tensor(make_gmem_ptr(param.q + q_offset), make_layout(
+                                shapeQ,
+                                make_stride(param.q_r_stride, _1{}, _0{})));
+    Tensor mK = make_tensor(make_gmem_ptr(param.k + k_offset), make_layout(
+                                shapeK,
+                                make_stride(param.k_r_stride, _1{}, _0{})));
+    Tensor mS = make_tensor(make_gmem_ptr(param.s + s_offset), make_layout(
+                                shapeS,
+                                make_stride(param.s_r_stride, _1{}, _0{})));
+
+    Shape tile_sdp = typename Trait::TileShapeMSdP{};
+
+    auto copyQ = typename Trait::TiledCopyQ{mQ};
+    auto copyK = typename Trait::TiledCopyK{mK};
+    auto copyS = typename Trait::TiledCopyS{mS};
+
+    Tensor mQ_coord = cute::get_xe_tensor(shapeQ);
+    Tensor mK_coord = cute::get_xe_tensor(shapeK);
+    Tensor mS_coord = cute::get_xe_tensor(shapeS);
+
+
+    typename Trait::TiledMmaSdP tiled_mma_sdp;
+    auto thr_mma_sdp = tiled_mma_sdp.get_slice(first_thread_in_sg_idx);
+
+
+    cutlass::NumericConverter<T, float> converter;
+    const int max_m_block = ceil_div(param.seq_len_q, kBlockM);
+    for (int m_block = 0; m_block < max_m_block; ++m_block) {
+        Tensor gQ = local_tile(mQ_coord, select<0, 2>(tile_sdp), make_coord(m_block, _, 0));
+        Tensor gK = local_tile(mK_coord, select<1, 2>(tile_sdp), make_coord(n_block, _, 0));
+        Tensor gS = local_tile(mS_coord, select<0, 1>(tile_sdp), make_coord(m_block, n_block, 0)); // debug
+
+        Tensor tSgQ = thr_mma_sdp.partition_A(gQ);
+        Tensor tSgK = thr_mma_sdp.partition_B(gK);
+        Tensor tSgS = thr_mma_sdp.partition_C(gS); // debug
+
+        Tensor tSrQ = make_tensor<T>(make_fragment_layout(copyQ, tSgQ(_,_,_,0).shape()));
+        Tensor tSrK = make_tensor<T>(make_fragment_layout(copyK, tSgK(_,_,_,0).shape()));
+
+        ThrCopy thr_copy_q = copyQ.get_slice(syclcompat::local_id::x());
+        ThrCopy thr_copy_k = copyK.get_slice(syclcompat::local_id::x());
+
+        // Retile registers for copies
+        Tensor tQrQ = thr_copy_q.retile_D(tSrQ);
+        Tensor tKrK = thr_copy_k.retile_D(tSrK);
+
+        // Retile global counting tensors for copies
+        Tensor tQgQ = thr_copy_q.retile_S(tSgQ);
+        Tensor tKgK = thr_copy_k.retile_S(tSgK);
+
+        Tensor tSrS = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});
+        clear(tSrS);
+
+        constexpr int k_tile = ceil_div(kHeadDim, kBlockK);
+        gemm_ker<k_tile>(tSrS, tSrQ, tSrK, tQgQ, tQrQ, tKgK, tKrK, tiled_mma_sdp, copyQ, copyK, thr_copy_q, thr_copy_k);
+        // if (m_block == 0 and cute::thread(0, 0)) {
+        //     print("tSrS: ");
+        //     print_t(tSrS);
+        // }
+        auto tSrSl = make_tensor_like<T>(tSrS);
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(tSrS); ++i) {
+            tSrSl(i) = converter(tSrS(i));
+        }
+        copy(copyS, tSrSl, tSgS);
+    }
+
+}
+
+template<class T>
+void
+mha_backward(T trait,
+             Param<typename T::DType> param) {
+    auto sg = syclcompat::get_nd_item<1>().get_sub_group();
+    auto first_thread_in_sg_idx = sg.get_group_linear_id() * trait.SubgroupSize;
+    // auto thr_mma = trait.tiled_mma.get_slice(first_thread_in_sg_idx);
     // std::is_same_v<decltype(copy_Pst), int>;
-    int m_coord = BlockIdxX();
-    int lh_coord = BlockIdxY();
-    int lb_coord = BlockIdxZ();
-    using ProblemShape = cute::tuple<int, int, int, int>;
-    using ProblemShapeEx = cute::tuple<int, int, int, int, int>;
     OPS_tobf16<typename T::DType> op;
-
-    if constexpr(first) {
-    {
-        /*
-          dV=Pst * dO
-          dV BATCH,NUM_HEAD_KV,SEQ_LEN_KV,HEAD_SIZE_VO
-          Pst BATCH,NUM_HEAD_Q,SEQ_LEN_KV,SEQ_LEN_QO
-          dO BATCH,NUM_HEAD_Q,SEQ_LEN_QO,HEAD_SIZE_VO
-          M SEQ_LEN_KV
-          N HEAD_SIZE_VO
-          K SEQ_LEN_QO
-        */
-        auto dPt = make_stride(Int<1>{}, trait.SEQ_LEN_KV,
-                               trait.SEQ_LEN_KV *trait.SEQ_LEN_QO); // A SEQ_LEN_KV,SEQ_LEN_QO
-        auto dO = make_stride(Int<1>{}, trait.HEAD_SIZE_VO,
-                              trait.HEAD_SIZE_VO *trait.SEQ_LEN_QO); // B HEAD_SIZE_VO,SEQ_LEN_QO
-        auto dV = make_stride(trait.HEAD_SIZE_VO, Int<1>{},
-                              trait.SEQ_LEN_KV *trait.HEAD_SIZE_VO); // C SEQ_LEN_KV,HEAD_SIZE_VO
-        ProblemShape problem_shape = ProblemShape(
-            trait.SEQ_LEN_KV,
-            trait.HEAD_SIZE_VO,
-            trait.SEQ_LEN_QO,
-            trait.BATCH * trait.NUM_HEAD_Q);
-        gemm_dkv(trait, problem_shape, thr_mma,
-             ps_d, dPt, typename T::CopyPt{},
-             go_d, dO, typename T::CopygO{},
-             gv_d, dV, typename T::CopygV{},
-             m_coord, lh_coord, lb_coord, false);
-    }
-    {
-        /*
-          shape
-          dO BATCH,NUM_HEAD_Q,SEQ_LEN_QO,HEAD_SIZE_VO
-          V  BATCH,NUM_HEAD_Q,SEQ_LEN_KV,HEAD_SIZE_VO
-          dP BATCH,NUM_HEAD_Q,SEQ_LEN_QO,SEQ_LEN_KV
-          M SEQ_LEN_KV
-          N HEAD_SIZE_VO
-          K SEQ_LEN_QO
-          dP=dO*Vt
-         */
-        auto dO = make_stride(trait.HEAD_SIZE_VO, Int<1>{},
-                              trait.SEQ_LEN_QO *trait.HEAD_SIZE_VO); // A SEQ_LEN_QO, HEAD_SIZE_VO
-        auto dV = make_stride(trait.HEAD_SIZE_VO, Int<1>{},
-                              trait.HEAD_SIZE_VO * trait.SEQ_LEN_KV); // B SEQ_LEN_KV, HEAD_SIZE_VO
-        auto dP = make_stride(trait.SEQ_LEN_KV, Int<1>{},
-                              trait.SEQ_LEN_QO *trait.SEQ_LEN_KV); // C SEQ_LEN_QO,SEQ_LEN_KV
-
-        auto tCrC = partition_fragment_C(trait.tiled_mma, take<0, 2>(trait.tile_mnk)); // dy
-        auto tCrCy = make_tensor_like<typename T::DType>(tCrC);
-// y
-        // init sum_row
-        auto sum_row = make_tensor_like(tCrC(_, _, 0));
-        // each work group actually cover m=0-512
-        // each subgroup cover m=0-32, there are 16 subgroup, and share same slm
-        // 512 local thread maximum
-        // every 256 rows handled by different work groups
-        // different l are handled by different work groups
-        constexpr auto NUM_COL_PER_THD = size<2>(tCrC);
-        // constexpr int SGSIZE = 16;
-        // constexpr int NUM_BLOCK_PER_THD = 256;
-        constexpr auto NUM_ROW_PER_THD = size<0>(tCrC) * size<1>(tCrC);
-        constexpr auto NUM_SG_PER_ROW = trait.bN / (Int<trait.SubgroupSize>{} * NUM_COL_PER_THD);
-        constexpr auto NUM_SG_PER_BLK_M = trait.bM / NUM_ROW_PER_THD;
-        constexpr auto NUM_SG = NUM_SG_PER_ROW * NUM_SG_PER_BLK_M;
-
-        // leverage share memory to reduce over 1 block
-        auto smem = syclcompat::local_mem<float[NUM_SG * NUM_ROW_PER_THD]>();
-        Tensor stensor = make_tensor(make_smem_ptr(smem), make_shape(Int<NUM_ROW_PER_THD>{}, Int<NUM_SG_PER_ROW>{}, Int<NUM_SG_PER_BLK_M>{})); // bank conflict
-        ProblemShapeEx problem_shape = ProblemShapeEx(
-            trait.SEQ_LEN_QO,
-            trait.SEQ_LEN_KV,
-            trait.HEAD_SIZE_VO,
-            trait.BATCH * trait.NUM_HEAD_Q,
-            trait.BATCH * trait.NUM_HEAD_KV);
-        if (m_coord < ceil_div(trait.SEQ_LEN_QO, trait.bM)) {
-            int lk_coord = lh_coord + lb_coord * trait.max_block_n;
-            for (int h_q = lh_coord * trait.block_n_chunk; h_q < (lh_coord + 1)* trait.block_n_chunk; ++h_q) {
-                int lq_coord = h_q + lb_coord * trait.NUM_HEAD_Q;
-                clear(tCrC);
-                clear(tCrCy);
-                clear(sum_row);
-                gemm_dp(trait, problem_shape, thr_mma,
-                        go_d, dO, typename T::CopygOA{},
-                        v_d, dV, typename T::CopyVt{},
-                        ps_d, dP, typename T::CopyP{},
-                        tCrC, tCrCy, sum_row,
-                        m_coord, lq_coord, lk_coord, false);
-                reduce_row<NUM_SG_PER_ROW, decltype(sum_row), decltype(stensor)>(sum_row, stensor);
-                softmax_bwd(trait, problem_shape, thr_mma,
-                            gps_d, dP, typename T::CopygP{},
-                            tCrC, tCrCy, sum_row,
-                            m_coord, lq_coord);
-            }
-        }
-    }
-    } else {
-    // store in smem for transpose syk
-    // auto group = syclcompat::get_nd_item<1>().get_group();
-    // sycl::group_barrier(group);
-    {
-        /*
-          dP BATCH,NUM_HEAD_Q,SEQ_LEN_QO,HEAD_SIZE_VO
-          K  BATCH,NUM_HEAD_KV,SEQ_LEN_KV,HEAD_SIZE_QK
-          dQ BATCH,NUM_HEAD_Q,SEQ_LEN_QO,HEAD_SIZE_QK
-          M  SEQ_LEN_QO
-          N  HEAD_SIZE_QK
-          K  SEQ_LEN_KV
-          dQ=dP*K
-         */
-        auto dP = make_stride(trait.SEQ_LEN_KV, Int<1>{},
-                              trait.SEQ_LEN_KV *trait.SEQ_LEN_QO); // A SEQ_LEN_QO, SEQ_LEN_KV
-        auto dK = make_stride(Int<1>{}, trait.HEAD_SIZE_QK,
-                              trait.HEAD_SIZE_QK *trait.SEQ_LEN_KV); // B HEAD_SIZE_QK, SEQ_LEN_KV
-        auto dQ = make_stride(trait.HEAD_SIZE_QK, Int<1>{},
-                              trait.SEQ_LEN_QO * trait.HEAD_SIZE_QK); // C SEQ_LEN_QO, HEAD_SIZE_QK
-        ProblemShapeEx problem_shape = ProblemShapeEx(
-            trait.SEQ_LEN_QO,
-            trait.HEAD_SIZE_QK,
-            trait.SEQ_LEN_KV,
-            trait.BATCH * trait.NUM_HEAD_Q,
-            trait.BATCH * trait.NUM_HEAD_KV);
-        int lk_coord = lh_coord + lb_coord * trait.max_block_n;
-        for (int h_q = lh_coord * trait.block_n_chunk; h_q < (lh_coord + 1) * trait.block_n_chunk; ++h_q) {
-            int lq_coord = h_q + lb_coord * trait.NUM_HEAD_Q;
-            gemm_dq(trait, problem_shape, thr_mma,
-                    gps_d, dP, typename T::CopygPA{},
-                    k_d, dK, typename T::CopyK{},
-                    gq_d, dQ, typename T::CopygQ{},
-                    m_coord, lq_coord, lk_coord, false);
-        }
-    }
-    {
-        /*
-          dP BATCH,NUM_HEAD_Q,SEQ_LEN_QO,SEQ_LEN_KV
-          Q  BATCH,NUM_HEAD_Q,SEQ_LEN_QO,HEAD_SIZE_QK
-          dK BATCH,NUM_HEAD_KV,SEQ_LEN_KV,HEAD_SIZE_QK
-          M SEQ_LEN_KV
-          N HEAD_SIZE_QK
-          K SEQ_LEN_QO
-          dK=dPt*Q
-         */
-        auto dP = make_stride(Int<1>{}, trait.SEQ_LEN_KV,
-                              trait.SEQ_LEN_KV *trait.SEQ_LEN_QO); // A SEQ_LEN_KV,SEQ_LEN_QO
-        auto dQ = make_stride(Int<1>{}, trait.HEAD_SIZE_QK,
-                              trait.SEQ_LEN_QO *trait.HEAD_SIZE_QK); // B SEQ_LEN_QO,HEAD_SIZE_QK
-        auto dK = make_stride(trait.HEAD_SIZE_QK, Int<1>{},
-                              trait.HEAD_SIZE_QK *trait.SEQ_LEN_KV); // C SEQ_LEN_KV,HEAD_SIZE_QK
-
-        ProblemShape problem_shape = ProblemShape(
-            trait.SEQ_LEN_KV,
-            trait.HEAD_SIZE_QK,
-            trait.SEQ_LEN_QO,
-            trait.BATCH * trait.NUM_HEAD_Q);
-        gemm_dkv(trait, problem_shape, thr_mma,
-                 gps_d, dP, typename T::CopyPt{},
-                 q_d, dQ, typename T::CopyQ{},
-                 gk_d, dK, typename T::CopygK{},
-                 m_coord, lh_coord, lb_coord, false);
-    }
-    }
+    const int bidb = BlockIdxZ();
+    const int bidh = BlockIdxY();
+    int n_block = 0;
+    const int max_n_block = ceil_div(param.seq_len_kv, trait.kBlockN);
+    for (int n_block = 0; n_block < max_n_block; ++n_block)
+        dq_dk_dv_1colblock(trait, param, bidb, bidh, n_block);
 }
 
 template<typename T, class ProblemShape>
 void launch_mha_backward(ProblemShape problem_shape,
-                         T *go_d,
+                         const T *do_d,
                          const T *q_d,
                          const T *k_d,
                          const T *v_d,
-                         const T *ps_d,
+                         const float *lse_d,
+                         const float *odo_d,
                          T *dq_d,
                          T *dk_d,
                          T *dv_d,
-                         T *dps_d) {
-
-    auto trait = MHA_TYPE<T, ProblemShape>(problem_shape);
-    // auto dimGrid = syclcompat::dim3(size(ceil_div(trait.SEQ_LEN_KV, trait.bM)), size(1), size(trait.BATCH * trait.NUM_HEAD_Q));
-    auto dimGrid = syclcompat::dim3(size(ceil_div(trait.max_block_m, trait.bM)), size(trait.max_block_n), size(trait.BATCH));
-    assert((trait.NUM_HEAD_Q % trait.NUM_HEAD_KV == 0) && "num_head_q must be dividable by num_head_kv");
-    assert((trait.NUM_HEAD_Q >= trait.NUM_HEAD_KV) && "num_head_q must be bigger than or equal to num_head_kv");
-    assert((trait.bNi <= trait.SEQ_LEN_KV) && "tile_N must be larger than SEQ_LEN_KV");
-    auto dimBlock = syclcompat::dim3(size(trait.mmaC), size(1), size(1));
+                         T *p_d,
+                         T *s_d) {
+    // skip if head != 128
+    if (get<5>(problem_shape) != 128)
+        return;
+    constexpr int numSGs = 8;
+    constexpr int kHeadDim = 128;
+    constexpr int kBlockM = 64;
+    constexpr int kBlockN = 64;
+    constexpr int kBlockK = 32;
+    auto trait = FAKernel<T, kHeadDim, kBlockM, kBlockN, kBlockK, numSGs>();
+    auto param = Param<T>(do_d, q_d, k_d, v_d, lse_d, odo_d,
+                          dq_d, dk_d, dv_d, p_d, s_d);
+    param.batch = get<0>(problem_shape);
+    param.num_head_q = get<1>(problem_shape);
+    param.num_head_kv = get<2>(problem_shape);
+    param.seq_len_q = get<3>(problem_shape);
+    param.seq_len_kv = get<4>(problem_shape);
+    param.head_dim = kHeadDim;
+    setup_bhsd_stride(param);
+    auto dimGrid = syclcompat::dim3(size(1), size(param.num_head_q), size(param.batch));
+    assert((trait.num_head_q % trait.num_head_kv == 0) && "num_head_q must be dividable by num_head_kv");
+    assert((trait.num_head_q >= trait.num_head_kv) && "num_head_q must be bigger than or equal to num_head_kv");
+    auto dimBlock = syclcompat::dim3(size(numSGs * trait.SubgroupSize), size(1), size(1));
+    // auto dimBlock = syclcompat::dim3(size(trait.tiled_mma_sdp));
 
     syclcompat::experimental::launch_properties launch_props{
         // sycl::ext::oneapi::experimental::work_group_scratch_size(0),
@@ -886,56 +699,60 @@ void launch_mha_backward(ProblemShape problem_shape,
     syclcompat::experimental::kernel_properties kernel_props{
         sycl::ext::oneapi::experimental::sub_group_size<trait.SubgroupSize>};
     syclcompat::experimental::launch_policy policy{dimGrid, dimBlock, launch_props, kernel_props};
-    auto event1 = syclcompat::experimental::launch<
-        mha_backward<decltype(trait), true>>(policy,
+    auto event = syclcompat::experimental::launch<
+        mha_backward<decltype(trait)>>(policy,
                                        trait,
-                                       go_d,
-                                       q_d, k_d, v_d,
-                                       ps_d,
-                                       dq_d, dk_d, dv_d,
-                                       dps_d);
-    EventManager::getInstance().addEvent(event1);
-    auto event2 = syclcompat::experimental::launch<
-        mha_backward<decltype(trait), false>>(policy,
-                                       trait,
-                                       go_d,
-                                       q_d, k_d, v_d,
-                                       ps_d,
-                                       dq_d, dk_d, dv_d,
-                                       dps_d);
-    EventManager::getInstance().addEvent(event2);
+                                       param);
+    EventManager::getInstance().addEvent(event);
 }
 
 int main(int argc, char**argv) {
-    using T = cute::bfloat16_t;
+    // using T = cute::bfloat16_t;
+    using T = cute::half_t;
+    using V = float;
     std::string data_file = "mha.npz";
     // read qkv
     cnpy::NpyArray q_npy = cnpy::npz_load(data_file, "q");
     cnpy::NpyArray k_npy = cnpy::npz_load(data_file, "k");
     cnpy::NpyArray v_npy = cnpy::npz_load(data_file, "v");
 
-    // read grad output
-    cnpy::NpyArray go_npy = cnpy::npz_load(data_file, "grad");
+    // read s and p for debug
+    cnpy::NpyArray s_npy = cnpy::npz_load(data_file, "s");
+    cnpy::NpyArray p_npy = cnpy::npz_load(data_file, "p");
 
-    // read p softmax
-    cnpy::NpyArray ps_npy = cnpy::npz_load(data_file, "attn");
+// read grad output
+    cnpy::NpyArray do_npy = cnpy::npz_load(data_file, "grad");
+
+    // read lse
+    cnpy::NpyArray lse_npy = cnpy::npz_load(data_file, "lse");
+    // read odo
+    cnpy::NpyArray odo_npy = cnpy::npz_load(data_file, "odo");
+
     // read grad reference
-    cnpy::NpyArray dps_npy = cnpy::npz_load(data_file, "p_grad");
     cnpy::NpyArray dq_npy = cnpy::npz_load(data_file, "q_grad");
-    cnpy::NpyArray da_npy = cnpy::npz_load(data_file, "attn_grad");
     cnpy::NpyArray dk_npy = cnpy::npz_load(data_file, "k_grad");
     cnpy::NpyArray dv_npy = cnpy::npz_load(data_file, "v_grad");
+
+    // read shape
+    cnpy::NpyArray shape = cnpy::npz_load(data_file, "shape");
 
     // alloc qkv
     T *q_d = syclcompat::malloc<T>(q_npy.num_vals);
     T *k_d = syclcompat::malloc<T>(k_npy.num_vals);
     T *v_d = syclcompat::malloc<T>(v_npy.num_vals);
+
+    // alloc ps
+    T *p_d = syclcompat::malloc<T>(p_npy.num_vals);
+    T *s_d = syclcompat::malloc<T>(s_npy.num_vals);
+
+    // alloc lse, odo
+    V *lse_d = syclcompat::malloc<V>(lse_npy.num_vals);
+    V *odo_d = syclcompat::malloc<V>(odo_npy.num_vals);
+
     // alloc grad output
-    T *go_d = syclcompat::malloc<T>(go_npy.num_vals);
-    // alloc p softmax
-    T *ps_d = syclcompat::malloc<T>(ps_npy.num_vals);
+    T *do_d = syclcompat::malloc<T>(do_npy.num_vals);
+
     // alloc grad test on device
-    T *dps_d = syclcompat::malloc<T>(dps_npy.num_vals);
     T *dq_d = syclcompat::malloc<T>(dq_npy.num_vals);
     T *dk_d = syclcompat::malloc<T>(dk_npy.num_vals);
     T *dv_d = syclcompat::malloc<T>(dv_npy.num_vals);
@@ -944,57 +761,75 @@ int main(int argc, char**argv) {
     syclcompat::memcpy<T>(q_d, q_npy.data<T>(), q_npy.num_vals);
     syclcompat::memcpy<T>(k_d, k_npy.data<T>(), k_npy.num_vals);
     syclcompat::memcpy<T>(v_d, v_npy.data<T>(), v_npy.num_vals);
-    // copy grad output
-    syclcompat::memcpy<T>(go_d, go_npy.data<T>(), go_npy.num_vals);
-    // copy softmax intermediate result
-    syclcompat::memcpy<T>(ps_d, ps_npy.data<T>(), ps_npy.num_vals);
-    int64_t BATCH = 4;
-    int64_t NUM_HEAD_Q = 4;
-    int64_t NUM_HEAD_KV = 4;
-    int64_t SEQ_LEN_QO = 1024;
-    int64_t SEQ_LEN_KV = 512;
-    int64_t HEAD_SIZE_QK = 128;
-    int64_t HEAD_SIZE_VO = 128;
 
-    read_args(argc, argv, 1, &BATCH);
-    read_args(argc, argv, 2, &NUM_HEAD_Q);
-    read_args(argc, argv, 3, &NUM_HEAD_KV);
-    read_args(argc, argv, 4, &SEQ_LEN_QO);
-    read_args(argc, argv, 5, &SEQ_LEN_KV);
-    read_args(argc, argv, 6, &HEAD_SIZE_QK);
-    read_args(argc, argv, 7, &HEAD_SIZE_VO);
+    // copy grad output
+    syclcompat::memcpy<T>(do_d, do_npy.data<T>(), do_npy.num_vals);
+
+    // copy lse
+    syclcompat::memcpy<V>(lse_d, lse_npy.data<V>(), lse_npy.num_vals);
+
+    // copy odo
+    syclcompat::memcpy<V>(odo_d, odo_npy.data<V>(), odo_npy.num_vals);
+
+    int64_t BATCH = shape.data<int>()[0];
+    int64_t NUM_HEAD_Q = shape.data<int>()[1];
+    int64_t NUM_HEAD_KV = shape.data<int>()[2];
+    int64_t SEQ_LEN_QO = shape.data<int>()[3];
+    int64_t SEQ_LEN_KV = shape.data<int>()[4];
+    int64_t HEAD_SIZE_QK = shape.data<int>()[5];
+    int64_t HEAD_SIZE_VO = shape.data<int>()[6];
+    bool is_causal = shape.data<int>()[7];
+    printf("batch %d nh_q %d nh_k %d sq_q %d sq_k %d hd_q %d hd_v %d\n", BATCH, NUM_HEAD_Q, NUM_HEAD_KV, SEQ_LEN_QO, SEQ_LEN_KV, HEAD_SIZE_QK, HEAD_SIZE_VO);
+    // read_args(argc, argv, 1, &BATCH);
+    // read_args(argc, argv, 2, &NUM_HEAD_Q);
+    // read_args(argc, argv, 3, &NUM_HEAD_KV);
+    // read_args(argc, argv, 4, &SEQ_LEN_QO);
+    // read_args(argc, argv, 5, &SEQ_LEN_KV);
+    // read_args(argc, argv, 6, &HEAD_SIZE_QK);
+    // read_args(argc, argv, 7, &HEAD_SIZE_VO);
 
     auto problem_shape = ProblemShapeRegular(BATCH, NUM_HEAD_Q, NUM_HEAD_KV, SEQ_LEN_QO, SEQ_LEN_KV, HEAD_SIZE_QK, HEAD_SIZE_VO);
-    assert(dv_npy.num_vals == dv_test.size());
     launch_mha_backward<T, decltype(problem_shape)>(
         problem_shape,
-        go_d,
+        do_d,
         q_d, k_d, v_d,
-        ps_d,
+        lse_d, odo_d,
         dq_d, dk_d, dv_d,
-        dps_d);
+        p_d, s_d);
 
-    float atol = 1e-2f;
-    float rtol = 1e-2f;
+    float atol = 1e-3f;
+    float rtol = 1e-3f;
+    std::vector<T> s_test(BATCH * NUM_HEAD_Q * SEQ_LEN_QO * SEQ_LEN_KV);
+    syclcompat::memcpy<T>(s_test.data(), s_d, s_test.size());
     syclcompat::wait_and_throw();
-    std::vector<T> dv_test(BATCH * NUM_HEAD_KV * SEQ_LEN_KV * HEAD_SIZE_VO);
-    syclcompat::memcpy<T>(dv_test.data(), dv_d, dv_test.size());
-    printf("verify dV: ");
-    verify(dv_npy.data<T>(), dv_test.data(), BATCH * NUM_HEAD_KV, SEQ_LEN_KV, HEAD_SIZE_VO, atol, rtol);
-    syclcompat::wait_and_throw();
-    std::vector<T> dps_test(BATCH * NUM_HEAD_Q * SEQ_LEN_QO * SEQ_LEN_KV);
-    syclcompat::memcpy<T>(dps_test.data(), dps_d, dps_test.size());
-    printf("verify dPs: ");
-    verify(dps_npy.data<T>(), dps_test.data(), BATCH * NUM_HEAD_Q, SEQ_LEN_QO, SEQ_LEN_KV, atol, rtol);
-    syclcompat::wait_and_throw();
-    std::vector<T> dk_test(BATCH * NUM_HEAD_KV * SEQ_LEN_KV * HEAD_SIZE_QK);
-    syclcompat::memcpy<T>(dk_test.data(), dk_d, dk_test.size());
-    printf("verify dK: ");
-    verify(dk_npy.data<T>(), dk_test.data(), BATCH * NUM_HEAD_KV, SEQ_LEN_KV, HEAD_SIZE_QK, atol, rtol);
+    verify(s_npy.data<T>(), s_test.data(), BATCH * NUM_HEAD_Q, SEQ_LEN_QO, SEQ_LEN_KV, atol, rtol);
+    // for (int m = 0; m < 4; ++m) {
+    //     for (int n = 0; n < 64; ++n) {
+    //         if (n % 16 == 0)
+    //             printf("\n(%03d,%03d): ", m, n);
+    //         printf("%7.4f ", (float)s_test[m * SEQ_LEN_KV + n], ());
+    //     }
+    //     printf("\n");
+    // }
+    // syclcompat::wait_and_throw();
+    // std::vector<T> dv_test(BATCH * NUM_HEAD_KV * SEQ_LEN_KV * HEAD_SIZE_VO);
+    // syclcompat::memcpy<T>(dv_test.data(), dv_d, dv_test.size());
+    // printf("verify dV: ");
+    // verify(dv_npy.data<T>(), dv_test.data(), BATCH * NUM_HEAD_KV, SEQ_LEN_KV, HEAD_SIZE_VO, atol, rtol);
+    // syclcompat::wait_and_throw();
+    // std::vector<T> dps_test(BATCH * NUM_HEAD_Q * SEQ_LEN_QO * SEQ_LEN_KV);
+    // syclcompat::memcpy<T>(dps_test.data(), dps_d, dps_test.size());
+    // printf("verify dPs: ");
+    // verify(dps_npy.data<T>(), dps_test.data(), BATCH * NUM_HEAD_Q, SEQ_LEN_QO, SEQ_LEN_KV, atol, rtol);
+    // syclcompat::wait_and_throw();
+    // std::vector<T> dk_test(BATCH * NUM_HEAD_KV * SEQ_LEN_KV * HEAD_SIZE_QK);
+    // syclcompat::memcpy<T>(dk_test.data(), dk_d, dk_test.size());
+    // printf("verify dK: ");
+    // verify(dk_npy.data<T>(), dk_test.data(), BATCH * NUM_HEAD_KV, SEQ_LEN_KV, HEAD_SIZE_QK, atol, rtol);
 
-    syclcompat::wait_and_throw();
-    std::vector<T> dq_test(BATCH * NUM_HEAD_Q * SEQ_LEN_QO * HEAD_SIZE_QK);
-    syclcompat::memcpy<T>(dq_test.data(), dq_d, dq_test.size());
-    printf("verify dQ: ");
-    verify(dq_npy.data<T>(), dq_test.data(), BATCH * NUM_HEAD_Q, SEQ_LEN_QO, HEAD_SIZE_QK, atol, rtol);
+    // syclcompat::wait_and_throw();
+    // std::vector<T> dq_test(BATCH * NUM_HEAD_Q * SEQ_LEN_QO * HEAD_SIZE_QK);
+    // syclcompat::memcpy<T>(dq_test.data(), dq_d, dq_test.size());
+    // printf("verify dQ: ");
+    // verify(dq_npy.data<T>(), dq_test.data(), BATCH * NUM_HEAD_Q, SEQ_LEN_QO, HEAD_SIZE_QK, atol, rtol);
 }

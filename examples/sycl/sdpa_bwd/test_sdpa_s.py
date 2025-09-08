@@ -84,7 +84,7 @@ def softmax_backward_odo(p: torch.Tensor,
     sum_odo = torch.sum(odo, dim= -1, keepdim=True)
     ds = p * (dp - sum_odo) * scale
     ds = ds.to(orig_dtype)
-    return ds
+    return ds, odo
 
 def dropout_backward(mask: torch.Tensor,
                      grad_y: torch.Tensor,
@@ -161,6 +161,7 @@ class SDPA(nn.Module):
         #self.p = q@k_expand.transpose(-2, -1)
         s = torch.matmul(q, k_expand.transpose(-1, -2))
         s.register_hook(lambda x: dump_grad('s_grad', x))
+        self.s = s
         s = s.to(torch.float32)
         self.softmax_scale = 1 / np.sqrt(self.head_size_q) if scale is None else scale
         s = s * self.softmax_scale + attn_bias
@@ -168,6 +169,7 @@ class SDPA(nn.Module):
         s = s - sum_row
         self.lse = torch.logsumexp(s, dim=-1, keepdim=True) + sum_row
         p = torch.softmax(s, dim= -1).to(dtype)
+        self.p = p
         p.register_hook(lambda x: dump_grad('p_grad', x))
         attn = torch.matmul(p, v_expand)
         attn.register_hook(lambda x: dump_grad('O_grad', x))
@@ -196,7 +198,8 @@ class SDPA(nn.Module):
         v_grad = torch.matmul(p.transpose(-1, -2), o_grad)
 
         p_grad = torch.matmul(o_grad, v_expand.transpose(-1, -2))
-        s_grad = softmax_backward_odo(p, p_grad, self.o, o_grad, self.softmax_scale)
+        s_grad, odo = softmax_backward_odo(p, p_grad, self.o, o_grad, self.softmax_scale)
+        self.odo = odo
         # s_grad = softmax_backward(p, p_grad, self.softmax_scale)
         k_grad = torch.matmul(s_grad.transpose(-1, -2), self.q)
         q_grad = torch.matmul(s_grad, k_expand)
@@ -274,6 +277,9 @@ def test_sdpa(dtype,
     set_dict(dump_dict, 'grad', grad)
     set_dict(dump_dict, 'v_grad', v_grad)
     set_dict(dump_dict, 'lse', test_model.lse)
+    set_dict(dump_dict, 'odo', test_model.odo)
+    set_dict(dump_dict, 's', test_model.s)
+    set_dict(dump_dict, 'p', test_model.p)
     set_dict(dump_dict, 'p_grad', p_grad)
     set_dict(dump_dict, 's_grad', s_grad)
     set_dict(dump_dict, 'k_grad', k_grad)
@@ -281,6 +287,8 @@ def test_sdpa(dtype,
     set_dict(dump_dict, 'q', q)
     set_dict(dump_dict, 'k', k)
     set_dict(dump_dict, 'v', v)
+    shape = np.array([batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, head_size_qk, head_size_vo, is_causal], dtype=np.int32)
+    dump_dict['shape'] = shape
     # print('test', v_grad[0,0:4,0,0:16])
     # print('upstream', v2.grad[0,0:4,0,0:16])
     print('attn_out ', is_close(attn_out, attn_out_pt))
