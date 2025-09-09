@@ -25,8 +25,15 @@ struct FAKernel {
     static constexpr int kBlockK = kBlockK_;
     static constexpr int kNSGs = kNSGs_;
     // using SubgroupLayout = Layout<Shape<Int<kNSGs>, _1, _1>, Stride<_1, _1, _1>>;
-    using SubgroupLayout = Layout<Shape<_16, _1, _1>, Stride<_1, _1, _1>>;
-    using TileShapeMSdP = Shape<Int<kBlockM>, Int<kBlockN>, Int<kBlockK>>;
+    static constexpr int AtomLayoutMSdP = 4;
+    using SubgroupLayout=Layout<Shape<Int<AtomLayoutMSdP>, Int<kNSGs / AtomLayoutMSdP>, _1>>;
+    static_assert(16 *AtomLayoutMSdP == kBlockM);
+    static_assert(32 *kNSGs / AtomLayoutMSdP == kBlockN);
+    static_assert(kBlockK == 32);
+    using TileShapeMSdP = Tile<Int<16 * AtomLayoutMSdP>, Int<32 * kNSGs / AtomLayoutMSdP>, _32>;
+
+    // using SubgroupLayout = Layout<Shape<_16, _1, _1>, Stride<_1, _1, _1>>;
+    // using TileShapeMSdP = Shape<Int<kBlockM>, Int<kBlockN>, Int<kBlockK>>;
     using TiledMmaSdP = typename TiledMMAHelper<MMA_Atom_ARCH,
                                                 Layout<TileShapeMSdP>,
                                                 SubgroupLayout>::TiledMMA;
@@ -36,9 +43,9 @@ struct FAKernel {
     using StrideC = cute::tuple<cute::C<1>, long>;
 
     using TiledCopyQ = decltype(make_tiled_copy(
-                                    Copy_Atom<Copy_Traits<XE_2D_U16x8x16_LD_N, StrideR>, DType>{},
+                                    Copy_Atom<Copy_Traits<XE_2D_U16x16x16_LD_N, StrideR>, DType>{},
                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 k-major
-                                    Layout<Shape<_8,_1>>{}));              // Val layout  32x2
+                                    Layout<Shape<_16,_1>>{}));              // Val layout  32x2
     using TiledCopyK = decltype(make_tiled_copy(
                                     Copy_Atom<Copy_Traits<XE_2D_U16x16x16_LD_T, StrideR>, DType>{},
                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
@@ -185,7 +192,7 @@ struct Param {
     T *dv;
     T *p;
     T *s;
-    T *buff;
+
     // const dimension
     int batch;
     int num_head_q;

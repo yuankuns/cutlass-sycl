@@ -139,6 +139,15 @@ void gemm_ker(Tensor0 &tCrC, Tensor1 &tCrA, Tensor2 &tCrB,
     }
 }
 
+template<class Tensor0, class Tensor1, class Tensor2>
+void load_lse(Tensor0 &lse, Tensor1 &mLSE, Tensor2 &taccScS_row) {
+    CUTLASS_PRAGMA_UNROLL
+    for (int mi = 0; mi < size(lse); ++mi) {
+        const int row = get<0>(taccScS_row(mi));
+        lse(mi) = mLSE(row);
+    }
+}
+
 template<typename T, class ProblemShape, class ThrMma,
          class AStride, class TiledCopyA,
          class BStride, class TiledCopyB,
@@ -727,23 +736,40 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
 
     Tensor tSrS = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});
 
+
+    // for lse read
+    Tensor caccS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{}); // same buffer as accS
+    Tensor taccScS = thr_mma_sdp.partition_C(caccS);
+    static_assert(decltype(size<0>(taccScS))::value == 8);
+    Tensor taccScS_row = logical_divide(taccScS, Shape<_1>{})(make_coord(0, _), _, 0);
+    Tensor lse = make_tensor<V>(Shape<Int<decltype(size(taccScS_row))::value>>{});
+    static_assert(size<0>(tSrS) * size<1>(tSrS) == size<0>(lse) && "row of acc and lse not match");
     // misc
-    // Tensor lse = make_tensor<V>(Shape<Int<decltype(size(taccScS_row))::value>>{});
+
     cutlass::NumericConverter<T, float> converter;
     const int max_m_block = ceil_div(param.seq_len_q, kBlockM);
+    constexpr int k_tile = ceil_div(kHeadDim, kBlockK);
     for (int m_block = 0; m_block < max_m_block - 1; ++m_block) {
         clear(tSrS);
-        constexpr int k_tile = ceil_div(kHeadDim, kBlockK);
-        if ((m_block == 0) and (cute::thread(0, 0))) {
-            cute::copy(copyQ, tQgQ(_, _, _, 0), tQrQ);
-            print_t(tQrQ(_, 0, 0));
+        // if ((m_block == 0) and (cute::thread(0, 0))) {
+        //     print(tQrQ);
+        //     print("\n");
+        //     print(tKrK);
+        //     print("\n");
+        //     print(tSrS);
+        //     print("\n");
+        // }
+        gemm_ker<k_tile>(tSrS, tSrQ, tSrK, tQgQ, tQrQ, tKgK, tKrK, tiled_mma_sdp, copyQ, copyK, thr_copy_q, thr_copy_k);
+        load_lse(lse, mLSE, taccScS_row);
+        // // Tensor scores = make_tensor(tSrS.data(), );
+        if (m_block == 0 and cute::thread(0, 0)) {
+            print("lse: ");
+            print_t(lse);
+            print("\nSrS:");
+            print_t(tSrS);
             print("\n");
         }
-        gemm_ker<k_tile>(tSrS, tSrQ, tSrK, tQgQ, tQrQ, tKgK, tKrK, tiled_mma_sdp, copyQ, copyK, thr_copy_q, thr_copy_k);
-        // if (m_block == 0 and cute::thread(0, 0)) {
-        //     print("tSrS: ");
-        //     print_t(tSrS);
-        // }
+        // tSrS - lse
         auto tSrSl = make_tensor_like<T>(tSrS);
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size(tSrS); ++i) {
@@ -780,6 +806,18 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
                                 make_layout(
                                     make_shape(tail_m, Int<kBlockN>{}, _1{}),
                                     make_stride(param.s_r_stride, _1{}, _0{})));
+        auto copyQ = typename Trait::TiledCopyQ{mQ};
+        auto copyK = typename Trait::TiledCopyK{mK};
+        auto copyS = typename Trait::TiledCopyS{mS};
+
+        clear(tSrS);
+        gemm_ker<k_tile>(tSrS, tSrQ, tSrK, tQgQ, tQrQ, tKgK, tKrK, tiled_mma_sdp, copyQ, copyK, thr_copy_q, thr_copy_k);
+        auto tSrSl = make_tensor_like<T>(tSrS);
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(tSrS); ++i) {
+            tSrSl(i) = converter(tSrS(i));
+        }
+        copy(copyS, tSrSl, tSgS);
     }
 
 }
@@ -909,7 +947,7 @@ mha_backward(T trait,
     const int bidh = BlockIdxY();
     const int max_n_block = ceil_div(param.seq_len_kv, trait.kBlockN);
     for (int n_block = 0; n_block < max_n_block; ++n_block)
-        dq_dk_dv_1colblock3(trait, param, bidb, bidh, n_block);
+        dq_dk_dv_1colblock2(trait, param, bidb, bidh, n_block);
 }
 
 template<typename T, class ProblemShape>
