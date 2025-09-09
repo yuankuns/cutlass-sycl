@@ -14,6 +14,7 @@ struct FAKernel {
       O BATCH,NUM_HEAD_Q,SEQ_LEN_QO,HEAD_SIZE_VO
     */
     using DType = T_;
+    using VType = float; // accumulation
     using MMA_Atom_ARCH = std::conditional_t<
         std::is_same_v<DType, cutlass::half_t>,
         MMA_Atom<XE_8x16x16_F32F16F16F32_TT>,
@@ -233,6 +234,10 @@ struct Boffset {
             h_id * param.s_s_stride +
             sq_id * param.s_r_stride + sk_id;
     }
+    index_t lse_offset(const index_t b_id, const index_t h_id, const index_t s_id) {
+        return b_id * param.seq_len_q * param.num_head_q + h_id * param.seq_len_q + s_id;
+    }
+
     Param<T> &param;
 };
 
