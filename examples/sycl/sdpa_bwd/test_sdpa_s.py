@@ -274,6 +274,7 @@ def test_sdpa(dtype,
     q_grad, k_grad, v_grad, p_grad, s_grad = test_model.backward_ref(grad)
     dump_dict = {}
     print(f"seed {seed} bsz {batch} nh_q {num_heads_q} nh_kv {num_heads_kv} sl_qo {seq_len_qo} sl_kv {seq_len_kv} hs_qk {head_size_qk} hs_vo {head_size_vo} dp {dropout_p} is_causal {is_causal}")
+    set_dict(dump_dict, 'out', attn_out)
     set_dict(dump_dict, 'grad', grad)
     set_dict(dump_dict, 'v_grad', v_grad)
     set_dict(dump_dict, 'lse', test_model.lse)
