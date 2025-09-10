@@ -167,18 +167,21 @@ struct Param {
           T *dk,
           T *dv,
           T *p,
-          T *s) : dO(dO),
-                  q(q),
-                  k(k),
-                  v(v),
-                  lse(lse),
-                  odo(odo),
-                  dq(dq),
-                  dk(dk),
-                  dv(dv),
-                  p(p),
-                  s(s),
-                  is_bhsd(true) {}
+          T *s,
+          const float softmax_scale)
+        : dO(dO),
+          q(q),
+          k(k),
+          v(v),
+          lse(lse),
+          odo(odo),
+          dq(dq),
+          dk(dk),
+          dv(dv),
+          p(p),
+          s(s),
+          scale_softmax_log2(softmax_scale * M_LOG2E),
+          is_bhsd(true) {}
     // read only
     const T *dO;
     const T *q;
@@ -186,6 +189,7 @@ struct Param {
     const T *v;
     const float *lse;
     const float *odo;
+    const float scale_softmax_log2;
     // write
     T *dq;
     T *dk;

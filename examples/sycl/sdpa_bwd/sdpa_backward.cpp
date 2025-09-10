@@ -147,6 +147,28 @@ void load_lse(Tensor0 &lse, Tensor1 &mLSE, Tensor2 &taccScS_row) {
         lse(mi) = mLSE(row);
     }
 }
+template<typename Layout>
+auto convert_layout_acc_layout(Layout acc_layout) {
+    static_assert(decltype(size<0>(acc_layout))::value == 8);
+    static_assert(decltype(rank(acc_layout))::value == 3);
+    auto l = logical_divide(acc_layout, Shape<_1>{});  // ((2, 2), MMA_M, MMA_N)
+    return make_layout(make_layout(get<0, 1>(l), get<1>(l)), make_layout(get<0, 0>(l), get<2>(l)));
+}
+
+template<class Engine0, class Layout0, class Engine1, class Layout1>
+void scale_apply_exp2(Tensor<Engine0, Layout0> &tensor, Tensor<Engine1, Layout1> &max, const float scale) {
+    static_assert(Layout0::rank == 2, "Only support 2D Tensor");
+    static_assert(Layout1::rank == 1, "Only support 1D Tensor");
+    CUTE_STATIC_ASSERT_V(size<0>(max) == size<0>(tensor));
+    CUTLASS_PRAGMA_UNROLL
+    for (int mi = 0; mi < size<0>(tensor); ++mi) {
+        const float max_scaled = max(mi) == -INFINITY ? 0.f : max(mi) * M_LOG2E;
+        CUTLASS_PRAGMA_UNROLL
+        for (int ni = 0; ni < size<1>(tensor); ++ni)  {
+            tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
+        }
+    }
+}
 
 template<typename T, class ProblemShape, class ThrMma,
          class AStride, class TiledCopyA,
@@ -761,14 +783,14 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
         // }
         gemm_ker<k_tile>(tSrS, tSrQ, tSrK, tQgQ, tQrQ, tKgK, tKrK, tiled_mma_sdp, copyQ, copyK, thr_copy_q, thr_copy_k);
         load_lse(lse, mLSE, taccScS_row);
-        // // Tensor scores = make_tensor(tSrS.data(), );
-        if (m_block == 0 and cute::thread(0, 0)) {
-            print("lse: ");
-            print_t(lse);
-            print("\nSrS:");
-            print_t(tSrS);
-            print("\n");
-        }
+        Tensor scores = make_tensor(tSrS.data(), convert_layout_acc_layout(tSrS.layout()));
+        scale_apply_exp2(scores, lse, param.scale_softmax_log2);
+        // if (m_block == 0 and cute::thread(0, 0)) {
+        //     print("lse: ");
+        //     print_t(lse);
+        //     print("\nscores");
+        //     print_t(scores);
+        // }
         // tSrS - lse
         auto tSrSl = make_tensor_like<T>(tSrS);
         CUTLASS_PRAGMA_UNROLL
@@ -812,6 +834,9 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
 
         clear(tSrS);
         gemm_ker<k_tile>(tSrS, tSrQ, tSrK, tQgQ, tQrQ, tKgK, tKrK, tiled_mma_sdp, copyQ, copyK, thr_copy_q, thr_copy_k);
+        load_lse(lse, mLSE, taccScS_row);
+        Tensor scores = make_tensor(tSrS.data(), convert_layout_acc_layout(tSrS.layout()));
+        scale_apply_exp2(scores, lse, param.scale_softmax_log2);
         auto tSrSl = make_tensor_like<T>(tSrS);
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size(tSrS); ++i) {
@@ -973,7 +998,8 @@ void launch_mha_backward(ProblemShape problem_shape,
     constexpr int kBlockK = 32;
     auto trait = FAKernel<T, kHeadDim, kBlockM, kBlockN, kBlockK, numSGs>();
     auto param = Param<T>(do_d, q_d, k_d, v_d, lse_d, odo_d,
-                          dq_d, dk_d, dv_d, p_d, s_d);
+                          dq_d, dk_d, dv_d, p_d, s_d,
+                          1 / sqrt(static_cast<float>(kHeadDim)));
     param.batch = get<0>(problem_shape);
     param.num_head_q = get<1>(problem_shape);
     param.num_head_kv = get<2>(problem_shape);
@@ -1096,7 +1122,7 @@ int main(int argc, char**argv) {
     std::vector<T> s_test(BATCH * NUM_HEAD_Q * SEQ_LEN_QO * SEQ_LEN_KV);
     syclcompat::memcpy<T>(s_test.data(), s_d, s_test.size());
     syclcompat::wait_and_throw();
-    verify(s_npy.data<T>(), s_test.data(), BATCH * NUM_HEAD_Q, SEQ_LEN_QO, SEQ_LEN_KV, atol, rtol);
+    verify(p_npy.data<T>(), s_test.data(), BATCH * NUM_HEAD_Q, SEQ_LEN_QO, SEQ_LEN_KV, atol, rtol);
     // for (int m = 0; m < 4; ++m) {
     //     for (int n = 0; n < 64; ++n) {
     //         if (n % 16 == 0)
