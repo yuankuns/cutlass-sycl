@@ -45,15 +45,29 @@ struct FAKernel {
     using TiledCopyQ = decltype(make_tiled_copy(
                                     Copy_Atom<Copy_Traits<XE_2D_U16x16x16_LD_N, StrideR>, DType>{},
                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 k-major
-                                    Layout<Shape<_16,_1>>{}));              // Val layout  32x2
+                                    Layout<Shape<_16,_1>>{}));              // Val layout  16x1
     using TiledCopyK = decltype(make_tiled_copy(
                                     Copy_Atom<Copy_Traits<XE_2D_U16x16x16_LD_T, StrideR>, DType>{},
                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
-                                    Layout<Shape<_16,_1>>{}));              // Val layout  32x2
+                                    Layout<Shape<_16,_1>>{}));              // Val layout  16x1
+
+    using TiledCopydO = decltype(make_tiled_copy(
+                                     Copy_Atom<Copy_Traits<XE_2D_U16x16x16_LD_N, StrideR>, DType>{},
+                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 k-major
+                                     Layout<Shape<_16,_1>>{}));              // Val layout  16x1
+
+    using TiledCopyV = decltype(make_tiled_copy(
+                                    Copy_Atom<Copy_Traits<XE_2D_U16x16x16_LD_T, StrideR>, DType>{},
+                                    Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
+                                    Layout<Shape<_16,_1>>{}));              // Val layout  16x1
     using TiledCopyS = decltype(make_tiled_copy(
                                     Copy_Atom<Copy_Traits<XE_2D_U16x8x16_ST_N, StrideR>, DType>{},
                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
                                     Layout<Shape<_8,_1>>{}));              // Val layout  8x1
+    using TiledCopydP = decltype(make_tiled_copy(
+                                     Copy_Atom<Copy_Traits<XE_2D_U16x8x16_ST_N, StrideR>, DType>{},
+                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
+                                     Layout<Shape<_8,_1>>{}));              // Val layout  8x1
     // static constexpr auto tiled_mma_sdp = TiledMmaSdP{};
     /*
       shape
@@ -158,6 +172,7 @@ using index_t = uint64_t;
 template<typename T>
 struct Param {
     Param(const T *dO,
+          const T *o,
           const T *q,
           const T *k,
           const T *v,
@@ -166,36 +181,38 @@ struct Param {
           T *dq,
           T *dk,
           T *dv,
-          T *p,
           T *s,
+          T *dp,
           const float softmax_scale)
-        : dO(dO),
-          q(q),
-          k(k),
-          v(v),
-          lse(lse),
-          odo(odo),
-          dq(dq),
-          dk(dk),
-          dv(dv),
-          p(p),
-          s(s),
+        : do_ptr(dO),
+          o_ptr(o),
+          q_ptr(q),
+          k_ptr(k),
+          v_ptr(v),
+          lse_ptr(lse),
+          odo_ptr(odo),
+          dq_ptr(dq),
+          dk_ptr(dk),
+          dv_ptr(dv),
+          s_ptr(s),
+          dp_ptr(dp),
           scale_softmax_log2(softmax_scale * M_LOG2E),
           is_bhsd(true) {}
     // read only
-    const T *dO;
-    const T *q;
-    const T *k;
-    const T *v;
-    const float *lse;
-    const float *odo;
+    const T *do_ptr;
+    const T *o_ptr;
+    const T *q_ptr;
+    const T *k_ptr;
+    const T *v_ptr;
+    const float *lse_ptr;
+    const float *odo_ptr;
     const float scale_softmax_log2;
     // write
-    T *dq;
-    T *dk;
-    T *dv;
-    T *p;
-    T *s;
+    T *dq_ptr;
+    T *dk_ptr;
+    T *dv_ptr;
+    T *s_ptr;
+    T *dp_ptr;
 
     // const dimension
     int batch;
@@ -215,6 +232,10 @@ struct Param {
     int v_r_stride;
     int v_h_stride;
     int v_b_stride;
+
+    int o_r_stride;
+    int o_h_stride;
+    int o_b_stride;
 
     int s_r_stride;
     int s_s_stride;
@@ -249,6 +270,9 @@ struct Boffset {
         return b_id * param.seq_len_q * param.num_head_q + h_id * param.seq_len_q + s_id;
     }
 
+    index_t o_offset(const index_t b_id, const index_t h_id, const index_t s_id) {
+        return b_id * param.o_b_stride + h_id * param.o_h_stride + s_id * param.o_r_stride;
+    }
     Param<T> &param;
 };
 
@@ -279,9 +303,9 @@ void setup_bhsd_stride(Param<T> &param) {
     // param.dv_h_stride = param.seq_len_kv * param.head_dim;
     // param.dv_b_stride = param.num_head_kv * param.seq_len_kv * param.head_dim;
 
-    // param.o_r_stride = param.head_dim;
-    // param.o_h_stride = param.seq_len_q * param.head_dim;
-    // param.o_b_stride = param.num_head_q * param.seq_len_q * param.head_dim;
+    param.o_r_stride = param.head_dim;
+    param.o_h_stride = param.seq_len_q * param.head_dim;
+    param.o_b_stride = param.num_head_q * param.seq_len_q * param.head_dim;
 
     // param.do_r_stride = param.head_dim;
     // param.do_h_stride = param.seq_len_q * param.head_dim;
