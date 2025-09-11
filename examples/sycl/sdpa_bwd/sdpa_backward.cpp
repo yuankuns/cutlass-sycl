@@ -642,11 +642,11 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                                 shapeS,
                                 make_stride(param.s_r_stride, _1{}, _0{})));
 
-    Shape tile_sdp = typename Trait::TileShapeMSdP{};
+    Shape tile_sdp = typename Trait::TileShapeSdP{};
 
-    auto copyQ = typename Trait::TiledCopyQ{mQ};
-    auto copyK = typename Trait::TiledCopyK{mK};
-    auto copyS = typename Trait::TiledCopyS{mS};
+    auto tileloadQ = typename Trait::TiledLoadQ{mQ};
+    auto tileloadK = typename Trait::TiledLoadK{mK};
+    auto tilesaveS = typename Trait::TiledSaveS{mS};
 
     Tensor mQ_coord = cute::get_xe_tensor(shapeQ);
     Tensor mK_coord = cute::get_xe_tensor(shapeK);
@@ -668,11 +668,11 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         Tensor tSgK = thr_mma_sdp.partition_B(gK);
         Tensor tSgS = thr_mma_sdp.partition_C(gS); // debug
 
-        Tensor tSrQ = make_tensor<T>(make_fragment_layout(copyQ, tSgQ(_,_,_,0).shape()));
-        Tensor tSrK = make_tensor<T>(make_fragment_layout(copyK, tSgK(_,_,_,0).shape()));
+        Tensor tSrQ = make_tensor<T>(make_fragment_layout(tileloadQ, tSgQ(_,_,_,0).shape()));
+        Tensor tSrK = make_tensor<T>(make_fragment_layout(tileloadK, tSgK(_,_,_,0).shape()));
 
-        ThrCopy thr_copy_q = copyQ.get_slice(syclcompat::local_id::x());
-        ThrCopy thr_copy_k = copyK.get_slice(syclcompat::local_id::x());
+        ThrCopy thr_copy_q = tileloadQ.get_slice(syclcompat::local_id::x());
+        ThrCopy thr_copy_k = tileloadK.get_slice(syclcompat::local_id::x());
 
         // Retile registers for copies
         Tensor tQrQ = thr_copy_q.retile_D(tSrQ);
@@ -686,7 +686,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         clear(tSrS);
 
         constexpr int k_tile = ceil_div(kHeadDim, kBlockK);
-        gemm_ker<k_tile>(tSrS, tSrQ, tSrK, tQgQ, tQrQ, tKgK, tKrK, tiled_mma_sdp, copyQ, copyK, thr_copy_q, thr_copy_k);
+        gemm_ker<k_tile>(tSrS, tSrQ, tSrK, tQgQ, tQrQ, tKgK, tKrK, tiled_mma_sdp, tileloadQ, tileloadK, thr_copy_q, thr_copy_k);
         // if (m_block == 0 and cute::thread(0, 0)) {
         //     print("tSrS: ");
         //     print_t(tSrS);
@@ -696,7 +696,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         for (int i = 0; i < size(tSrS); ++i) {
             tSrSl(i) = converter(tSrS(i));
         }
-        copy(copyS, tSrSl, tSgS);
+        copy(tilesaveS, tSrSl, tSgS);
     }
 
 }
@@ -713,6 +713,7 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
     constexpr int kBlockN = Trait::kBlockN;
     constexpr int kBlockK = Trait::kBlockK;
     auto sg = syclcompat::get_nd_item<1>().get_sub_group();
+    auto group = syclcompat::get_nd_item<1>().get_group();
     auto first_thread_in_sg_idx = sg.get_group_linear_id() * trait.SubgroupSize;
     auto bofst = Boffset(param);
 
@@ -721,8 +722,12 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
     const index_t v_offset = bofst.v_offset(bidb, bidh, n_block * kBlockN);
     const index_t o_offset = bofst.o_offset(bidb, bidh, 0);
     const index_t do_offset = bofst.o_offset(bidb, bidh, 0);
+    const index_t dv_offset = bofst.v_offset(bidb, bidh, n_block * kBlockN);
     const index_t lse_offset = bofst.lse_offset(bidb, bidh, 0);
     const index_t dpsum_offset = bofst.lse_offset(bidb, bidh, 0);
+
+    // buff offset
+    const index_t pb_offset = bidb * param.num_head_q * kBlockM * kBlockN + bidh * kBlockM * kBlockN;
 
     const index_t s_offset = bofst.ps_offset(bidb, bidh, 0, n_block * kBlockN);
     const index_t dp_offset = bofst.ps_offset(bidb, bidh, 0, n_block * kBlockN);
@@ -731,9 +736,12 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
     Shape shapeK = Shape<Int<kBlockN>, Int<kHeadDim>, _1>{};
     Shape shapeV = Shape<Int<kBlockN>, Int<kHeadDim>, _1>{};
     Shape shapeO = Shape<Int<kBlockM>, Int<kHeadDim>, _1>{};
+    Shape shapeOt = Shape<Int<kHeadDim>, Int<kBlockM>, _1>{};
 
-    Shape shapeS = Shape<Int<kBlockM>, Int<kBlockN>, _1>{};
+    Shape shapeSP = Shape<Int<kBlockM>, Int<kBlockN>, _1>{};
     Shape shapedP = Shape<Int<kBlockM>, Int<kBlockN>, _1>{};
+
+    Shape shapePt = Shape<Int<kBlockN>, Int<kBlockM>, _1>{};
 
     Tensor mQ = make_tensor(make_gmem_ptr(param.q_ptr + q_offset),
                             make_layout(
@@ -751,11 +759,19 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
                              make_layout(
                                  shapeO,
                                  make_stride(param.o_r_stride, _1{}, _0{})));
-    Tensor mO = make_tensor(make_gmem_ptr(param.o_ptr + o_offset),
+    // intermediate buffer
+    Tensor mP = make_tensor(make_gmem_ptr(param.pb_ptr + pb_offset),
                             make_layout(
-                                shapeO,
-                                make_stride(param.o_r_stride, _1{}, _0{})));
-
+                                shapeSP,
+                                make_stride(Int<kBlockN>{}, _1{}, _1{})));
+    Tensor mPt = make_tensor(make_gmem_ptr(param.pb_ptr + pb_offset),
+                             make_layout(
+                                 shapePt,
+                                 make_stride(_1{}, Int<kBlockN>{}, _1{})));
+    Tensor mdOt = make_tensor(make_gmem_ptr(param.do_ptr+do_offset),
+                              make_layout(
+                                  shapeOt,
+                                  make_stride(_1{}, param.o_r_stride, _0{})));
     Tensor mLSE = make_tensor(make_gmem_ptr(param.lse_ptr + lse_offset),
                               make_layout(
                                   Shape<Int<kBlockM>>{},
@@ -765,39 +781,59 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
                                     Shape<Int<kBlockM>>{},
                                     Stride<_1>{}));
 
+    Tensor mdV = make_tensor(make_gmem_ptr(param.dv_ptr + dv_offset), make_layout(
+                             shapeV,
+                             make_stride(param.v_r_stride, _1{}, _1{})));
     Tensor mS = make_tensor(make_gmem_ptr(param.s_ptr + s_offset), make_layout(
-                                shapeS,
+                                shapeSP,
                                 make_stride(param.s_r_stride, _1{}, _0{})));
     Tensor mdP = make_tensor(make_gmem_ptr(param.dp_ptr + s_offset), make_layout(
-                                shapeS,
+                                shapeSP,
                                 make_stride(param.s_r_stride, _1{}, _0{})));
 
-    Shape tile_sdp = typename Trait::TileShapeMSdP{};
 
-    auto copyQ = typename Trait::TiledCopyQ{mQ};
-    auto copyK = typename Trait::TiledCopyK{mK};
-    auto copydO = typename Trait::TiledCopydO{mdO};
-    auto copyV = typename Trait::TiledCopyV{mV};
+    Shape tile_sdp = typename Trait::TileShapeSdP{};
+    Shape tile_dkv = typename Trait::TileShapedKV{};
 
-    auto copyS = typename Trait::TiledCopyS{mS};
-    auto copydP = typename Trait::TiledCopydP{mdP};
+    auto tileloadQ = typename Trait::TiledLoadQ{mQ};
+    auto tileloadK = typename Trait::TiledLoadK{mK};
+    auto tileloaddO = typename Trait::TiledLoaddO{mdO};
+    auto tileloadV = typename Trait::TiledLoadV{mV};
+    auto tileloadPt = typename Trait::TiledLoadPt{mPt};
+    auto tileloaddOt = typename Trait::TiledLoaddOt{mdOt}; // load dO as operand B for dV=Pt*dO
+
+    auto tilesaveP = typename Trait::TiledSaveS{mP}; // to internal buffer
+    auto tilesavedV = typename Trait::TiledSavedV{mdV};
+
+    auto tilesaveS = typename Trait::TiledSaveS{mS};
+    auto tilesavedP = typename Trait::TiledSavedP{mdP};
 
     Tensor mQ_coord = cute::get_xe_tensor(shapeQ);
     Tensor mK_coord = cute::get_xe_tensor(shapeK);
     Tensor mV_coord = cute::get_xe_tensor(shapeV);
     Tensor mdO_coord = cute::get_xe_tensor(shapeO);
+    Tensor mdOt_coord = cute::get_xe_tensor(shapeOt);
+    Tensor mdV_coord = cute::get_xe_tensor(shapeV);
 
-    Tensor mS_coord = cute::get_xe_tensor(shapeS);
+    Tensor mS_coord = cute::get_xe_tensor(shapeSP);
+    Tensor mPt_coord = cute::get_xe_tensor(shapePt);
     Tensor mdP_coord = cute::get_xe_tensor(shapedP);
 
     typename Trait::TiledMmaSdP tiled_mma_sdp;
+    typename Trait::TiledMmadKV tiled_mma_dkv;
 
     auto thr_mma_sdp = tiled_mma_sdp.get_slice(first_thread_in_sg_idx);
+    auto thr_mma_dkv = tiled_mma_dkv.get_slice(first_thread_in_sg_idx);
 
     Tensor gQ = local_tile(mQ_coord, select<0, 2>(tile_sdp), make_coord(0, _, 0));
     Tensor gK = local_tile(mK_coord, select<1, 2>(tile_sdp), make_coord(0, _, 0));
     Tensor gdO = local_tile(mdO_coord, select<0, 2>(tile_sdp), make_coord(0, _, 0));
     Tensor gV = local_tile(mV_coord, select<1, 2>(tile_sdp), make_coord(0, _, 0));
+    Tensor gPt = local_tile(mPt_coord, select<0, 2>(tile_dkv), make_coord(0, _, 0)); // load Pt
+    Tensor gdOt = local_tile(mdOt_coord, select<1, 2>(tile_dkv), make_coord(0, _, 0));
+
+    Tensor gP = local_tile(mS_coord, select<0, 1>(tile_sdp), make_coord(0, 0, 0)); // dump P
+    Tensor gdV = local_tile(mdV_coord, select<0, 1>(tile_dkv), make_coord(0, 0, 0));
 
     Tensor gS = local_tile(mS_coord, select<0, 1>(tile_sdp), make_coord(0, 0, 0)); // debug
     Tensor gdP = local_tile(mdP_coord, select<0, 1>(tile_sdp), make_coord(0, 0, 0)); // debug
@@ -806,35 +842,48 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
     Tensor tSgK = thr_mma_sdp.partition_B(gK);
     Tensor tdPgdO = thr_mma_sdp.partition_A(gdO);
     Tensor tdPgV = thr_mma_sdp.partition_B(gV);
+    Tensor tdVgPt = thr_mma_dkv.partition_A(gPt);
+    Tensor tdVgdOt = thr_mma_dkv.partition_B(gdOt);
+
+    Tensor tPgP = thr_mma_sdp.partition_C(gP); // internal buffer
+    Tensor tdVgdV = thr_mma_dkv.partition_C(gdV); // save to dv
 
     Tensor tSgS = thr_mma_sdp.partition_C(gS); // debug
     Tensor tdPgdP = thr_mma_sdp.partition_C(gdP); // debug
 
-    Tensor tSrQ = make_tensor<T>(make_fragment_layout(copyQ, tSgQ(_,_,_,0).shape()));
-    Tensor tSrK = make_tensor<T>(make_fragment_layout(copyK, tSgK(_,_,_,0).shape()));
-    Tensor tdPrdO = make_tensor<T>(make_fragment_layout(copydO, tdPgdO(_,_,_,0).shape()));
-    Tensor tdPrV = make_tensor<T>(make_fragment_layout(copyV, tdPgV(_,_,_,0).shape()));
+    Tensor tSrQ = make_tensor<T>(make_fragment_layout(tileloadQ, tSgQ(_,_,_,0).shape()));
+    Tensor tSrK = make_tensor<T>(make_fragment_layout(tileloadK, tSgK(_,_,_,0).shape()));
+    Tensor tdPrdO = make_tensor<T>(make_fragment_layout(tileloaddO, tdPgdO(_,_,_,0).shape()));
+    Tensor tdPrV = make_tensor<T>(make_fragment_layout(tileloadV, tdPgV(_,_,_,0).shape()));
+    Tensor tdVrPt = make_tensor<T>(make_fragment_layout(tileloadPt, tdVgPt(_,_,_,0).shape()));
+    Tensor tdVrdOt = make_tensor<T>(make_fragment_layout(tileloaddOt, tdVgdOt(_,_,_,0).shape()));
 
-    ThrCopy thr_copy_q = copyQ.get_slice(syclcompat::local_id::x());
-    ThrCopy thr_copy_k = copyK.get_slice(syclcompat::local_id::x());
-    ThrCopy thr_copy_do = copydO.get_slice(syclcompat::local_id::x());
-    ThrCopy thr_copy_v = copyV.get_slice(syclcompat::local_id::x());
+    ThrCopy thr_copy_q = tileloadQ.get_slice(syclcompat::local_id::x());
+    ThrCopy thr_copy_k = tileloadK.get_slice(syclcompat::local_id::x());
+    ThrCopy thr_copy_do = tileloaddO.get_slice(syclcompat::local_id::x());
+    ThrCopy thr_copy_v = tileloadV.get_slice(syclcompat::local_id::x());
+    ThrCopy thr_copy_pt = tileloadPt.get_slice(syclcompat::local_id::x());
+    ThrCopy thr_copy_dot = tileloaddOt.get_slice(syclcompat::local_id::x());
 
     // Retile registers for copies
     Tensor tQrQ = thr_copy_q.retile_D(tSrQ);
     Tensor tKrK = thr_copy_k.retile_D(tSrK);
     Tensor tdOrdO = thr_copy_do.retile_D(tdPrdO);
     Tensor tVrV = thr_copy_v.retile_D(tdPrV);
+    Tensor tPtrPt = thr_copy_pt.retile_D(tdVrPt);
+    Tensor tdOtrdOt = thr_copy_dot.retile_D(tdVrdOt);
 
     // Retile global counting tensors for copies
     Tensor tQgQ = thr_copy_q.retile_S(tSgQ);
     Tensor tKgK = thr_copy_k.retile_S(tSgK);
     Tensor tdOgdO = thr_copy_do.retile_S(tdPgdO);
     Tensor tVgV = thr_copy_v.retile_S(tdPgV);
+    Tensor tPtgPt = thr_copy_pt.retile_S(tdVgPt);
+    Tensor tdOtgdOt = thr_copy_dot.retile_S(tdVgdOt);
 
     Tensor tSrS = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});
     Tensor tdPrdP = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});
-
+    Tensor tdVrdV = partition_fragment_C(tiled_mma_dkv, Shape<Int<kBlockN>, Int<kHeadDim>>{});
 
     // for lse read
     Tensor caccS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{}); // same buffer as accS
@@ -847,6 +896,9 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
 
     const int max_m_block = ceil_div(param.seq_len_q, kBlockM);
     constexpr int k_tile = ceil_div(kHeadDim, kBlockK);
+
+    // clear accumulator
+    clear(tdVrdV);
     for (int m_block = 0; m_block < max_m_block - 1; ++m_block) {
         clear(tSrS);
         clear(tdPrdP);
@@ -858,18 +910,34 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
         //     print(tSrS);
         //     print("\n");
         // }
-        gemm_ker<k_tile>(tSrS, tSrQ, tSrK, tQgQ, tQrQ, tKgK, tKrK, tiled_mma_sdp, copyQ, copyK, thr_copy_q, thr_copy_k);
+        // S=QKt
+        gemm_ker<k_tile>(tSrS, tSrQ, tSrK, tQgQ, tQrQ, tKgK, tKrK, tiled_mma_sdp, tileloadQ, tileloadK, thr_copy_q, thr_copy_k);
+        // if (cute::thread(0, 0)) {
+        //     print("S(%d, %d):", m_block, n_block);
+        //     print_t(tSrS);
+        //     print("\n");
+        // }
         load_1colvec(lse, mLSE, taccScS_row);
         Tensor dP_sum = make_fragment_like(lse);
         load_1colvec(dP_sum, mdPsum, taccScS_row);
         Tensor scores = make_tensor(tSrS.data(), convert_layout_acc_layout(tSrS.layout()));
+        // P=softmax(S,lse)
         scale_apply_exp2(scores, lse, param.scale_softmax_log2);
+        // if (cute::thread(0, 0)) {
+        //     print("P(%d, %d): ", m_block, n_block);
+        //     print_t(tSrS);
+        //     print("\n");
+        // }
+        auto tSrSl = convert_type<T>(tSrS);
+        copy(tilesaveP, tSrSl, tPgP); // save P to internal buffers
+        copy(tilesaveS, tSrSl, tSgS); // save P to external tensor for verification
         // if (m_block == 0 and cute::thread(0, 0)) {
         //     print("scores");
         //     print_t(scores);
         //     print("\n");
         // }
-        gemm_ker<k_tile>(tdPrdP, tdPrdO, tdPrV, tdOgdO, tdOrdO, tVgV, tVrV, tiled_mma_sdp, copydO, copyV, thr_copy_do, thr_copy_v);
+        // dP=dO*Vt
+        gemm_ker<k_tile>(tdPrdP, tdPrdO, tdPrV, tdOgdO, tdOrdO, tVgV, tVrV, tiled_mma_sdp, tileloaddO, tileloadV, thr_copy_do, thr_copy_v);
         Tensor dS = make_tensor(tdPrdP.data(), scores.layout());
         // if (m_block == 0 and cute::thread(0, 0)) {
         //     print("scores/P");
@@ -880,31 +948,51 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
         //     print_t(dS);
         //     print("\n");
         // }
+        // dS=P(dP-sum_row(P))*scale
         softmax_backward(scores, dP_sum, dS, param.scale_softmax);
         // if (m_block == 0  and cute::thread(0, 0)) {
         //     print("dS");
         //     print_t(dS);
         //     print("\n");
         // }
-        // tSrS - lse
-        auto tSrSl = convert_type<T>(tSrS);
-        copy(copyS, tSrSl, tSgS);
-        auto tdPrdPl = convert_type<T>(tdPrdP);
-        copy(copydP, tdPrdPl, tdPgdP);
 
+        cute::copy(tileloadPt, tPtgPt(_, _, _, 0), tdVrPt);
+        cute::copy(tileloaddOt, tdOtgdOt(_, _, _, 0), tdVrdOt);
+        // if (cute::thread(0, 0)) { //
+        //     // print("P");
+        //     // print_t(tSrS);
+        //     print("\nPt(%d, %d):", m_block, n_block);
+        //     print_t(tdVrPt);
+        //     print("\ndOt(%d, %d):", m_block, n_block);
+        //     print_t(tdVrdOt);
+        //     print("\n size k: ");
+        //     print(size<3>(tPtgPt));
+        //     print("\n");
+        // }
+        auto tdPrdPl = convert_type<T>(tdPrdP);
+        copy(tilesavedP, tdPrdPl, tdPgdP); // save dP to external tensor for verification
+
+        // dV=Pt*dO
+        gemm_ker(tdVrdV, tdVrPt, tdVrdOt, tPtgPt, tPtrPt, tdOtgdOt, tdOtrdOt, tiled_mma_dkv, tileloadPt, tileloaddOt, thr_copy_pt, thr_copy_dot);
+        // if (cute::thread(0, 0)) {
+        //     print("\ndV: ");
+        //     print_t(tdVrdV);
+        // }
         // update ptr/atom copy
         mQ.data() = mQ.data() + int(kBlockM * param.q_r_stride);
         mdO.data() = mdO.data() + int(kBlockM * param.o_r_stride);
+        mdOt.data() = mdOt.data() + int(kBlockM * param.o_r_stride);
         mS.data() = mS.data() + int(kBlockM * param.s_r_stride); // debug
         mdP.data() = mdP.data() + int(kBlockM * param.s_r_stride); // debug
         mLSE.data() = mLSE.data() + int(kBlockM);
         mdPsum.data() = mdPsum.data() + int(kBlockM);
 
-        copyQ = typename Trait::TiledCopyQ{mQ};
-        copydO = typename Trait::TiledCopydO{mdO};
+        tileloadQ = typename Trait::TiledLoadQ{mQ};
+        tileloaddO = typename Trait::TiledLoaddO{mdO};
+        tileloaddOt = typename Trait::TiledLoaddOt{mdOt};
 
-        copyS = typename Trait::TiledCopyS{mS}; // debug
-        copydP = typename Trait::TiledCopyS{mdP}; // debug
+        tilesaveS = typename Trait::TiledSaveS{mS}; // debug
+        tilesavedP = typename Trait::TiledSaveS{mdP}; // debug
     }
     int m_block = max_m_block - 1;
     const int tail_m = param.seq_len_q - m_block * kBlockM;
@@ -912,6 +1000,7 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
     if (tail_m > 0) {
         const index_t q_offset = bofst.q_offset(bidb, bidh, m_block * kBlockM);
         const index_t k_offset = bofst.k_offset(bidb, bidh, n_block * kBlockN);
+        const index_t do_offset = bofst.o_offset(bidb, bidh, m_block * kBlockM);
         const index_t s_offset = bofst.ps_offset(bidb, bidh, m_block * kBlockM, n_block * kBlockN);
         const index_t lse_offset = bofst.lse_offset(bidb, bidh, m_block * kBlockM);
 
@@ -919,6 +1008,14 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
                                 make_layout(
                                     make_shape(tail_m, Int<kHeadDim>{}, _1{}),
                                     make_stride(param.q_r_stride, _1{}, _0{})));
+        Tensor mdO = make_tensor(make_gmem_ptr(param.do_ptr + do_offset),
+                                 make_layout(
+                                     make_shape(tail_m, Int<kHeadDim>{}, _1{}),
+                                     make_stride(param.o_r_stride, _1{}, _0{})));
+        Tensor mdOt = make_tensor(make_gmem_ptr(param.do_ptr+do_offset),
+                                  make_layout(
+                                      make_shape(Int<kHeadDim>{}, tail_m, _1{}),
+                                      make_stride(_1{}, param.o_r_stride, _0{})));
         Tensor mK = make_tensor(make_gmem_ptr(param.k_ptr + k_offset),
                                 make_layout(
                                     shapeK,
@@ -932,28 +1029,50 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
                                     make_shape(tail_m, Int<kBlockN>{}, _1{}),
                                     make_stride(param.s_r_stride, _1{}, _0{}))); // debug
 
-        auto copyQ = typename Trait::TiledCopyQ{mQ};
-        auto copyK = typename Trait::TiledCopyK{mK};
-        auto copyS = typename Trait::TiledCopyS{mS};
-        auto copydP = typename Trait::TiledCopydP{mdP};
+        auto tileloadQ = typename Trait::TiledLoadQ{mQ};
+        auto tileloadK = typename Trait::TiledLoadK{mK};
+        auto tileloaddO = typename Trait::TiledLoaddO{mdO};
+        auto tileloaddOt = typename Trait::TiledLoaddOt{mdOt};
+        auto tilesaveS = typename Trait::TiledSaveS{mS};
+        auto tilesavedP = typename Trait::TiledSavedP{mdP};
 
         clear(tSrS);
         clear(tdPrdP);
-        gemm_ker<k_tile>(tSrS, tSrQ, tSrK, tQgQ, tQrQ, tKgK, tKrK, tiled_mma_sdp, copyQ, copyK, thr_copy_q, thr_copy_k);
+        // S=QKt
+        gemm_ker<k_tile>(tSrS, tSrQ, tSrK, tQgQ, tQrQ, tKgK, tKrK, tiled_mma_sdp, tileloadQ, tileloadK, thr_copy_q, thr_copy_k);
         load_1colvec(lse, mLSE, taccScS_row);
         Tensor dP_sum = make_fragment_like(lse);
         load_1colvec(dP_sum, mdPsum, taccScS_row);
         Tensor scores = make_tensor(tSrS.data(), convert_layout_acc_layout(tSrS.layout()));
+        // P=softmax(S,lse)
         scale_apply_exp2(scores, lse, param.scale_softmax_log2);
-        gemm_ker<k_tile>(tdPrdP, tdPrdO, tdPrV, tdOgdO, tdOrdO, tVgV, tVrV, tiled_mma_sdp, copydO, copyV, thr_copy_do, thr_copy_v);
-        Tensor dS = make_tensor(tdPrdP.data(), scores.layout());
-        softmax_backward(scores, dP_sum, dS, param.scale_softmax);
         auto tSrSl = convert_type<T>(tSrS);
-        copy(copyS, tSrSl, tSgS);
+        copy(tilesaveP, tSrSl, tPgP); // save P to internal buffers
+        copy(tilesaveS, tSrSl, tSgS); // save P to external tensor for verification
+        // dP=dO*Vt
+        gemm_ker<k_tile>(tdPrdP, tdPrdO, tdPrV, tdOgdO, tdOrdO, tVgV, tVrV, tiled_mma_sdp, tileloaddO, tileloadV, thr_copy_do, thr_copy_v);
+        Tensor dS = make_tensor(tdPrdP.data(), scores.layout());
+        // dS=P(dP-sum_row(P))*scale
+        softmax_backward(scores, dP_sum, dS, param.scale_softmax);
+        // if (cute::thread(0, 0)) {
+        //     print("dP: ");
+        //     print_t(dP);
+        // }
+        // if (cute::thread(0, 0)) {
+        //     print("tdVrdV");
+        //     print_t(tdVrdV);
+        // }
         auto tdPrdPl = convert_type<T>(tdPrdP);
-        copy(copydP, tdPrdPl, tdPgdP);
+        copy(tilesavedP, tdPrdPl, tdPgdP);
+        gemm_ker(tdVrdV, tdVrPt, tdVrdOt, tPtgPt, tPtrPt, tdOtgdOt, tdOtrdOt, tiled_mma_dkv, tileloadPt, tileloaddOt, thr_copy_pt, thr_copy_dot);
+        // gemm_ker(tdVrdV, tdVrPt, tdVrdOt, tPtgPt, tPtrPt, tdOtgdOt, tdOtrdOt, tiled_mma_dkv, tileloadPt, tileloaddOt, thr_copy_pt, thr_copy_dot);
+        // if (cute::thread(0, 0)) {
+        //     print("\nfinal dV: ");
+        //     print_t(tdVrdV);
+        // }
     }
-
+    auto tdVrdVl = convert_type<T>(tdVrdV);
+    copy(tilesavedV, tdVrdVl, tdVgdV);
 }
 
 /*
@@ -980,7 +1099,7 @@ dq_dk_dv_1colblock3(Trait &trait, Param<typename Trait::DType> &param,
         // Shape<Int<kBlockM>, Int<kHeadDim>>{};
     Shape shapeK = make_shape(param.seq_len_kv, Int<kHeadDim>{}, Int<1>{});
         // Shape<Int<kBlockN>, Int<kHeadDim>>{};
-    Shape shapeS = make_shape(param.seq_len_q, param.seq_len_kv, Int<1>{});
+    Shape shapeSP = make_shape(param.seq_len_q, param.seq_len_kv, Int<1>{});
         // Shape<Int<kBlockM>, Int<kBlockN>>{};
     Tensor mQ = make_tensor(make_gmem_ptr(param.q + q_offset), make_layout(
                                 shapeQ,
@@ -989,18 +1108,18 @@ dq_dk_dv_1colblock3(Trait &trait, Param<typename Trait::DType> &param,
                                 shapeK,
                                 make_stride(param.k_r_stride, _1{}, _0{})));
     Tensor mS = make_tensor(make_gmem_ptr(param.s + s_offset), make_layout(
-                                shapeS,
+                                shapeSP,
                                 make_stride(param.s_r_stride, _1{}, _0{})));
 
-    Shape tile_sdp = typename Trait::TileShapeMSdP{};
+    Shape tile_sdp = typename Trait::TileShapeSdP{};
 
-    auto copyQ = typename Trait::TiledCopyQ{mQ};
-    auto copyK = typename Trait::TiledCopyK{mK};
-    auto copyS = typename Trait::TiledCopyS{mS};
+    auto tileloadQ = typename Trait::TiledLoadQ{mQ};
+    auto tileloadK = typename Trait::TiledLoadK{mK};
+    auto tilesaveS = typename Trait::TiledSaveS{mS};
 
     Tensor mQ_coord = cute::get_xe_tensor(shapeQ);
     Tensor mK_coord = cute::get_xe_tensor(shapeK);
-    Tensor mS_coord = cute::get_xe_tensor(shapeS);
+    Tensor mS_coord = cute::get_xe_tensor(shapeSP);
 
 
     typename Trait::TiledMmaSdP tiled_mma_sdp;
@@ -1015,11 +1134,11 @@ dq_dk_dv_1colblock3(Trait &trait, Param<typename Trait::DType> &param,
     Tensor tSgK = thr_mma_sdp.partition_B(gK);
     Tensor tSgS = thr_mma_sdp.partition_C(gS); // debug
 
-    Tensor tSrQ = make_tensor<T>(make_fragment_layout(copyQ, tSgQ(_,_,_,0).shape()));
-    Tensor tSrK = make_tensor<T>(make_fragment_layout(copyK, tSgK(_,_,_,0).shape()));
+    Tensor tSrQ = make_tensor<T>(make_fragment_layout(tileloadQ, tSgQ(_,_,_,0).shape()));
+    Tensor tSrK = make_tensor<T>(make_fragment_layout(tileloadK, tSgK(_,_,_,0).shape()));
 
-    ThrCopy thr_copy_q = copyQ.get_slice(syclcompat::local_id::x());
-    ThrCopy thr_copy_k = copyK.get_slice(syclcompat::local_id::x());
+    ThrCopy thr_copy_q = tileloadQ.get_slice(syclcompat::local_id::x());
+    ThrCopy thr_copy_k = tileloadK.get_slice(syclcompat::local_id::x());
 
     // Retile registers for copies
     Tensor tQrQ = thr_copy_q.retile_D(tSrQ);
@@ -1044,8 +1163,8 @@ dq_dk_dv_1colblock3(Trait &trait, Param<typename Trait::DType> &param,
         tSgK = thr_mma_sdp.partition_B(gK);
         tSgS = thr_mma_sdp.partition_C(gS); // debug
 
-        thr_copy_q = copyQ.get_slice(syclcompat::local_id::x());
-        thr_copy_k = copyK.get_slice(syclcompat::local_id::x());
+        thr_copy_q = tileloadQ.get_slice(syclcompat::local_id::x());
+        thr_copy_k = tileloadK.get_slice(syclcompat::local_id::x());
 
         tQrQ = thr_copy_q.retile_D(tSrQ);
         tKrK = thr_copy_k.retile_D(tSrK);
@@ -1054,7 +1173,7 @@ dq_dk_dv_1colblock3(Trait &trait, Param<typename Trait::DType> &param,
         tKgK = thr_copy_k.retile_S(tSgK);
         clear(tSrS);
 
-        gemm_ker<k_tile>(tSrS, tSrQ, tSrK, tQgQ, tQrQ, tKgK, tKrK, tiled_mma_sdp, copyQ, copyK, thr_copy_q, thr_copy_k);
+        gemm_ker<k_tile>(tSrS, tSrQ, tSrK, tQgQ, tQrQ, tKgK, tKrK, tiled_mma_sdp, tileloadQ, tileloadK, thr_copy_q, thr_copy_k);
         // if (m_block == 0 and cute::thread(0, 0)) {
         //     print("tSrS: ");
         //     print_t(tSrS);
@@ -1064,7 +1183,7 @@ dq_dk_dv_1colblock3(Trait &trait, Param<typename Trait::DType> &param,
         for (int i = 0; i < size(tSrS); ++i) {
             tSrSl(i) = converter(tSrS(i));
         }
-        copy(copyS, tSrSl, tSgS);
+        copy(tilesaveS, tSrSl, tSgS);
     }
 
 }
@@ -1109,8 +1228,9 @@ void launch_mha_backward(ProblemShape problem_shape,
     constexpr int kBlockN = 64;
     constexpr int kBlockK = 32;
     auto trait = FAKernel<T, kHeadDim, kBlockM, kBlockN, kBlockK, numSGs>();
+    T * pbuff = syclcompat::malloc<T>(get<0>(problem_shape) * get<1>(problem_shape) * kBlockM * kBlockN);
     auto param = Param<T>(do_d, o_d, q_d, k_d, v_d, lse_d, odo_d,
-                          dq_d, dk_d, dv_d, s_d, dp_d,
+                          dq_d, dk_d, dv_d, s_d, dp_d, pbuff,
                           1 / sqrt(static_cast<float>(kHeadDim)));
     param.batch = get<0>(problem_shape);
     param.num_head_q = get<1>(problem_shape);
@@ -1255,11 +1375,11 @@ int main(int argc, char**argv) {
     //     }
     //     printf("\n");
     // }
-    // syclcompat::wait_and_throw();
-    // std::vector<T> dv_test(BATCH * NUM_HEAD_KV * SEQ_LEN_KV * HEAD_SIZE_VO);
-    // syclcompat::memcpy<T>(dv_test.data(), dv_d, dv_test.size());
-    // printf("verify dV: ");
-    // verify(dv_npy.data<T>(), dv_test.data(), BATCH * NUM_HEAD_KV, SEQ_LEN_KV, HEAD_SIZE_VO, atol, rtol);
+    syclcompat::wait_and_throw();
+    std::vector<T> dv_test(BATCH * NUM_HEAD_KV * SEQ_LEN_KV * HEAD_SIZE_VO);
+    syclcompat::memcpy<T>(dv_test.data(), dv_d, dv_test.size());
+    printf("dV val\n");
+    verify(dv_npy.data<T>(), dv_test.data(), BATCH * NUM_HEAD_KV, SEQ_LEN_KV, HEAD_SIZE_VO, atol, rtol);
     // syclcompat::wait_and_throw();
     // std::vector<T> dps_test(BATCH * NUM_HEAD_Q * SEQ_LEN_QO * SEQ_LEN_KV);
     // syclcompat::memcpy<T>(dps_test.data(), dps_d, dps_test.size());
