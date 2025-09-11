@@ -124,7 +124,7 @@ template<int k_tile = 0, typename Tensor0, typename Tensor1, typename Tensor2,
          typename Tensor5, typename Tensor6,
          typename TiledMma, typename TiledCopyA, typename TiledCopyB,
          typename ThrCopyA, typename ThrCopyB>
-void gemm_ker(Tensor0 &tCrC, Tensor1 &tCrA, Tensor2 &tCrB,
+CUTLASS_DEVICE void gemm_ker(Tensor0 &tCrC, Tensor1 &tCrA, Tensor2 &tCrB,
               Tensor3 &tAgA, Tensor4 &tArA,
               Tensor5 &tBgB, Tensor6 &tBrB, TiledMma &tiled_mma,
               TiledCopyA &copy_a, TiledCopyB &copy_b,
@@ -140,15 +140,14 @@ void gemm_ker(Tensor0 &tCrC, Tensor1 &tCrA, Tensor2 &tCrB,
 }
 
 template<class Tensor0, class Tensor1, class Tensor2>
-void load_lse(Tensor0 &lse, Tensor1 &mLSE, Tensor2 &taccScS_row) {
+CUTLASS_DEVICE void load_1colvec(Tensor0 &reg, Tensor1 &mT, Tensor2 &coord_row) {
     CUTLASS_PRAGMA_UNROLL
-    for (int mi = 0; mi < size(lse); ++mi) {
-        const int row = get<0>(taccScS_row(mi));
-        lse(mi) = mLSE(row);
+    for (int mi = 0; mi < size(reg); ++mi) {
+        reg(mi) = mT(get<0>(coord_row(mi)));
     }
 }
 template<typename Layout>
-auto convert_layout_acc_layout(Layout acc_layout) {
+CUTLASS_DEVICE auto convert_layout_acc_layout(Layout acc_layout) {
     static_assert(decltype(size<0>(acc_layout))::value == 8);
     static_assert(decltype(rank(acc_layout))::value == 3);
     auto l = logical_divide(acc_layout, Shape<_1>{});  // ((2, 2), MMA_M, MMA_N)
@@ -156,7 +155,7 @@ auto convert_layout_acc_layout(Layout acc_layout) {
 }
 
 template<class Engine0, class Layout0, class Engine1, class Layout1>
-void scale_apply_exp2(Tensor<Engine0, Layout0> &tensor, Tensor<Engine1, Layout1> &max, const float scale) {
+CUTLASS_DEVICE void scale_apply_exp2(Tensor<Engine0, Layout0> &tensor, Tensor<Engine1, Layout1> &max, const float scale) {
     static_assert(Layout0::rank == 2, "Only support 2D Tensor");
     static_assert(Layout1::rank == 1, "Only support 1D Tensor");
     CUTE_STATIC_ASSERT_V(size<0>(max) == size<0>(tensor));
@@ -179,6 +178,16 @@ CUTLASS_DEVICE auto convert_type(Tensor<Engine, Layout> const &tensor) {
     return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
 }
 
+template<class Tensor0, class Tensor1, class Tensor2>
+CUTLASS_DEVICE void softmax_backward(Tensor0 &P, Tensor1 &dP_sum, Tensor2 &dP, const float scale) {
+    CUTLASS_PRAGMA_UNROLL
+    for (int mi = 0; mi < size<0>(dP); ++mi) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int mj = 0; mj < size<1>(dP); ++mj) {
+            dP(mi, mj) = P(mi, mj) * (dP(mi, mj) - dP_sum(mi)) * scale;
+        }
+    }
+}
 template<typename T, class ProblemShape, class ThrMma,
          class AStride, class TiledCopyA,
          class BStride, class TiledCopyB,
@@ -706,12 +715,14 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
     auto sg = syclcompat::get_nd_item<1>().get_sub_group();
     auto first_thread_in_sg_idx = sg.get_group_linear_id() * trait.SubgroupSize;
     auto bofst = Boffset(param);
+
     const index_t q_offset = bofst.q_offset(bidb, bidh, 0);
     const index_t k_offset = bofst.k_offset(bidb, bidh, n_block * kBlockN);
     const index_t v_offset = bofst.v_offset(bidb, bidh, n_block * kBlockN);
     const index_t o_offset = bofst.o_offset(bidb, bidh, 0);
     const index_t do_offset = bofst.o_offset(bidb, bidh, 0);
     const index_t lse_offset = bofst.lse_offset(bidb, bidh, 0);
+    const index_t dpsum_offset = bofst.lse_offset(bidb, bidh, 0);
 
     const index_t s_offset = bofst.ps_offset(bidb, bidh, 0, n_block * kBlockN);
     const index_t dp_offset = bofst.ps_offset(bidb, bidh, 0, n_block * kBlockN);
@@ -749,6 +760,10 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
                               make_layout(
                                   Shape<Int<kBlockM>>{},
                                   Stride<_1>{}));
+    Tensor mdPsum = make_tensor(make_gmem_ptr(param.odo_ptr + dpsum_offset),
+                                make_layout(
+                                    Shape<Int<kBlockM>>{},
+                                    Stride<_1>{}));
 
     Tensor mS = make_tensor(make_gmem_ptr(param.s_ptr + s_offset), make_layout(
                                 shapeS,
@@ -844,16 +859,33 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
         //     print("\n");
         // }
         gemm_ker<k_tile>(tSrS, tSrQ, tSrK, tQgQ, tQrQ, tKgK, tKrK, tiled_mma_sdp, copyQ, copyK, thr_copy_q, thr_copy_k);
-        load_lse(lse, mLSE, taccScS_row);
+        load_1colvec(lse, mLSE, taccScS_row);
+        Tensor dP_sum = make_fragment_like(lse);
+        load_1colvec(dP_sum, mdPsum, taccScS_row);
         Tensor scores = make_tensor(tSrS.data(), convert_layout_acc_layout(tSrS.layout()));
         scale_apply_exp2(scores, lse, param.scale_softmax_log2);
         // if (m_block == 0 and cute::thread(0, 0)) {
-        //     print("lse: ");
-        //     print_t(lse);
-        //     print("\nscores");
+        //     print("scores");
         //     print_t(scores);
+        //     print("\n");
         // }
         gemm_ker<k_tile>(tdPrdP, tdPrdO, tdPrV, tdOgdO, tdOrdO, tVgV, tVrV, tiled_mma_sdp, copydO, copyV, thr_copy_do, thr_copy_v);
+        Tensor dS = make_tensor(tdPrdP.data(), scores.layout());
+        // if (m_block == 0 and cute::thread(0, 0)) {
+        //     print("scores/P");
+        //     print_t(scores);
+        //     print("\ndPsum");
+        //     print_t(dP_sum);
+        //     print("\ndP");
+        //     print_t(dS);
+        //     print("\n");
+        // }
+        softmax_backward(scores, dP_sum, dS, param.scale_softmax);
+        // if (m_block == 0  and cute::thread(0, 0)) {
+        //     print("dS");
+        //     print_t(dS);
+        //     print("\n");
+        // }
         // tSrS - lse
         auto tSrSl = convert_type<T>(tSrS);
         copy(copyS, tSrSl, tSgS);
@@ -866,6 +898,7 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
         mS.data() = mS.data() + int(kBlockM * param.s_r_stride); // debug
         mdP.data() = mdP.data() + int(kBlockM * param.s_r_stride); // debug
         mLSE.data() = mLSE.data() + int(kBlockM);
+        mdPsum.data() = mdPsum.data() + int(kBlockM);
 
         copyQ = typename Trait::TiledCopyQ{mQ};
         copydO = typename Trait::TiledCopydO{mdO};
@@ -907,10 +940,14 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
         clear(tSrS);
         clear(tdPrdP);
         gemm_ker<k_tile>(tSrS, tSrQ, tSrK, tQgQ, tQrQ, tKgK, tKrK, tiled_mma_sdp, copyQ, copyK, thr_copy_q, thr_copy_k);
-        load_lse(lse, mLSE, taccScS_row);
+        load_1colvec(lse, mLSE, taccScS_row);
+        Tensor dP_sum = make_fragment_like(lse);
+        load_1colvec(dP_sum, mdPsum, taccScS_row);
         Tensor scores = make_tensor(tSrS.data(), convert_layout_acc_layout(tSrS.layout()));
         scale_apply_exp2(scores, lse, param.scale_softmax_log2);
         gemm_ker<k_tile>(tdPrdP, tdPrdO, tdPrV, tdOgdO, tdOrdO, tVgV, tVrV, tiled_mma_sdp, copydO, copyV, thr_copy_do, thr_copy_v);
+        Tensor dS = make_tensor(tdPrdP.data(), scores.layout());
+        softmax_backward(scores, dP_sum, dS, param.scale_softmax);
         auto tSrSl = convert_type<T>(tSrS);
         copy(copyS, tSrSl, tSgS);
         auto tdPrdPl = convert_type<T>(tdPrdP);
@@ -1129,6 +1166,7 @@ int main(int argc, char**argv) {
     cnpy::NpyArray dk_npy = cnpy::npz_load(data_file, "k_grad");
     cnpy::NpyArray dv_npy = cnpy::npz_load(data_file, "v_grad");
     cnpy::NpyArray dp_npy = cnpy::npz_load(data_file, "p_grad");
+    cnpy::NpyArray ds_npy = cnpy::npz_load(data_file, "s_grad");
 
     // read shape
     cnpy::NpyArray shape = cnpy::npz_load(data_file, "shape");
@@ -1207,8 +1245,8 @@ int main(int argc, char**argv) {
     std::vector<T> dp_test(BATCH * NUM_HEAD_Q * SEQ_LEN_QO * SEQ_LEN_KV);
     syclcompat::memcpy<T>(dp_test.data(), dp_d, dp_test.size());
     syclcompat::wait_and_throw();
-    printf("dP val\n");
-    verify(dp_npy.data<T>(), dp_test.data(), BATCH * NUM_HEAD_Q, SEQ_LEN_QO, SEQ_LEN_KV, atol, rtol);
+    printf("dS val\n");
+    verify(ds_npy.data<T>(), dp_test.data(), BATCH * NUM_HEAD_Q, SEQ_LEN_QO, SEQ_LEN_KV, atol, rtol);
     // for (int m = 0; m < 4; ++m) {
     //     for (int n = 0; n < 64; ++n) {
     //         if (n % 16 == 0)
