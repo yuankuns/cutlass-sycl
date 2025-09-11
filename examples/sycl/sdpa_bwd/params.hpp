@@ -196,6 +196,7 @@ struct Param {
           dv_ptr(dv),
           s_ptr(s),
           dp_ptr(dp),
+          scale_softmax(softmax_scale),
           scale_softmax_log2(softmax_scale * M_LOG2E),
           is_bhsd(true) {}
     // read only
@@ -206,6 +207,7 @@ struct Param {
     const T *v_ptr;
     const float *lse_ptr;
     const float *odo_ptr;
+    const float scale_softmax;
     const float scale_softmax_log2;
     // write
     T *dq_ptr;

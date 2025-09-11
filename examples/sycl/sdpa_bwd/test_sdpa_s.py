@@ -84,7 +84,7 @@ def softmax_backward_odo(p: torch.Tensor,
     sum_odo = torch.sum(odo, dim= -1, keepdim=True)
     ds = p * (dp - sum_odo) * scale
     ds = ds.to(orig_dtype)
-    return ds, odo
+    return ds, sum_odo
 
 def dropout_backward(mask: torch.Tensor,
                      grad_y: torch.Tensor,
