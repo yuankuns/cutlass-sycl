@@ -26,48 +26,81 @@ struct FAKernel {
     static constexpr int kNSGs = kNSGs_;
     // using SubgroupLayout = Layout<Shape<Int<kNSGs>, _1, _1>, Stride<_1, _1, _1>>;
     static constexpr int AtomLayoutMSdP = 4;
-    using SubgroupLayout=Layout<Shape<Int<AtomLayoutMSdP>, Int<kNSGs / AtomLayoutMSdP>, _1>>;
+    static constexpr int AtomLayoutNdKV = 2;
+    using SubgroupLayoutSdP = Layout<Shape<Int<AtomLayoutMSdP>, Int<kNSGs / AtomLayoutMSdP>, _1>>;
+    using SubgroupLayoutdKV = Layout<Shape<Int<AtomLayoutNdKV>, Int<kNSGs / AtomLayoutNdKV>, _1>>;
     static_assert(16 *AtomLayoutMSdP == kBlockM);
     static_assert(32 *kNSGs / AtomLayoutMSdP == kBlockN);
     static_assert(kBlockK == 32);
-    using TileShapeMSdP = Tile<Int<16 * AtomLayoutMSdP>, Int<32 * kNSGs / AtomLayoutMSdP>, _32>;
+    using TileShapeSdP = Tile<Int<16 * AtomLayoutMSdP>, Int<32 * kNSGs / AtomLayoutMSdP>, _32>;
+    static_assert(size<0>(TileShapeSdP{}) == kBlockM);
+    static_assert(size<1>(TileShapeSdP{}) == kBlockN);
+    static_assert(size<2>(TileShapeSdP{}) == kBlockK);
+    using TileShapedKV = Tile<Int<32 * AtomLayoutNdKV>, Int<32 * kNSGs / AtomLayoutNdKV>, _32>;
+    static_assert(size<0>(TileShapedKV{}) == kBlockN);
+    static_assert(size<1>(TileShapedKV{}) == kHeadDim);
+    static_assert(size<2>(TileShapedKV{}) == kBlockK);
 
     // using SubgroupLayout = Layout<Shape<_16, _1, _1>, Stride<_1, _1, _1>>;
     // using TileShapeMSdP = Shape<Int<kBlockM>, Int<kBlockN>, Int<kBlockK>>;
     using TiledMmaSdP = typename TiledMMAHelper<MMA_Atom_ARCH,
-                                                Layout<TileShapeMSdP>,
-                                                SubgroupLayout>::TiledMMA;
+                                                Layout<TileShapeSdP>,
+                                                SubgroupLayoutSdP>::TiledMMA;
+
+    using TiledMmadKV = typename TiledMMAHelper<MMA_Atom_ARCH,
+                                                Layout<TileShapedKV>,
+                                                SubgroupLayoutdKV>::TiledMMA;
+
     static constexpr auto bP = Int<2>{}; // Pipeline
 
     using StrideR = cute::tuple<long, cute::C<1>>;
     using StrideC = cute::tuple<cute::C<1>, long>;
 
-    using TiledCopyQ = decltype(make_tiled_copy(
+    // for load Q and Kt in S=QKt
+    using TiledLoadQ = decltype(make_tiled_copy(
                                     Copy_Atom<Copy_Traits<XE_2D_U16x16x16_LD_N, StrideR>, DType>{},
                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 k-major
                                     Layout<Shape<_16,_1>>{}));              // Val layout  16x1
-    using TiledCopyK = decltype(make_tiled_copy(
+    using TiledLoadK = decltype(make_tiled_copy(
                                     Copy_Atom<Copy_Traits<XE_2D_U16x16x16_LD_T, StrideR>, DType>{},
                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
                                     Layout<Shape<_16,_1>>{}));              // Val layout  16x1
 
-    using TiledCopydO = decltype(make_tiled_copy(
+    // for load dO and Vt in dP=dO*Vt
+    using TiledLoaddO = decltype(make_tiled_copy(
                                      Copy_Atom<Copy_Traits<XE_2D_U16x16x16_LD_N, StrideR>, DType>{},
                                      Layout<Shape<_1,_16>>{}, // Thr layout 1x16 k-major
                                      Layout<Shape<_16,_1>>{}));              // Val layout  16x1
 
-    using TiledCopyV = decltype(make_tiled_copy(
+    using TiledLoadV = decltype(make_tiled_copy(
                                     Copy_Atom<Copy_Traits<XE_2D_U16x16x16_LD_T, StrideR>, DType>{},
                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
                                     Layout<Shape<_16,_1>>{}));              // Val layout  16x1
-    using TiledCopyS = decltype(make_tiled_copy(
+
+    // for load Pt and dO in dV=Pt*dO
+    using TiledLoadPt = decltype(make_tiled_copy(
+                                     Copy_Atom<Copy_Traits<XE_2D_U16x16x8_LD_T, StrideC>, DType>{},
+                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 m-major
+                                     Layout<Shape<_8,_1>>{})); // // Val layout  16x1
+    using TiledLoaddOt = decltype(make_tiled_copy(
+                                     Copy_Atom<Copy_Traits<XE_2D_U16x16x16_LD_V, StrideC>, DType>{}, // should be V here
+                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
+                                     Layout<Shape<_16,_1>>{})); // val layout 32x2
+
+    // for save S in S=QKt and P
+    using TiledSaveS = decltype(make_tiled_copy(
                                     Copy_Atom<Copy_Traits<XE_2D_U16x8x16_ST_N, StrideR>, DType>{},
                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
                                     Layout<Shape<_8,_1>>{}));              // Val layout  8x1
-    using TiledCopydP = decltype(make_tiled_copy(
+    // for save dP in dP=dO*Vt
+    using TiledSavedP = decltype(make_tiled_copy(
                                      Copy_Atom<Copy_Traits<XE_2D_U16x8x16_ST_N, StrideR>, DType>{},
                                      Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
                                      Layout<Shape<_8,_1>>{}));              // Val layout  8x1
+    using TiledSavedV = decltype(make_tiled_copy(
+                                     Copy_Atom<Copy_Traits<XE_2D_U16x8x16_ST_N, StrideR>, DType>{},
+                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
+                                     Layout<Shape<_8,_1>>{})); // Val layout  8x1
     // static constexpr auto tiled_mma_sdp = TiledMmaSdP{};
     /*
       shape
@@ -183,6 +216,7 @@ struct Param {
           T *dv,
           T *s,
           T *dp,
+          T *pb,
           const float softmax_scale)
         : do_ptr(dO),
           o_ptr(o),
@@ -196,6 +230,7 @@ struct Param {
           dv_ptr(dv),
           s_ptr(s),
           dp_ptr(dp),
+          pb_ptr(pb),
           scale_softmax(softmax_scale),
           scale_softmax_log2(softmax_scale * M_LOG2E),
           is_bhsd(true) {}
@@ -215,6 +250,7 @@ struct Param {
     T *dv_ptr;
     T *s_ptr;
     T *dp_ptr;
+    T *pb_ptr;
 
     // const dimension
     int batch;
