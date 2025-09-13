@@ -894,12 +894,14 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
     static_assert(size<0>(tSrS) * size<1>(tSrS) == size<0>(lse) && "row of acc and lse not match");
     // misc
 
-    const int max_m_block = ceil_div(param.seq_len_q, kBlockM);
+    const int max_m_block = param.seq_len_q / kBlockM;
+    const int tail_m = param.seq_len_q % kBlockM;
+
     constexpr int k_tile = ceil_div(kHeadDim, kBlockK);
 
     // clear accumulator
     clear(tdVrdV);
-    for (int m_block = 0; m_block < max_m_block - 1; ++m_block) {
+    for (int m_block = 0; m_block < max_m_block; ++m_block) {
         clear(tSrS);
         clear(tdPrdP);
         // if ((m_block == 0) and (cute::thread(0, 0))) {
@@ -994,8 +996,7 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
         tilesaveS = typename Trait::TiledSaveS{mS}; // debug
         tilesavedP = typename Trait::TiledSaveS{mdP}; // debug
     }
-    int m_block = max_m_block - 1;
-    const int tail_m = param.seq_len_q - m_block * kBlockM;
+    int m_block = max_m_block;
     // tail case
     if (tail_m > 0) {
         const index_t q_offset = bofst.q_offset(bidb, bidh, m_block * kBlockM);
@@ -1054,16 +1055,9 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
         Tensor dS = make_tensor(tdPrdP.data(), scores.layout());
         // dS=P(dP-sum_row(P))*scale
         softmax_backward(scores, dP_sum, dS, param.scale_softmax);
-        // if (cute::thread(0, 0)) {
-        //     print("dP: ");
-        //     print_t(dP);
-        // }
-        // if (cute::thread(0, 0)) {
-        //     print("tdVrdV");
-        //     print_t(tdVrdV);
-        // }
         auto tdPrdPl = convert_type<T>(tdPrdP);
         copy(tilesavedP, tdPrdPl, tdPgdP);
+        // dV=Pt*dO
         gemm_ker(tdVrdV, tdVrPt, tdVrdOt, tPtgPt, tPtrPt, tdOtgdOt, tdOtrdOt, tiled_mma_dkv, tileloadPt, tileloaddOt, thr_copy_pt, thr_copy_dot);
         // gemm_ker(tdVrdV, tdVrPt, tdVrdOt, tPtgPt, tPtrPt, tdOtgdOt, tdOtrdOt, tiled_mma_dkv, tileloadPt, tileloaddOt, thr_copy_pt, thr_copy_dot);
         // if (cute::thread(0, 0)) {
