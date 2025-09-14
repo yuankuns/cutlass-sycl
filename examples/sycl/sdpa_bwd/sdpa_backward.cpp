@@ -1000,7 +1000,7 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
     // tail case
     if (tail_m > 0) {
         const index_t q_offset = bofst.q_offset(bidb, bidh, m_block * kBlockM);
-        const index_t k_offset = bofst.k_offset(bidb, bidh, n_block * kBlockN);
+        // const index_t k_offset = bofst.k_offset(bidb, bidh, n_block * kBlockN);
         const index_t do_offset = bofst.o_offset(bidb, bidh, m_block * kBlockM);
         const index_t s_offset = bofst.ps_offset(bidb, bidh, m_block * kBlockM, n_block * kBlockN);
         const index_t lse_offset = bofst.lse_offset(bidb, bidh, m_block * kBlockM);
@@ -1017,10 +1017,10 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
                                   make_layout(
                                       make_shape(Int<kHeadDim>{}, tail_m, _1{}),
                                       make_stride(_1{}, param.o_r_stride, _0{})));
-        Tensor mK = make_tensor(make_gmem_ptr(param.k_ptr + k_offset),
-                                make_layout(
-                                    shapeK,
-                                    make_stride(param.k_r_stride, _1{}, _0{})));
+        // Tensor mK = make_tensor(make_gmem_ptr(param.k_ptr + k_offset),
+        //                         make_layout(
+        //                             shapeK,
+        //                             make_stride(param.k_r_stride, _1{}, _0{})));
         Tensor mS = make_tensor(make_gmem_ptr(param.s_ptr + s_offset),
                                 make_layout(
                                     make_shape(tail_m, Int<kBlockN>{}, _1{}),
@@ -1031,7 +1031,7 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
                                     make_stride(param.s_r_stride, _1{}, _0{}))); // debug
 
         auto tileloadQ = typename Trait::TiledLoadQ{mQ};
-        auto tileloadK = typename Trait::TiledLoadK{mK};
+        // auto tileloadK = typename Trait::TiledLoadK{mK};
         auto tileloaddO = typename Trait::TiledLoaddO{mdO};
         auto tileloaddOt = typename Trait::TiledLoaddOt{mdOt};
         auto tilesaveS = typename Trait::TiledSaveS{mS};
