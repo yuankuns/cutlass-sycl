@@ -259,6 +259,7 @@ struct Param {
     int seq_len_q;
     int seq_len_kv;
     int head_dim;
+    int max_n_block;
     int q_r_stride;
     int q_h_stride;
     int q_b_stride;
