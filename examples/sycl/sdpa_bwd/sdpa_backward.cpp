@@ -727,7 +727,8 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
     const index_t dpsum_offset = bofst.lse_offset(bidb, bidh, 0);
 
     // buff offset
-    const index_t pb_offset = bidb * param.num_head_q * kBlockM * kBlockN + bidh * kBlockM * kBlockN;
+    const index_t pb_offset = bidb * param.num_head_q * param.max_n_block * kBlockM * kBlockN
+        + bidh * param.num_head_q * kBlockM * kBlockN + n_block * kBlockM * kBlockN;
 
     const index_t s_offset = bofst.ps_offset(bidb, bidh, 0, n_block * kBlockN);
     const index_t dp_offset = bofst.ps_offset(bidb, bidh, 0, n_block * kBlockN);
@@ -1194,8 +1195,8 @@ mha_backward(T trait,
     OPS_tobf16<typename T::DType> op;
     const int bidb = BlockIdxZ();
     const int bidh = BlockIdxY();
-    const int max_n_block = ceil_div(param.seq_len_kv, trait.kBlockN);
-    for (int n_block = 0; n_block < max_n_block; ++n_block)
+    // const int max_n_block = ceil_div(param.seq_len_kv, trait.kBlockN);
+    for (int n_block = 0; n_block < param.max_n_block; ++n_block)
         dq_dk_dv_1colblock2(trait, param, bidb, bidh, n_block);
 }
 
@@ -1222,16 +1223,24 @@ void launch_mha_backward(ProblemShape problem_shape,
     constexpr int kBlockN = 64;
     constexpr int kBlockK = 32;
     auto trait = FAKernel<T, kHeadDim, kBlockM, kBlockN, kBlockK, numSGs>();
-    T * pbuff = syclcompat::malloc<T>(get<0>(problem_shape) * get<1>(problem_shape) * kBlockM * kBlockN);
+
+    const int BATCH = get<0>(problem_shape);
+    const int NUM_HEAD_Q = get<1>(problem_shape);
+    const int NUM_HEAD_KV = get<2>(problem_shape);
+    const int SEQ_LEN_Q = get<3>(problem_shape);
+    const int SEQ_LEN_KV = get<4>(problem_shape);
+    const int MAX_N_BLOCK = ceil_div(SEQ_LEN_KV, kBlockN);
+    T * pbuff = syclcompat::malloc<T>(BATCH * NUM_HEAD_Q * MAX_N_BLOCK * kBlockM * kBlockN);
     auto param = Param<T>(do_d, o_d, q_d, k_d, v_d, lse_d, odo_d,
                           dq_d, dk_d, dv_d, s_d, dp_d, pbuff,
                           1 / sqrt(static_cast<float>(kHeadDim)));
-    param.batch = get<0>(problem_shape);
-    param.num_head_q = get<1>(problem_shape);
-    param.num_head_kv = get<2>(problem_shape);
-    param.seq_len_q = get<3>(problem_shape);
-    param.seq_len_kv = get<4>(problem_shape);
+    param.batch = BATCH;
+    param.num_head_q = NUM_HEAD_Q;
+    param.num_head_kv = NUM_HEAD_KV;
+    param.seq_len_q = SEQ_LEN_Q;
+    param.seq_len_kv = SEQ_LEN_KV;
     param.head_dim = kHeadDim;
+    param.max_n_block = MAX_N_BLOCK;
     setup_bhsd_stride(param);
     auto dimGrid = syclcompat::dim3(size(1), size(param.num_head_q), size(param.batch));
     assert((trait.num_head_q % trait.num_head_kv == 0) && "num_head_q must be dividable by num_head_kv");
