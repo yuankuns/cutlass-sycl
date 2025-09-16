@@ -257,9 +257,12 @@ struct Param {
     int num_head_q;
     int num_head_kv;
     int seq_len_q;
+    int seq_len_q_pad;
     int seq_len_kv;
+    int seq_len_kv_pad;
     int head_dim;
-    int max_n_block;
+    int n_block;
+    int tail_n;
     int q_r_stride;
     int q_h_stride;
     int q_b_stride;
@@ -349,7 +352,7 @@ void setup_bhsd_stride(Param<T> &param) {
     // param.do_r_stride = param.head_dim;
     // param.do_h_stride = param.seq_len_q * param.head_dim;
     // param.do_b_stride = param.num_head_q * param.seq_len_q * param.head_dim;
-    param.s_r_stride = param.seq_len_kv;
-    param.s_s_stride = param.seq_len_q * param.seq_len_kv;
-    param.s_b_stride = param.num_head_q * param.seq_len_q * param.seq_len_kv;
+    param.s_r_stride = param.seq_len_kv_pad;
+    param.s_s_stride = param.seq_len_q_pad * param.seq_len_kv_pad;
+    param.s_b_stride = param.num_head_q * param.seq_len_q_pad * param.seq_len_kv_pad;
 }
