@@ -727,8 +727,8 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
     const index_t dpsum_offset = bofst.lse_offset(bidb, bidh, 0);
 
     // buff offset
-    const index_t pb_offset = bidb * param.num_head_q * param.max_n_block * kBlockM * kBlockN
-        + bidh * param.num_head_q * kBlockM * kBlockN + n_block * kBlockM * kBlockN;
+    const index_t pb_offset = bidb * param.num_head_q * param.seq_len_kv_pad * kBlockM
+        + bidh * param.seq_len_kv_pad * kBlockM + n_block * kBlockN * kBlockM;
 
     const index_t s_offset = bofst.ps_offset(bidb, bidh, 0, n_block * kBlockN);
     const index_t dp_offset = bofst.ps_offset(bidb, bidh, 0, n_block * kBlockN);
@@ -1196,11 +1196,11 @@ mha_backward(T trait,
     const int bidb = BlockIdxZ();
     const int bidh = BlockIdxY();
     // const int max_n_block = ceil_div(param.seq_len_kv, trait.kBlockN);
-    for (int n_block = 0; n_block < param.max_n_block; ++n_block)
+    for (int n_block = 0; n_block < param.n_block; ++n_block)
         dq_dk_dv_1colblock2(trait, param, bidb, bidh, n_block);
 }
 
-template<typename T, class ProblemShape>
+template<typename T, class ProblemShape, int kBlockM, int kBlockN>
 void launch_mha_backward(ProblemShape problem_shape,
                          const T *do_d,
                          const T *o_d,
@@ -1213,14 +1213,16 @@ void launch_mha_backward(ProblemShape problem_shape,
                          T *dk_d,
                          T *dv_d,
                          T *s_d,
-                         T *dp_d) {
+                         T *dp_d,
+                         const int seq_len_q_pad,
+                         const int seq_len_kv_pad) {
     // skip if head != 128
     if (get<5>(problem_shape) != 128)
         return;
     constexpr int numSGs = 8;
     constexpr int kHeadDim = 128;
-    constexpr int kBlockM = 64;
-    constexpr int kBlockN = 64;
+    // constexpr int kBlockM = 64;
+    // constexpr int kBlockN = 64;
     constexpr int kBlockK = 32;
     auto trait = FAKernel<T, kHeadDim, kBlockM, kBlockN, kBlockK, numSGs>();
 
@@ -1229,8 +1231,9 @@ void launch_mha_backward(ProblemShape problem_shape,
     const int NUM_HEAD_KV = get<2>(problem_shape);
     const int SEQ_LEN_Q = get<3>(problem_shape);
     const int SEQ_LEN_KV = get<4>(problem_shape);
-    const int MAX_N_BLOCK = ceil_div(SEQ_LEN_KV, kBlockN);
-    T * pbuff = syclcompat::malloc<T>(BATCH * NUM_HEAD_Q * MAX_N_BLOCK * kBlockM * kBlockN);
+    const int N_BLOCK = SEQ_LEN_KV / kBlockN;
+    const int tail_n = SEQ_LEN_KV % kBlockN;
+    T * pbuff = syclcompat::malloc<T>(BATCH * NUM_HEAD_Q * seq_len_kv_pad * kBlockM);
     auto param = Param<T>(do_d, o_d, q_d, k_d, v_d, lse_d, odo_d,
                           dq_d, dk_d, dv_d, s_d, dp_d, pbuff,
                           1 / sqrt(static_cast<float>(kHeadDim)));
@@ -1240,7 +1243,10 @@ void launch_mha_backward(ProblemShape problem_shape,
     param.seq_len_q = SEQ_LEN_Q;
     param.seq_len_kv = SEQ_LEN_KV;
     param.head_dim = kHeadDim;
-    param.max_n_block = MAX_N_BLOCK;
+    param.n_block = N_BLOCK;
+    param.tail_n = tail_n;
+    param.seq_len_kv_pad = seq_len_kv_pad;
+    param.seq_len_q_pad = seq_len_q_pad;
     setup_bhsd_stride(param);
     auto dimGrid = syclcompat::dim3(size(1), size(param.num_head_q), size(param.batch));
     assert((trait.num_head_q % trait.num_head_kv == 0) && "num_head_q must be dividable by num_head_kv");
@@ -1294,14 +1300,35 @@ int main(int argc, char**argv) {
     // read shape
     cnpy::NpyArray shape = cnpy::npz_load(data_file, "shape");
 
+    int64_t BATCH = shape.data<int>()[0];
+    int64_t NUM_HEAD_Q = shape.data<int>()[1];
+    int64_t NUM_HEAD_KV = shape.data<int>()[2];
+    int64_t SEQ_LEN_QO = shape.data<int>()[3];
+    int64_t SEQ_LEN_KV = shape.data<int>()[4];
+    int64_t HEAD_SIZE_QK = shape.data<int>()[5];
+    int64_t HEAD_SIZE_VO = shape.data<int>()[6];
+    bool is_causal = shape.data<int>()[7];
+    constexpr int kBlockN = 64;
+    constexpr int kBlockM = 64;
+    int64_t SEQ_LEN_QO_PAD = ceil_div(SEQ_LEN_QO, kBlockM) * kBlockM;
+    int64_t SEQ_LEN_KV_PAD = ceil_div(SEQ_LEN_KV, kBlockN) * kBlockN;
+    printf("batch %d nh_q %d nh_k %d sq_q %d(%d) sq_k %d(%d) hd_q %d hd_v %d\n", BATCH, NUM_HEAD_Q, NUM_HEAD_KV, SEQ_LEN_QO, SEQ_LEN_QO_PAD, SEQ_LEN_KV, SEQ_LEN_KV_PAD, HEAD_SIZE_QK, HEAD_SIZE_VO);
+    // read_args(argc, argv, 1, &BATCH);
+    // read_args(argc, argv, 2, &NUM_HEAD_Q);
+    // read_args(argc, argv, 3, &NUM_HEAD_KV);
+    // read_args(argc, argv, 4, &SEQ_LEN_QO);
+    // read_args(argc, argv, 5, &SEQ_LEN_KV);
+    // read_args(argc, argv, 6, &HEAD_SIZE_QK);
+    // read_args(argc, argv, 7, &HEAD_SIZE_VO);
+
     // alloc qkv
     T *q_d = syclcompat::malloc<T>(q_npy.num_vals);
     T *k_d = syclcompat::malloc<T>(k_npy.num_vals);
     T *v_d = syclcompat::malloc<T>(v_npy.num_vals);
 
     // alloc ps
-    T *p_d = syclcompat::malloc<T>(p_npy.num_vals);
-    T *s_d = syclcompat::malloc<T>(s_npy.num_vals);
+    T *p_d = syclcompat::malloc<T>(BATCH * NUM_HEAD_Q * SEQ_LEN_QO_PAD * SEQ_LEN_KV_PAD);
+    T *s_d = syclcompat::malloc<T>(BATCH * NUM_HEAD_Q * SEQ_LEN_QO_PAD * SEQ_LEN_KV_PAD);
 
     // alloc lse, odo
     V *lse_d = syclcompat::malloc<V>(lse_npy.num_vals);
@@ -1315,7 +1342,7 @@ int main(int argc, char**argv) {
     T *dq_d = syclcompat::malloc<T>(dq_npy.num_vals);
     T *dk_d = syclcompat::malloc<T>(dk_npy.num_vals);
     T *dv_d = syclcompat::malloc<T>(dv_npy.num_vals);
-    T *dp_d = syclcompat::malloc<T>(dp_npy.num_vals);
+    T *dp_d = syclcompat::malloc<T>(BATCH * NUM_HEAD_Q * SEQ_LEN_QO_PAD * SEQ_LEN_KV_PAD);
 
     // copy qkv
     syclcompat::memcpy<T>(q_d, q_npy.data<T>(), q_npy.num_vals);
@@ -1332,44 +1359,27 @@ int main(int argc, char**argv) {
     // copy odo
     syclcompat::memcpy<V>(odo_d, odo_npy.data<V>(), odo_npy.num_vals);
 
-    int64_t BATCH = shape.data<int>()[0];
-    int64_t NUM_HEAD_Q = shape.data<int>()[1];
-    int64_t NUM_HEAD_KV = shape.data<int>()[2];
-    int64_t SEQ_LEN_QO = shape.data<int>()[3];
-    int64_t SEQ_LEN_KV = shape.data<int>()[4];
-    int64_t HEAD_SIZE_QK = shape.data<int>()[5];
-    int64_t HEAD_SIZE_VO = shape.data<int>()[6];
-    bool is_causal = shape.data<int>()[7];
-    printf("batch %d nh_q %d nh_k %d sq_q %d sq_k %d hd_q %d hd_v %d\n", BATCH, NUM_HEAD_Q, NUM_HEAD_KV, SEQ_LEN_QO, SEQ_LEN_KV, HEAD_SIZE_QK, HEAD_SIZE_VO);
-    // read_args(argc, argv, 1, &BATCH);
-    // read_args(argc, argv, 2, &NUM_HEAD_Q);
-    // read_args(argc, argv, 3, &NUM_HEAD_KV);
-    // read_args(argc, argv, 4, &SEQ_LEN_QO);
-    // read_args(argc, argv, 5, &SEQ_LEN_KV);
-    // read_args(argc, argv, 6, &HEAD_SIZE_QK);
-    // read_args(argc, argv, 7, &HEAD_SIZE_VO);
-
     auto problem_shape = ProblemShapeRegular(BATCH, NUM_HEAD_Q, NUM_HEAD_KV, SEQ_LEN_QO, SEQ_LEN_KV, HEAD_SIZE_QK, HEAD_SIZE_VO);
-    launch_mha_backward<T, decltype(problem_shape)>(
+    launch_mha_backward<T, decltype(problem_shape), kBlockM, kBlockN>(
         problem_shape,
         do_d, o_d,
         q_d, k_d, v_d,
         lse_d, odo_d,
         dq_d, dk_d, dv_d,
-        s_d, dp_d);
+        s_d, dp_d, SEQ_LEN_QO_PAD, SEQ_LEN_KV_PAD);
 
     float atol = 1e-3f;
     float rtol = 1e-3f;
-    std::vector<T> s_test(BATCH * NUM_HEAD_Q * SEQ_LEN_QO * SEQ_LEN_KV);
+    std::vector<T> s_test(BATCH * NUM_HEAD_Q * SEQ_LEN_QO_PAD * SEQ_LEN_KV_PAD);
     syclcompat::memcpy<T>(s_test.data(), s_d, s_test.size());
     syclcompat::wait_and_throw();
     printf("P val\n");
-    verify(p_npy.data<T>(), s_test.data(), BATCH * NUM_HEAD_Q, SEQ_LEN_QO, SEQ_LEN_KV, atol, rtol);
-    std::vector<T> dp_test(BATCH * NUM_HEAD_Q * SEQ_LEN_QO * SEQ_LEN_KV);
+    verify(p_npy.data<T>(), s_test.data(), BATCH * NUM_HEAD_Q, SEQ_LEN_QO, SEQ_LEN_QO_PAD, SEQ_LEN_KV, SEQ_LEN_KV_PAD, atol, rtol);
+    std::vector<T> dp_test(BATCH * NUM_HEAD_Q * SEQ_LEN_QO_PAD * SEQ_LEN_KV_PAD);
     syclcompat::memcpy<T>(dp_test.data(), dp_d, dp_test.size());
     syclcompat::wait_and_throw();
     printf("dS val\n");
-    verify(ds_npy.data<T>(), dp_test.data(), BATCH * NUM_HEAD_Q, SEQ_LEN_QO, SEQ_LEN_KV, atol, rtol);
+    verify(ds_npy.data<T>(), dp_test.data(), BATCH * NUM_HEAD_Q, SEQ_LEN_QO, SEQ_LEN_QO_PAD, SEQ_LEN_KV, SEQ_LEN_KV_PAD, atol, rtol);
     // for (int m = 0; m < 4; ++m) {
     //     for (int n = 0; n < 64; ++n) {
     //         if (n % 16 == 0)
