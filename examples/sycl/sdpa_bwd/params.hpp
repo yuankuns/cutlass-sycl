@@ -96,7 +96,7 @@ struct FAKernel {
                                      Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
                                      Layout<Shape<_16,_1>>{})); // val layout 16x1
 
-    // for load dP in dQ=dP*K
+    // for load dP, K and dQ in dQ=dP*K
     using TiledLoaddP = decltype(make_tiled_copy(
                                      Copy_Atom<Copy_Traits<XE_2D_U16x8x16_LD_N, StrideR>, DType>{},
                                      Layout<Shape<_1,_16>>{}, // Thr layout 1x16 k-major
@@ -110,6 +110,16 @@ struct FAKernel {
                                      Copy_Atom<Copy_Traits<XE_2D_U32x8x16_LD_N, StrideR>, VType>{},
                                      Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
                                      Layout<Shape<_8,_1>>{})); // val layout 8x1
+
+    //  for load dPt, Q in dK=dPt*Q
+    using TiledLoaddPt = decltype(make_tiled_copy(
+                                      Copy_Atom<Copy_Traits<XE_2D_U16x16x16_LD_T, StrideC>, DType>{},
+                                      Layout<Shape<_1,_16>>{}, // Thr layout 1x16 k-major
+                                      Layout<Shape<_16,_1>>{}));              // Val layout  16x1
+    using TiledLoadQt = decltype(make_tiled_copy(
+                                     Copy_Atom<Copy_Traits<XE_2D_U16x16x16_LD_N, StrideC>, DType>{},
+                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
+                                     Layout<Shape<_16,_1>>{}));              // Val layout  16x1
 
     // for save S in S=QKt and P
     using TiledSaveS = decltype(make_tiled_copy(
@@ -126,11 +136,16 @@ struct FAKernel {
                                      Copy_Atom<Copy_Traits<XE_2D_U16x8x16_ST_N, StrideR>, DType>{},
                                      Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
                                      Layout<Shape<_8,_1>>{})); // Val layout  8x1
-    // for save dQ in dP*K
+    // for save dQ in dQ=dP*K
     using TiledSavedQ = decltype(make_tiled_copy(
                                      Copy_Atom<Copy_Traits<XE_2D_U32x8x16_ST_N, StrideR>, VType>{},
                                      Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
                                      Layout<Shape<_8,_1>>{})); // val layout 8x1
+    // for save dK=dPt*Q
+    using TiledSavedK = decltype(make_tiled_copy(
+                                     Copy_Atom<Copy_Traits<XE_2D_U16x8x16_ST_N, StrideR>, DType>{},
+                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
+                                     Layout<Shape<_8,_1>>{})); // Val layout  8x1
 
     // static constexpr auto tiled_mma_sdp = TiledMmaSdP{};
     /*
