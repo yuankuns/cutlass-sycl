@@ -1042,7 +1042,8 @@ mha_backward(T trait,
     // const int max_n_block = ceil_div(param.seq_len_kv, trait.kBlockN);
     for (int n_block = 0; n_block < param.n_block; ++n_block)
         dq_dk_dv_1colblock2<false>(trait, param, bidb, bidh, n_block);
-    dq_dk_dv_1colblock2<false>(trait, param, bidb, bidh, param.n_block, param.tail_n);
+    if (param.tail_n > 0)
+        dq_dk_dv_1colblock2<false>(trait, param, bidb, bidh, param.n_block, param.tail_n);
 }
 
 template<typename T, class ProblemShape, int kBlockM, int kBlockN>
