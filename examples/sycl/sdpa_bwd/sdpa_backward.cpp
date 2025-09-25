@@ -1067,31 +1067,25 @@ mha_backward(T trait,
         dq_dk_dv_1colblock2<false>(trait, param, bidb, bidh, param.n_block, param.tail_n);
 }
 
-template<typename T, class ProblemShape, int kBlockM, int kBlockN, bool is_bhsd>
-void launch_mha_backward(ProblemShape problem_shape,
-                         const T *do_d,
-                         const T *o_d,
-                         const T *q_d,
-                         const T *k_d,
-                         const T *v_d,
-                         const float *lse_d,
-                         const float *odo_d,
-                         float *dqaccum_d,
-                         T *dk_d,
-                         T *dv_d,
-                         T *s_d,
-                         T *dp_d,
-                         const int seq_len_q_pad,
-                         const int seq_len_kv_pad) {
-    // skip if head != 128
-    if (get<5>(problem_shape) != 128)
-        return;
+template<typename T, class ProblemShape, int kBlockM, int kBlockN, int kHeadDim, bool is_bhsd>
+void launch_mha_backward_headdim(ProblemShape problem_shape,
+                                 const T *do_d,
+                                 const T *o_d,
+                                 const T *q_d,
+                                 const T *k_d,
+                                 const T *v_d,
+                                 const float *lse_d,
+                                 const float *odo_d,
+                                 float *dqaccum_d,
+                                 T *dk_d,
+                                 T *dv_d,
+                                 T *s_d,
+                                 T *dp_d,
+                                 const int seq_len_q_pad,
+                                 const int seq_len_kv_pad) {
     constexpr int numSGs = 8;
-    constexpr int kHeadDim = 128;
-    // constexpr int kBlockM = 64;
-    // constexpr int kBlockN = 64;
     constexpr int kBlockK = 32;
-    auto trait = FAKernel<T, kHeadDim, kBlockM, kBlockN, kBlockK, numSGs>();
+    auto trait = FAKernel<T, kHeadDim, kBlockM, kBlockN, kBlockK, numSGs>{};
 
     const int BATCH = get<0>(problem_shape);
     const int NUM_HEAD_Q = get<1>(problem_shape);
@@ -1136,6 +1130,73 @@ void launch_mha_backward(ProblemShape problem_shape,
                                        trait,
                                        param);
     EventManager::getInstance().addEvent(event);
+}
+
+template<typename T, class ProblemShape, int kBlockM, int kBlockN, bool is_bhsd>
+void launch_mha_backward(ProblemShape problem_shape,
+                         const T *do_d,
+                         const T *o_d,
+                         const T *q_d,
+                         const T *k_d,
+                         const T *v_d,
+                         const float *lse_d,
+                         const float *odo_d,
+                         float *dqaccum_d,
+                         T *dk_d,
+                         T *dv_d,
+                         T *s_d,
+                         T *dp_d,
+                         const int seq_len_q_pad,
+                         const int seq_len_kv_pad) {
+    const int headdim = get<5>(problem_shape);
+    if (headdim == 64) {
+        constexpr int kHeadDim = 64;
+        launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN, kHeadDim, is_bhsd>(
+            problem_shape,
+            do_d, o_d, q_d, k_d, v_d,
+            lse_d, odo_d,
+            dqaccum_d, dk_d, dv_d,
+            s_d, dp_d,
+            seq_len_q_pad, seq_len_kv_pad);
+    } else if (headdim == 96) {
+        constexpr int kHeadDim = 96;
+        launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN, kHeadDim, is_bhsd>(
+            problem_shape,
+            do_d, o_d, q_d, k_d, v_d,
+            lse_d, odo_d,
+            dqaccum_d, dk_d, dv_d,
+            s_d, dp_d,
+            seq_len_q_pad, seq_len_kv_pad);
+    } else if (headdim == 128) {
+        constexpr int kHeadDim = 128;
+        launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN, kHeadDim, is_bhsd>(
+            problem_shape,
+            do_d, o_d, q_d, k_d, v_d,
+            lse_d, odo_d,
+            dqaccum_d, dk_d, dv_d,
+            s_d, dp_d,
+            seq_len_q_pad, seq_len_kv_pad);
+    } else if (headdim == 192) {
+        constexpr int kHeadDim = 192;
+        launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN, kHeadDim, is_bhsd>(
+            problem_shape,
+            do_d, o_d, q_d, k_d, v_d,
+            lse_d, odo_d,
+            dqaccum_d, dk_d, dv_d,
+            s_d, dp_d,
+            seq_len_q_pad, seq_len_kv_pad);
+    } else if (headdim == 256) {
+        constexpr int kHeadDim = 256;
+        launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN, kHeadDim, is_bhsd>(
+            problem_shape,
+            do_d, o_d, q_d, k_d, v_d,
+            lse_d, odo_d,
+            dqaccum_d, dk_d, dv_d,
+            s_d, dp_d,
+            seq_len_q_pad, seq_len_kv_pad);
+    } else {
+        assert(false && "only support headdim 64,96,128,192,256");
+    }
 }
 
 int main(int argc, char**argv) {

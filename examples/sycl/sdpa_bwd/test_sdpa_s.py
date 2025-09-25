@@ -315,13 +315,15 @@ def test_sdpa(dtype,
 def loop_run():
     global GRAD_DICT
     for h in [4]:
-        for seq_q in list(range(512, 512+32)):
-            for seq_k in list(range(512, 512+32)):
-                for dim in [128]:
+        # for seq_q in list(range(512, 512+32)):
+        #     for seq_k in list(range(512, 512+32)):
+        for seq_q in [512, 513, 523, 527, 528, 529, 543]:
+            for seq_k in [512, 513, 523, 527, 528, 529, 543]:
+                for dim in [96]:
                     # print('test_run', 4, 4, h, seq_q, seq_k, dim, dim)
                     # bhsd
-                    # test_sdpa(torch.float16, 123, 4, 4, h, seq_q, seq_k, dim, dim, is_bhsd = True)
-                    # GRAD_DICT = {}
+                    test_sdpa(torch.float16, 123, 4, 4, h, seq_q, seq_k, dim, dim, is_bhsd = True)
+                    GRAD_DICT = {}
                     # bshd
                     test_sdpa(torch.float16, 123, 4, 4, h, seq_q, seq_k, dim, dim, is_bhsd = False)
                     GRAD_DICT = {}
