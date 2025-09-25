@@ -427,3 +427,45 @@ void setup_bhsd_stride(Param<T> &param) {
     param.dq_h_stride = param.seq_len_q_pad * param.head_dim;
     param.dq_b_stride = param.num_head_q * param.seq_len_q_pad * param.head_dim;
 }
+
+template<typename T>
+void setup_bshd_stride(Param<T> &param) {
+    param.q_r_stride = param.num_head_q * param.head_dim;
+    param.q_h_stride = param.head_dim;
+    param.q_b_stride = param.num_head_q * param.seq_len_q * param.head_dim;
+
+    // param.dq_r_stride = param.head_dim;
+    // param.dq_h_stride = param.seq_len_q * param.head_dim;
+    // param.dq_b_stride = param.num_head_q * param.seq_len_q * param.head_dim;
+
+    param.k_r_stride = param.num_head_kv * param.head_dim;
+    param.k_h_stride = param.head_dim;
+    param.k_b_stride = param.num_head_kv * param.seq_len_kv * param.head_dim;
+
+    // param.dk_r_stride = param.head_dim;
+    // param.dk_h_stride = param.seq_len_kv * param.head_dim;
+    // param.dk_b_stride = param.num_head_kv * param.seq_len_kv * param.head_dim;
+
+    param.v_r_stride = param.num_head_kv * param.head_dim;
+    param.v_h_stride = param.head_dim;
+    param.v_b_stride = param.num_head_kv * param.seq_len_kv * param.head_dim;
+
+    // param.dv_r_stride = param.head_dim;
+    // param.dv_h_stride = param.seq_len_kv * param.head_dim;
+    // param.dv_b_stride = param.num_head_kv * param.seq_len_kv * param.head_dim;
+
+    param.o_r_stride = param.num_head_q * param.head_dim;
+    param.o_h_stride = param.head_dim;
+    param.o_b_stride = param.num_head_q * param.seq_len_q * param.head_dim;
+
+    // param.do_r_stride = param.head_dim;
+    // param.do_h_stride = param.seq_len_q * param.head_dim;
+    // param.do_b_stride = param.num_head_q * param.seq_len_q * param.head_dim;
+    param.s_r_stride = param.seq_len_kv_pad;
+    param.s_s_stride = param.seq_len_q_pad * param.seq_len_kv_pad;
+    param.s_b_stride = param.num_head_q * param.seq_len_q_pad * param.seq_len_kv_pad;
+
+    param.dq_r_stride = param.num_head_q * param.head_dim;
+    param.dq_h_stride = param.head_dim;
+    param.dq_b_stride = param.num_head_q * param.seq_len_q_pad * param.head_dim;
+}

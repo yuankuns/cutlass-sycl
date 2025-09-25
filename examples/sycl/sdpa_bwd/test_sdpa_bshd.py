@@ -244,8 +244,7 @@ def test_sdpa(dtype,
               head_size_qk: int,
               head_size_vo: int,
               dropout_p: float = 0.0,
-              is_causal: bool = False,
-              is_bhsd: bool = True):
+              is_causal: bool = False):
     torch.manual_seed(seed)
     q = torch.randn(batch, num_heads_q, seq_len_qo, head_size_qk, requires_grad=True).to(dtype)
     k = torch.randn(batch, num_heads_kv, seq_len_kv, head_size_qk, requires_grad=True).to(dtype)
@@ -274,7 +273,25 @@ def test_sdpa(dtype,
     attn_out_pt.backward(grad)
     q_grad, k_grad, v_grad, p_grad, s_grad = test_model.backward_ref(grad)
     dump_dict = {}
-    print(f"seed {seed} bsz {batch} nh_q {num_heads_q} nh_kv {num_heads_kv} sl_qo {seq_len_qo} sl_kv {seq_len_kv} hs_qk {head_size_qk} hs_vo {head_size_vo} dp {dropout_p} is_causal {is_causal} is_bhsd {is_bhsd}")
+    print(f"seed {seed} bsz {batch} nh_q {num_heads_q} nh_kv {num_heads_kv} sl_qo {seq_len_qo} sl_kv {seq_len_kv} hs_qk {head_size_qk} hs_vo {head_size_vo} dp {dropout_p} is_causal {is_causal}")
+    set_dict(dump_dict, 'out', attn_out.transpose(1, 2).contiguous())
+    set_dict(dump_dict, 'grad', grad.transpose(1, 2).contiguous())
+    set_dict(dump_dict, 'v_grad', v_grad.transpose(1, 2).contiguous())
+    set_dict(dump_dict, 'lse', test_model.lse)
+    set_dict(dump_dict, 'odo', test_model.odo)
+    set_dict(dump_dict, 's', test_model.s)
+    set_dict(dump_dict, 'p', test_model.p)
+    set_dict(dump_dict, 'p_grad', p_grad)
+    set_dict(dump_dict, 's_grad', s_grad)
+    set_dict(dump_dict, 'k_grad', k_grad.transpose(1, 2).contiguous())
+    set_dict(dump_dict, 'q_grad', q_grad.transpose(1, 2).contiguous())
+    set_dict(dump_dict, 'q', q.transpose(1, 2).contiguous())
+    set_dict(dump_dict, 'k', k.transpose(1, 2).contiguous())
+    set_dict(dump_dict, 'v', v.transpose(1, 2).contiguous())
+    shape = np.array([batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, head_size_qk, head_size_vo, is_causal, False], dtype=np.int32)
+    dump_dict['shape'] = shape
+    # print('test', v_grad[0,0:4,0,0:16])
+    # print('upstream', v2.grad[0,0:4,0,0:16])
     print('attn_out ', is_close(attn_out, attn_out_pt))
     print('p_grad ', is_close(GRAD_DICT['p_grad'], p_grad))
     # print('s2_grad ', is_close(GRAD_DICT['s2_grad'], s2_grad))
@@ -282,35 +299,7 @@ def test_sdpa(dtype,
     print('k_grad ', is_close(k_grad, k2.grad))
     print('q_grad ', is_close(q_grad, q2.grad))
     print('v_grad ', is_close(v_grad, v2.grad))
-    if is_bhsd:
-        set_dict(dump_dict, 'out', attn_out)
-        set_dict(dump_dict, 'grad', grad)
-        set_dict(dump_dict, 'v_grad', v_grad)
-        set_dict(dump_dict, 'k_grad', k_grad)
-        set_dict(dump_dict, 'q_grad', q_grad)
-        set_dict(dump_dict, 'q', q)
-        set_dict(dump_dict, 'k', k)
-        set_dict(dump_dict, 'v', v)
-    else:
-        set_dict(dump_dict, 'out', attn_out.transpose(1, 2).contiguous())
-        set_dict(dump_dict, 'grad', grad.transpose(1, 2).contiguous())
-        set_dict(dump_dict, 'v_grad', v_grad.transpose(1, 2).contiguous())
-        set_dict(dump_dict, 'k_grad', k_grad.transpose(1, 2).contiguous())
-        set_dict(dump_dict, 'q_grad', q_grad.transpose(1, 2).contiguous())
-        set_dict(dump_dict, 'q', q.transpose(1, 2).contiguous())
-        set_dict(dump_dict, 'k', k.transpose(1, 2).contiguous())
-        set_dict(dump_dict, 'v', v.transpose(1, 2).contiguous())
-    set_dict(dump_dict, 'lse', test_model.lse)
-    set_dict(dump_dict, 'odo', test_model.odo)
-    set_dict(dump_dict, 's', test_model.s)
-    set_dict(dump_dict, 'p', test_model.p)
-    set_dict(dump_dict, 'p_grad', p_grad)
-    set_dict(dump_dict, 's_grad', s_grad)
-    shape = np.array([batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, head_size_qk, head_size_vo, is_causal, is_bhsd], dtype=np.int32)
-    dump_dict['shape'] = shape
-    # print('test', v_grad[0,0:4,0,0:16])
-    # print('upstream', v2.grad[0,0:4,0,0:16])
-    np.savez(f'mha-{batch}-{num_heads_q}-{num_heads_kv}-{seq_len_qo}-{seq_len_kv}-{head_size_qk}-{head_size_vo}-{dropout_p}-{int(is_causal)}-{int(is_bhsd)}.npz', **dump_dict)
+    np.savez(f'mha-{batch}-{num_heads_q}-{num_heads_kv}-{seq_len_qo}-{seq_len_kv}-{head_size_qk}-{head_size_vo}-{dropout_p}-{int(is_causal)}.npz', **dump_dict)
 
 def loop_run():
     global GRAD_DICT
@@ -318,12 +307,8 @@ def loop_run():
         for seq_q in list(range(512, 512+32)):
             for seq_k in list(range(512, 512+32)):
                 for dim in [128]:
-                    # print('test_run', 4, 4, h, seq_q, seq_k, dim, dim)
-                    # bhsd
-                    # test_sdpa(torch.float16, 123, 4, 4, h, seq_q, seq_k, dim, dim, is_bhsd = True)
-                    # GRAD_DICT = {}
-                    # bshd
-                    test_sdpa(torch.float16, 123, 4, 4, h, seq_q, seq_k, dim, dim, is_bhsd = False)
+                    print('test_run', 4, 4, h, seq_q, seq_k, dim, dim)
+                    test_sdpa(torch.float16, 123, 4, 4, h, seq_q, seq_k, dim, dim)
                     GRAD_DICT = {}
 
 if __name__ == '__main__':
