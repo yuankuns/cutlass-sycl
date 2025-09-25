@@ -26,7 +26,8 @@ struct FAKernel {
     static constexpr int kNSGs = kNSGs_;
     // using SubgroupLayout = Layout<Shape<Int<kNSGs>, _1, _1>, Stride<_1, _1, _1>>;
     static constexpr int AtomLayoutMSdP = 16 *kNSGs / kBlockN;
-    static constexpr int AtomLayoutNdKV = 16 *kNSGs / kHeadDim;
+    // static constexpr int AtomLayoutNdKV = 16 *kNSGs / kHeadDim;
+    static constexpr int AtomLayoutNdKV = 2;
     static constexpr int AtomLayoutMdQ = kBlockM / 32;
     // static constexpr int AtomLayoutMSdP = 4;
     // static constexpr int AtomLayoutNdKV = 2;
