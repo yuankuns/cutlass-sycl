@@ -244,7 +244,8 @@ def test_sdpa(dtype,
               head_size_qk: int,
               head_size_vo: int,
               dropout_p: float = 0.0,
-              is_causal: bool = False):
+              is_causal: bool = False,
+              is_bhsd: bool = True):
     torch.manual_seed(seed)
     q = torch.randn(batch, num_heads_q, seq_len_qo, head_size_qk, requires_grad=True).to(dtype)
     k = torch.randn(batch, num_heads_kv, seq_len_kv, head_size_qk, requires_grad=True).to(dtype)
@@ -288,7 +289,7 @@ def test_sdpa(dtype,
     set_dict(dump_dict, 'q', q)
     set_dict(dump_dict, 'k', k)
     set_dict(dump_dict, 'v', v)
-    shape = np.array([batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, head_size_qk, head_size_vo, is_causal], dtype=np.int32)
+    shape = np.array([batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, head_size_qk, head_size_vo, is_causal, is_bhsd], dtype=np.int32)
     dump_dict['shape'] = shape
     # print('test', v_grad[0,0:4,0,0:16])
     # print('upstream', v2.grad[0,0:4,0,0:16])
@@ -304,8 +305,8 @@ def test_sdpa(dtype,
 def loop_run():
     global GRAD_DICT
     for h in [4]:
-        for seq_q in list(range(1024, 1024+32)):
-            for seq_k in list(range(1024, 1024+32)):
+        for seq_q in list(range(512, 512+32)):
+            for seq_k in list(range(512, 512+32)):
                 for dim in [128]:
                     print('test_run', 4, 4, h, seq_q, seq_k, dim, dim)
                     test_sdpa(torch.float16, 123, 4, 4, h, seq_q, seq_k, dim, dim)
