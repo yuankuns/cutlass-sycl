@@ -269,7 +269,7 @@ struct Param {
           const T *k,
           const T *v,
           const float *lse,
-          const float *odo,
+          float *odo,
           float *dqaccum,
           T *dk,
           T *dv,
@@ -300,7 +300,7 @@ struct Param {
     const T *k_ptr;
     const T *v_ptr;
     const float *lse_ptr;
-    const float *odo_ptr;
+    float *odo_ptr;
     const float scale_softmax;
     const float scale_softmax_log2;
     // write
