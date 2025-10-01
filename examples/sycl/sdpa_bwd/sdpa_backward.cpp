@@ -1501,6 +1501,63 @@ convert_dq(T &trait, Param<typename T::DType> &param, int m_block, int bidb, int
     }
 }
 
+template <bool Is_even_M, class T>
+void
+convert_dq(T &trait, Param<typename T::DType> &param, int m_block, int bidb, int bidh) {
+    constexpr int kBlockM = T::kBlockM;
+    constexpr int kBlockN = T::kBlockN;
+    constexpr int kHeadDim = T::kHeadDim;
+    using DType = typename T::DType;
+    using VType = typename T::VType;
+    auto sg = syclcompat::get_nd_item<1>().get_sub_group();
+    auto first_thread_in_sg_idx = sg.get_group_linear_id() * trait.SubgroupSize;
+
+    auto bofst = Boffset(param);
+    const index_t dq_offset = bofst.dq_offset(bidb, bidh, m_block * kBlockM);
+    const index_t q_offset = bofst.q_offset(bidb, bidh, m_block * kBlockM);
+    using ShapeQ = Shape<
+        std::conditional_t<Is_even_M, Int<kBlockM>, int>,
+        Int<kHeadDim>, _1>;
+    ShapeQ shapeQ;
+    if constexpr (Is_even_M) {
+        shapeQ = make_shape(Int<kBlockM>{}, Int<kHeadDim>{}, _1{});
+    } else {
+        shapeQ = make_shape(param.tail_m, Int<kHeadDim>{}, _1{});
+    }
+
+    Tensor mdQaccum = make_tensor(make_gmem_ptr(param.dqaccum_ptr + dq_offset),
+                                  make_layout(
+                                      shapeQ,
+                                      make_stride(param.dq_r_stride, _1{}, _1{})));
+    Tensor mdQ = make_tensor(make_gmem_ptr(param.dq_ptr + q_offset),
+                            make_layout(
+                                shapeQ,
+                                make_stride(param.q_r_stride, _1{}, _1{})));
+
+    Shape tile_dq = typename T::TileShapedQ{};
+
+    auto tileloaddQ = typename T::TiledLoaddQ{mdQaccum};
+    auto tilesavedQ = typename T::TiledSavedV{mdQ};
+
+
+    typename T::TiledMmadQ tiled_mma_dq;
+    auto thr_mma_dq = tiled_mma_dq.get_slice(first_thread_in_sg_idx);
+
+    Tensor mQ_coord = cute::get_xe_tensor(shapeQ);
+    Tensor gdQ = local_tile(mQ_coord, select<0, 1>(tile_dq), make_coord(0, 0, 0)); // dump dQ
+
+    Tensor tdQgdQ = thr_mma_dq.partition_C(gdQ); // save to dq
+    Tensor tdQrdQaccum = partition_fragment_C(tiled_mma_dq, Shape<Int<kBlockM>, Int<kHeadDim>>{});
+
+    Tensor tdQrdQ = make_fragment_like<DType>(tdQrdQaccum);
+    copy(tileloaddQ, tdQgdQ, tdQrdQaccum);
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(tdQrdQ); ++i) {
+        tdQrdQ(i) = static_cast<DType>(tdQrdQaccum(i));
+    }
+    copy(tilesavedQ, tdQrdQ, tdQgdQ);
+}
+
 template<class T>
 void
 mhd_convert_dq(T trait,
@@ -1510,8 +1567,12 @@ mhd_convert_dq(T trait,
     // The block index for the batch.
     const int bidb = BlockIdxZ();
     // The block index for the head.
-    const int bidh = BlockIdxY();;
-    convert_dq(trait, param, m_block, bidb, bidh);
+    const int bidh = BlockIdxY();
+    if (param.tail_m > 0 and m_block == param.m_block - 1) {
+        convert_dq<false>(trait, param, m_block, bidb, bidh);
+    } else {
+        convert_dq<true>(trait, param, m_block, bidb, bidh);
+    }
 }
 
 template<typename T, class ProblemShape, int kBlockM, int kBlockN, int kHeadDim, bool is_bhsd>
@@ -1599,7 +1660,7 @@ void launch_mha_backward_headdim(ProblemShape problem_shape,
     EventManager::getInstance().addEvent(event1);
 
     auto dimGrid2 = syclcompat::dim3(size(M_BLOCK), size(param.num_head_q), size(param.batch));
-    auto dimBlock2 = syclcompat::dim3(size(kBlockM), size(1), size(1));
+    auto dimBlock2 = syclcompat::dim3(size(numSGs * trait.SubgroupSize), size(1), size(1));
     syclcompat::experimental::launch_properties launch_props2{
         // sycl::ext::oneapi::experimental::work_group_scratch_size(0),
     };
