@@ -1476,7 +1476,7 @@ mha_dot_do_o(T trait,
     compute_o_dot_do(trait, param);
 }
 
-template <bool Is_even_M, class T>
+template <class T>
 void
 convert_dq(T &trait, Param<typename T::DType> &param, int m_block, int bidb, int bidh) {
     constexpr int kBlockM = T::kBlockM;
@@ -1511,12 +1511,7 @@ mhd_convert_dq(T trait,
     const int bidb = BlockIdxZ();
     // The block index for the head.
     const int bidh = BlockIdxY();;
-    // if (param.tail_m > 0 and m_block == param.m_block) {
-    //     // last block with tail
-    //     convert_dq<false>(trait, param, m_block, bidb, bidh);
-    // } else {
-        convert_dq<true>(trait, param, m_block, bidb, bidh);
-    // }
+    convert_dq(trait, param, m_block, bidb, bidh);
 }
 
 template<typename T, class ProblemShape, int kBlockM, int kBlockN, int kHeadDim, bool is_bhsd>
