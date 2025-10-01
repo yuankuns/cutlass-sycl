@@ -1318,7 +1318,6 @@ compute_o_dot_do2(T &trait, Param<typename T::DType> param) {
     // The block index for the head.
     const int bidh = BlockIdxY();;
     // The thread index.
-    // const int tidx = threadIdx.x;
     constexpr int kBlockM = T::kBlockM;
     constexpr int kBlockN = T::kBlockN;
     constexpr int kHeadDim = T::kHeadDim;
@@ -1477,6 +1476,49 @@ mha_dot_do_o(T trait,
     compute_o_dot_do(trait, param);
 }
 
+template <bool Is_even_M, class T>
+void
+convert_dq(T &trait, Param<typename T::DType> &param, int m_block, int bidb, int bidh) {
+    constexpr int kBlockM = T::kBlockM;
+    constexpr int kBlockN = T::kBlockN;
+    constexpr int kHeadDim = T::kHeadDim;
+    constexpr int kNSGs = T::kNSGs;
+    using DType = typename T::DType;
+    using VType = typename T::VType;
+
+    auto bofst = Boffset(param);
+    const index_t dq_offset = bofst.dq_offset(bidb, bidh, m_block * kBlockM);
+    const index_t q_offset = bofst.q_offset(bidb, bidh, m_block * kBlockM);
+    VType * dQaccum = param.dqaccum_ptr + dq_offset;
+    DType * dQ = param.dq_ptr + q_offset;
+
+    int tail_m = param.seq_len_q - m_block * kBlockM;
+    int m = ThreadIdxX();
+    if (m < tail_m) {
+        for (int h = 0; h < kHeadDim; ++h) {
+            dQ[m * param.q_r_stride + h] = static_cast<DType>(dQaccum[m * param.dq_r_stride + h]);
+        }
+    }
+}
+
+template<class T>
+void
+mhd_convert_dq(T trait,
+               Param<typename T::DType>  param) {
+    // The block index for the M dimension.
+    const int m_block = BlockIdxX();
+    // The block index for the batch.
+    const int bidb = BlockIdxZ();
+    // The block index for the head.
+    const int bidh = BlockIdxY();;
+    // if (param.tail_m > 0 and m_block == param.m_block) {
+    //     // last block with tail
+    //     convert_dq<false>(trait, param, m_block, bidb, bidh);
+    // } else {
+        convert_dq<true>(trait, param, m_block, bidb, bidh);
+    // }
+}
+
 template<typename T, class ProblemShape, int kBlockM, int kBlockN, int kHeadDim, bool is_bhsd>
 void launch_mha_backward_headdim(ProblemShape problem_shape,
                                  const T *do_d,
@@ -1487,6 +1529,7 @@ void launch_mha_backward_headdim(ProblemShape problem_shape,
                                  const float *lse_d,
                                  float *odo_d,
                                  float *dqaccum_d,
+                                 T *dq_d,
                                  T *dk_d,
                                  T *dv_d,
                                  T *s_d,
@@ -1504,9 +1547,11 @@ void launch_mha_backward_headdim(ProblemShape problem_shape,
     const int SEQ_LEN_KV = get<4>(problem_shape);
     const int N_BLOCK = SEQ_LEN_KV / kBlockN;
     const int tail_n = SEQ_LEN_KV % kBlockN;
+    const int M_BLOCK = ceil_div(SEQ_LEN_Q, kBlockM);
+    const int tail_m = SEQ_LEN_Q % kBlockM;
     T * pbuff = syclcompat::malloc<T>(BATCH * NUM_HEAD_Q * seq_len_kv_pad * kBlockM);
     auto param = Param<T>(do_d, o_d, q_d, k_d, v_d, lse_d, odo_d,
-                          dqaccum_d, dk_d, dv_d, s_d, dp_d, pbuff,
+                          dqaccum_d, dq_d, dk_d, dv_d, s_d, dp_d, pbuff,
                           1 / sqrt(static_cast<float>(kHeadDim)));
     param.batch = BATCH;
     param.num_head_q = NUM_HEAD_Q;
@@ -1516,6 +1561,8 @@ void launch_mha_backward_headdim(ProblemShape problem_shape,
     param.head_dim = kHeadDim;
     param.n_block = N_BLOCK;
     param.tail_n = tail_n;
+    param.m_block = M_BLOCK;
+    param.tail_m = tail_m;
     param.seq_len_kv_pad = seq_len_kv_pad;
     param.seq_len_q_pad = seq_len_q_pad;
     if constexpr(is_bhsd) {
@@ -1523,9 +1570,8 @@ void launch_mha_backward_headdim(ProblemShape problem_shape,
     } else {
         setup_bshd_stride(param);
     }
-    const int NUM_M_BLOCK = ceil_div(SEQ_LEN_Q, kBlockM);
-    printf("kBlockM: %d, kBlockN: %d, kHeadDim: %d \n", kBlockM, kBlockN, kHeadDim);
-    auto dimGrid0 = syclcompat::dim3(size(NUM_M_BLOCK), size(param.num_head_q), size(param.batch));
+
+    auto dimGrid0 = syclcompat::dim3(size(M_BLOCK), size(param.num_head_q), size(param.batch));
     auto dimBlock0 = syclcompat::dim3(size(kBlockM), size(1), size(1));
     syclcompat::experimental::launch_properties launch_props0{
         // sycl::ext::oneapi::experimental::work_group_scratch_size(0),
@@ -1538,6 +1584,7 @@ void launch_mha_backward_headdim(ProblemShape problem_shape,
                                        trait,
                                        param);
     EventManager::getInstance().addEvent(event0);
+
     auto dimGrid1 = syclcompat::dim3(size(1), size(param.num_head_q), size(param.batch));
     assert((trait.num_head_q % trait.num_head_kv == 0) && "num_head_q must be dividable by num_head_kv");
     assert((trait.num_head_q >= trait.num_head_kv) && "num_head_q must be bigger than or equal to num_head_kv");
@@ -1555,6 +1602,20 @@ void launch_mha_backward_headdim(ProblemShape problem_shape,
                                        trait,
                                        param);
     EventManager::getInstance().addEvent(event1);
+
+    auto dimGrid2 = syclcompat::dim3(size(M_BLOCK), size(param.num_head_q), size(param.batch));
+    auto dimBlock2 = syclcompat::dim3(size(kBlockM), size(1), size(1));
+    syclcompat::experimental::launch_properties launch_props2{
+        // sycl::ext::oneapi::experimental::work_group_scratch_size(0),
+    };
+    syclcompat::experimental::kernel_properties kernel_props2{
+        sycl::ext::oneapi::experimental::sub_group_size<trait.SubgroupSize>};
+    syclcompat::experimental::launch_policy policy2{dimGrid2, dimBlock2, launch_props2, kernel_props2};
+    auto event2 = syclcompat::experimental::launch<
+        mhd_convert_dq<decltype(trait)>>(policy2,
+                                         trait,
+                                         param);
+    EventManager::getInstance().addEvent(event2);
 }
 
 template<typename T, class ProblemShape, int kBlockM, int kBlockN, bool is_bhsd>
@@ -1567,6 +1628,7 @@ void launch_mha_backward(ProblemShape problem_shape,
                          const float *lse_d,
                          float *odo_d,
                          float *dqaccum_d,
+                         T *dq_d,
                          T *dk_d,
                          T *dv_d,
                          T *s_d,
@@ -1580,7 +1642,7 @@ void launch_mha_backward(ProblemShape problem_shape,
             problem_shape,
             do_d, o_d, q_d, k_d, v_d,
             lse_d, odo_d,
-            dqaccum_d, dk_d, dv_d,
+            dqaccum_d, dq_d, dk_d, dv_d,
             s_d, dp_d,
             seq_len_q_pad, seq_len_kv_pad);
     } else if (headdim == 96) {
@@ -1589,7 +1651,7 @@ void launch_mha_backward(ProblemShape problem_shape,
             problem_shape,
             do_d, o_d, q_d, k_d, v_d,
             lse_d, odo_d,
-            dqaccum_d, dk_d, dv_d,
+            dqaccum_d, dq_d, dk_d, dv_d,
             s_d, dp_d,
             seq_len_q_pad, seq_len_kv_pad);
     } else if (headdim == 128) {
@@ -1598,7 +1660,7 @@ void launch_mha_backward(ProblemShape problem_shape,
             problem_shape,
             do_d, o_d, q_d, k_d, v_d,
             lse_d, odo_d,
-            dqaccum_d, dk_d, dv_d,
+            dqaccum_d, dq_d, dk_d, dv_d,
             s_d, dp_d,
             seq_len_q_pad, seq_len_kv_pad);
     } else if (headdim == 192) {
@@ -1607,7 +1669,7 @@ void launch_mha_backward(ProblemShape problem_shape,
             problem_shape,
             do_d, o_d, q_d, k_d, v_d,
             lse_d, odo_d,
-            dqaccum_d, dk_d, dv_d,
+            dqaccum_d, dq_d, dk_d, dv_d,
             s_d, dp_d,
             seq_len_q_pad, seq_len_kv_pad);
     } else if (headdim == 256) {
@@ -1616,7 +1678,7 @@ void launch_mha_backward(ProblemShape problem_shape,
             problem_shape,
             do_d, o_d, q_d, k_d, v_d,
             lse_d, odo_d,
-            dqaccum_d, dk_d, dv_d,
+            dqaccum_d, dq_d, dk_d, dv_d,
             s_d, dp_d,
             seq_len_q_pad, seq_len_kv_pad);
     } else {
@@ -1725,7 +1787,7 @@ int main(int argc, char**argv) {
             do_d, o_d,
             q_d, k_d, v_d,
             lse_d, odo_d,
-            dqaccum_d, dk_d, dv_d,
+            dqaccum_d, dq_d, dk_d, dv_d,
             s_d, dp_d, SEQ_LEN_QO_PAD, SEQ_LEN_KV_PAD);
     } else {
         launch_mha_backward<T, decltype(problem_shape), kBlockM, kBlockN, false>(
@@ -1733,7 +1795,7 @@ int main(int argc, char**argv) {
             do_d, o_d,
             q_d, k_d, v_d,
             lse_d, odo_d,
-            dqaccum_d, dk_d, dv_d,
+            dqaccum_d, dq_d, dk_d, dv_d,
             s_d, dp_d, SEQ_LEN_QO_PAD, SEQ_LEN_KV_PAD);
     }
     float atol = 1e-3f;
@@ -1767,13 +1829,19 @@ int main(int argc, char**argv) {
     printf("dK val: ");
     verify(dk_npy.data<T>(), dk_test.data(), BATCH * NUM_HEAD_KV, SEQ_LEN_KV, HEAD_SIZE_QK, atol, rtol);
 
-    std::vector<V> dq_test(BATCH * NUM_HEAD_Q * SEQ_LEN_QO_PAD * HEAD_SIZE_QK);
-    syclcompat::memcpy<V>(dq_test.data(), dqaccum_d, dq_test.size());
+    std::vector<V> dqaccum_test(BATCH * NUM_HEAD_Q * SEQ_LEN_QO_PAD * HEAD_SIZE_QK);
+    syclcompat::memcpy<V>(dqaccum_test.data(), dqaccum_d, dqaccum_test.size());
+    syclcompat::wait_and_throw();
+    printf("dQaccum val: ");
+    if (is_bhsd) {
+        verify<T, V, true>(dq_npy.data<T>(), dqaccum_test.data(), BATCH, NUM_HEAD_Q, SEQ_LEN_QO, SEQ_LEN_QO_PAD, HEAD_SIZE_QK, atol, rtol);
+    } else {
+        verify<T, V, false>(dq_npy.data<T>(), dqaccum_test.data(), BATCH, NUM_HEAD_Q, SEQ_LEN_QO, SEQ_LEN_QO_PAD, HEAD_SIZE_QK, atol, rtol);
+    }
+
+    std::vector<T> dq_test(BATCH * NUM_HEAD_Q * SEQ_LEN_QO * HEAD_SIZE_QK);
+    syclcompat::memcpy<T>(dq_test.data(), dq_d, dq_test.size());
     syclcompat::wait_and_throw();
     printf("dQ val: ");
-    if (is_bhsd) {
-        verify<T, V, true>(dq_npy.data<T>(), dq_test.data(), BATCH, NUM_HEAD_Q, SEQ_LEN_QO, SEQ_LEN_QO_PAD, HEAD_SIZE_QK, atol, rtol);
-    } else {
-        verify<T, V, false>(dq_npy.data<T>(), dq_test.data(), BATCH, NUM_HEAD_Q, SEQ_LEN_QO, SEQ_LEN_QO_PAD, HEAD_SIZE_QK, atol, rtol);
-    }
+    verify(dq_npy.data<T>(), dq_test.data(), BATCH * NUM_HEAD_Q, SEQ_LEN_QO, HEAD_SIZE_QK, atol, rtol);
 }
