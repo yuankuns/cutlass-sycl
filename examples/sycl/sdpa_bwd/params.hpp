@@ -271,6 +271,7 @@ struct Param {
           const float *lse,
           float *odo,
           float *dqaccum,
+          T *dq,
           T *dk,
           T *dv,
           T *s,
@@ -285,6 +286,7 @@ struct Param {
           lse_ptr(lse),
           odo_ptr(odo),
           dqaccum_ptr(dqaccum),
+          dq_ptr(dq),
           dk_ptr(dk),
           dv_ptr(dv),
           s_ptr(s),
@@ -300,12 +302,12 @@ struct Param {
     const T *k_ptr;
     const T *v_ptr;
     const float *lse_ptr;
-    float *odo_ptr;
     const float scale_softmax;
     const float scale_softmax_log2;
     // write
-    T *dq_ptr;
+    float *odo_ptr;
     float *dqaccum_ptr;
+    T *dq_ptr;
     T *dk_ptr;
     T *dv_ptr;
     T *s_ptr;
@@ -323,6 +325,8 @@ struct Param {
     int head_dim;
     int n_block;
     int tail_n;
+    int m_block;
+    int tail_m;
     int q_r_stride;
     int q_h_stride;
     int q_b_stride;
