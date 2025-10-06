@@ -1207,6 +1207,7 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
         sycl::group_barrier(group);
 
         copy(tilesavedP, tdPrdPl, tdPgdP); // save dP to buffer after P used by dV
+        sycl::group_barrier(group);
 
         if (n_block > 0)
             copy(tileloaddQ, tdQgdQ, tdQrdQ);
