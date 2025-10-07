@@ -711,6 +711,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
 
         copy(tilesavedP, tdPrdPl, tdPgdP); // save dP to buffer after P used by dV
 
+        sycl::group_barrier(group);
         if (n_block > 0)
             copy(tileloaddQ, tdQgdQ, tdQrdQ);
         // dQ=dP*K
@@ -821,6 +822,8 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         gemm_ker(tdVrdV, tdVrPt, tdVrdOt, tPtgPt, tPtrPt, tdOtgdOt, tdOtrdOt, tiled_mma_dkv, tileloadPt, tileloaddOt, thr_copy_pt, thr_copy_dot);
         sycl::group_barrier(group);
         copy(tilesavedP, tdPrdPl, tdPgdP); // save dP to internal buff after P is used
+
+        sycl::group_barrier(group);
         if (n_block > 0)
             copy(tileloaddQ, tdQgdQ, tdQrdQ);
         // dQ=dP*K
