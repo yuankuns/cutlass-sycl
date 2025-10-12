@@ -83,33 +83,45 @@ constexpr int tid = 0;
 constexpr int bid = 0;
 
 
+template<typename TiledMma, class TileMNK,
+         class TiledCopyA, class TiledCopyB,
+         class Tensor0, class Tensor1>
+CUTLASS_DEVICE void
+prefetch(TiledMma, TileMNK &tile_mnk,
+         TiledCopyA &copy_a, TiledCopyB &copy_b,
+         Tensor0 &gA, Tensor1 &gB) {
+    static constexpr auto ATOM_M = get<1>(typename TiledMma::ThrLayoutVMNK{}.shape());
+    static constexpr auto ATOM_N = get<2>(typename TiledMma::ThrLayoutVMNK{}.shape());
+    static constexpr auto ATOM_K = get<3>(typename TiledMma::ThrLayoutVMNK{}.shape());
+    static constexpr auto Num_SGs = ATOM_N * ATOM_M * ATOM_K;
+
+    static constexpr auto BLK_M = get<0>(TileMNK{});
+    static constexpr auto BLK_N = get<1>(TileMNK{});
+    static constexpr auto BLK_K = get<2>(TileMNK{});
+    auto prefetch_a = cute::prefetch_selector<Shape<Int<BLK_M>, Int<BLK_K>>, Num_SGs>(copy_a);
+    auto prefetch_b = cute::prefetch_selector<Shape<Int<BLK_N>, Int<BLK_K>>, Num_SGs>(copy_b);
+    int thread_idx = int(ThreadIdxX());
+    auto thr_prefetch_A = prefetch_a.get_slice(thread_idx);
+    auto thr_prefetch_B = prefetch_b.get_slice(thread_idx);
+
+    auto pAgA = thr_prefetch_A.partition_S(gA);
+    auto pBgB = thr_prefetch_B.partition_S(gB);
+    for (int prefetch_k = 0; prefetch_k < size<3>(pAgA); ++prefetch_k) {
+        prefetch(prefetch_a, pAgA(_, _, _, prefetch_k));
+        prefetch(prefetch_b, pBgB(_, _, _, prefetch_k));
+    }
+}
+
 template<int k_tile = 0, bool A_in_reg = false,
          typename Tensor0, typename Tensor1, typename Tensor2,
          typename Tensor3, typename Tensor4,
          typename Tensor5, typename Tensor6,
-         typename TiledMma, typename TiledCopyA, typename TiledCopyB,
-         typename ThrCopyA, typename ThrCopyB>
-CUTLASS_DEVICE void gemm_ker(Tensor0 &tCrC, Tensor1 &tCrA, Tensor2 &tCrB,
-              Tensor3 &tAgA, Tensor4 &tArA,
-              Tensor5 &tBgB, Tensor6 &tBrB, TiledMma &tiled_mma,
-              TiledCopyA &copy_a, TiledCopyB &copy_b,
-              ThrCopyA &thr_copy_a, ThrCopyB &thr_copy_b) {
-    // static constexpr auto ATOM_M = get<1>(typename TiledMma::ThrLayoutVMNK{}.shape());
-    // static constexpr auto ATOM_N = get<2>(typename TiledMma::ThrLayoutVMNK{}.shape());
-    // static constexpr auto ATOM_K = get<3>(typename TiledMma::ThrLayoutVMNK{}.shape());
-    // static constexpr auto Num_SGs = ATOM_N * ATOM_M * ATOM_K;
-
-    // static constexpr auto BLK_M = get<0>(TiledMma::tile_mnk);
-    // static constexpr auto BLK_N = get<1>(TiledMma::tile_mnk);
-    // static constexpr auto BLK_K = get<2>(TiledMma::tile_mnk);
-    // auto prefetch_a = cute::prefetch_select<Shape<Int<BLK_M>, Int<BLK_K>>, Num_SGs>(copy_a);
-    // auto prefetch_b = cute::prefetch_select<Shape<Int<BLK_N>, Int<BLK_K>>, Num_SGs>(copy_b);
-    // int thread_idx = int(ThreadIdxX());
-    // auto thr_prefetch_A = prefetch_a.get_slice(thread_idx);
-    // auto thr_prefetch_B = prefetch_b.get_slice(thread_idx);
-
-    // auto pAgA = thr_prefetch_A.partition_S(gA);
-    // auto pBgB = thr_prefetch_B.partition_S(gB);
+         typename TiledMma, typename TiledCopyA, typename TiledCopyB>
+CUTLASS_DEVICE void
+gemm_ker(Tensor0 &tCrC, Tensor1 &tCrA, Tensor2 &tCrB,
+         Tensor3 &tAgA, Tensor4 &tArA,
+         Tensor5 &tBgB, Tensor6 &tBrB, TiledMma &tiled_mma,
+         TiledCopyA &copy_a, TiledCopyB &copy_b) {
     constexpr int barrier_scope = 2;
     CUTLASS_PRAGMA_UNROLL
     for (int k = 0; k < size<3>(tAgA); ++k) {
@@ -686,7 +698,7 @@ dq_dk_dv_1colblock3(Trait &trait, Param<typename Trait::DType> &param,
         clear(tdPrdP);
         clear(tdQrdQ);
         // S=QKt
-        gemm_ker<k_tile>(tSrS, tSrQ, tSrKt, tQgQ, tQrQ, tKtgKt, tKtrKt, tiled_mma_sdp, tileloadQ, tileloadKt, thr_copy_q, thr_copy_kt);
+        gemm_ker(tSrS, tSrQ, tSrKt, tQgQ, tQrQ, tKtgKt, tKtrKt, tiled_mma_sdp, tileloadQ, tileloadKt);
         load_1colvec(lse, mLSE, taccScS_row);
         Tensor dP_sum = make_fragment_like(lse);
         load_1colvec(dP_sum, mdPsum, taccScS_row);
@@ -699,7 +711,7 @@ dq_dk_dv_1colblock3(Trait &trait, Param<typename Trait::DType> &param,
         copy(tilesaveP, tSrSl, tPgP); // save P to internal buffers
         copy(tilesaveS, tSrSl, tSgS); // save P to external tensor for verification
         // dP=dO*Vt
-        gemm_ker<k_tile>(tdPrdP, tdPrdO, tdPrV, tdOgdO, tdOrdO, tVgV, tVrV, tiled_mma_sdp, tileloaddO, tileloadV, thr_copy_do, thr_copy_v);
+        gemm_ker(tdPrdP, tdPrdO, tdPrV, tdOgdO, tdOrdO, tVgV, tVrV, tiled_mma_sdp, tileloaddO, tileloadV);
         Tensor dS = make_tensor(tdPrdP.data(), scores.layout());
         // dS=P(dP-sum_row(P))*scale
         softmax_backward(scores, dP_sum, dS, param.scale_softmax);
@@ -708,7 +720,7 @@ dq_dk_dv_1colblock3(Trait &trait, Param<typename Trait::DType> &param,
         copy(tilesavedPd, tdPrdPl, tdPgdPd); // save dP to external tensor for verification
 
         // dV=Pt*dO
-        gemm_ker(tdVrdV, tdVrPt, tdVrdOt, tPtgPt, tPtrPt, tdOtgdOt, tdOtrdOt, tiled_mma_dkv, tileloadPt, tileloaddOt, thr_copy_pt, thr_copy_dot);
+        gemm_ker(tdVrdV, tdVrPt, tdVrdOt, tPtgPt, tPtrPt, tdOtgdOt, tdOtrdOt, tiled_mma_dkv, tileloadPt, tileloaddOt);
         sycl::group_barrier(group);
 
         copy(tilesavedP, tdPrdPl, tdPgdP); // save dP to buffer after P used by dV
@@ -717,10 +729,10 @@ dq_dk_dv_1colblock3(Trait &trait, Param<typename Trait::DType> &param,
         if (n_block > 0)
             copy(tileloaddQ, tdQgdQ, tdQrdQ);
         // dQ=dP*K
-        gemm_ker<k_tile>(tdQrdQ, tdQrdP, tdQrK, tdPgdPa, tdPrdPa, tKgK, tKrK, tiled_mma_dq, tileloaddP, tileloadK, thr_copy_dp, thr_copy_k);
+        gemm_ker(tdQrdQ, tdQrdP, tdQrK, tdPgdPa, tdPrdPa, tKgK, tKrK, tiled_mma_dq, tileloaddP, tileloadK);
         copy(tilesavedQ, tdQrdQ, tdQgdQ);
         // dK=dPt*Q
-        gemm_ker<k_tile>(tdKrdK, tdKrdPt, tdKrQt, tdPtgdPt, tdPtrdPt, tQtgQt, tQtrQt, tiled_mma_dkv, tileloaddPt, tileloadQt, thr_copy_dpt, thr_copy_qt);
+        gemm_ker(tdKrdK, tdKrdPt, tdKrQt, tdPtgdPt, tdPtrdPt, tQtgQt, tQtrQt, tiled_mma_dkv, tileloaddPt, tileloadQt);
         // update ptr/atom copy
         mQ.data() = mQ.data() + int(kBlockM * param.q_r_stride);
         mdO.data() = mdO.data() + int(kBlockM * param.o_r_stride);
@@ -799,7 +811,7 @@ dq_dk_dv_1colblock3(Trait &trait, Param<typename Trait::DType> &param,
         clear(tdPrdP);
         clear(tdQrdQ);
         // S=QKt
-        gemm_ker<k_tile>(tSrS, tSrQ, tSrKt, tQgQ, tQrQ, tKtgKt, tKtrKt, tiled_mma_sdp, tileloadQ, tileloadKt, thr_copy_q, thr_copy_kt);
+        gemm_ker(tSrS, tSrQ, tSrKt, tQgQ, tQrQ, tKtgKt, tKtrKt, tiled_mma_sdp, tileloadQ, tileloadKt);
         load_1colvec(lse, mLSE, taccScS_row);
         Tensor dP_sum = make_fragment_like(lse);
         load_1colvec(dP_sum, mdPsum, taccScS_row);
@@ -812,7 +824,7 @@ dq_dk_dv_1colblock3(Trait &trait, Param<typename Trait::DType> &param,
         copy(tilesaveP, tSrSl, tPgP); // save P to internal buffers
         copy(tilesaveS, tSrSl, tSgS); // save P to external tensor for verification
         // dP=dO*Vt
-        gemm_ker<k_tile>(tdPrdP, tdPrdO, tdPrV, tdOgdO, tdOrdO, tVgV, tVrV, tiled_mma_sdp, tileloaddO, tileloadV, thr_copy_do, thr_copy_v);
+        gemm_ker(tdPrdP, tdPrdO, tdPrV, tdOgdO, tdOrdO, tVgV, tVrV, tiled_mma_sdp, tileloaddO, tileloadV);
         Tensor dS = make_tensor(tdPrdP.data(), scores.layout());
         // dS=P(dP-sum_row(P))*scale
         softmax_backward(scores, dP_sum, dS, param.scale_softmax);
@@ -821,7 +833,7 @@ dq_dk_dv_1colblock3(Trait &trait, Param<typename Trait::DType> &param,
         convert_type(converter, tdPrdP, tdPrdPl);
         copy(tilesavedPd, tdPrdPl, tdPgdPd); // save dP to external tensor for verification
         // dV=Pt*dO
-        gemm_ker(tdVrdV, tdVrPt, tdVrdOt, tPtgPt, tPtrPt, tdOtgdOt, tdOtrdOt, tiled_mma_dkv, tileloadPt, tileloaddOt, thr_copy_pt, thr_copy_dot);
+        gemm_ker(tdVrdV, tdVrPt, tdVrdOt, tPtgPt, tPtrPt, tdOtgdOt, tdOtrdOt, tiled_mma_dkv, tileloadPt, tileloaddOt);
         sycl::group_barrier(group);
         copy(tilesavedP, tdPrdPl, tdPgdP); // save dP to internal buff after P is used
 
@@ -829,10 +841,10 @@ dq_dk_dv_1colblock3(Trait &trait, Param<typename Trait::DType> &param,
         if (n_block > 0)
             copy(tileloaddQ, tdQgdQ, tdQrdQ);
         // dQ=dP*K
-        gemm_ker<k_tile>(tdQrdQ, tdQrdP, tdQrK, tdPgdPa, tdPrdPa, tKgK, tKrK, tiled_mma_dq, tileloaddP, tileloadK, thr_copy_dp, thr_copy_k);
+        gemm_ker(tdQrdQ, tdQrdP, tdQrK, tdPgdPa, tdPrdPa, tKgK, tKrK, tiled_mma_dq, tileloaddP, tileloadK);
         copy(tilesavedQ, tdQrdQ, tdQgdQ);
         // dK=dPt*Q
-        gemm_ker<k_tile>(tdKrdK, tdKrdPt, tdKrQt, tdPtgdPt, tdPtrdPt, tQtgQt, tQtrQt, tiled_mma_dkv, tileloaddPt, tileloadQt, thr_copy_dpt, thr_copy_qt);
+        gemm_ker(tdKrdK, tdKrdPt, tdKrQt, tdPtgdPt, tdPtrdPt, tQtgQt, tQtrQt, tiled_mma_dkv, tileloaddPt, tileloadQt);
     }
     auto tdVrdVl = make_tensor_like<T>(tdVrdV);
     convert_type(converter, tdVrdV, tdVrdVl);
@@ -1164,7 +1176,7 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
         clear(tdPrdP);
         clear(tdQrdQ);
         // S=QKt
-        gemm_ker<k_tile>(tSrS, tSrQ, tSrKt, tQgQ, tQrQ, tKtgKt, tKtrKt, tiled_mma_sdp, tileloadQ, tileloadKt, thr_copy_q, thr_copy_kt);
+        gemm_ker(tSrS, tSrQ, tSrKt, tQgQ, tQrQ, tKtgKt, tKtrKt, tiled_mma_sdp, tileloadQ, tileloadKt);
         load_1colvec(lse, mLSE, taccScS_row);
         Tensor dP_sum = make_fragment_like(lse);
         load_1colvec(dP_sum, mdPsum, taccScS_row);
@@ -1177,7 +1189,7 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
         copy(tilesaveP, tSrSl, tPgP); // save P to internal buffers
         copy(tilesaveS, tSrSl, tPgP); // save P to external tensor for verification
         // dP=dO*Vt
-        gemm_ker<k_tile>(tdPrdP, tdPrdO, tdPrV, tdOgdO, tdOrdO, tVgV, tVrV, tiled_mma_sdp, tileloaddO, tileloadV, thr_copy_do, thr_copy_v);
+        gemm_ker(tdPrdP, tdPrdO, tdPrV, tdOgdO, tdOrdO, tVgV, tVrV, tiled_mma_sdp, tileloaddO, tileloadV);
         Tensor dS = make_tensor(tdPrdP.data(), scores.layout());
         // dS=P(dP-sum_row(P))*scale
         softmax_backward(scores, dP_sum, dS, param.scale_softmax);
@@ -1186,7 +1198,7 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
         copy(tilesavedPd, tdPrdPl, tPgP); // save dP to external tensor for verification
 
         // dV=Pt*dO
-        gemm_ker(tdVrdV, tdVrPt, tdVrdOt, tPtgPt, tPtrPt, tdOtgdOt, tdOtrdOt, tiled_mma_dkv, tileloadPt, tileloaddOt, thr_copy_pt, thr_copy_dot);
+        gemm_ker(tdVrdV, tdVrPt, tdVrdOt, tPtgPt, tPtrPt, tdOtgdOt, tdOtrdOt, tiled_mma_dkv, tileloadPt, tileloaddOt);
         sycl::group_barrier(group);
 
         copy(tilesavedP, tdPrdPl, tPgP); // save dP to buffer after P used by dV
@@ -1195,10 +1207,10 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
         if (n_block > 0)
             copy(tileloaddQ, tdQgdQ, tdQrdQ);
         // dQ=dP*K
-        gemm_ker<k_tile>(tdQrdQ, tdQrdP, tdQrK, tdPgdPa, tdPrdPa, tKgK, tKrK, tiled_mma_dq, tileloaddP, tileloadK, thr_copy_dp, thr_copy_k);
+        gemm_ker(tdQrdQ, tdQrdP, tdQrK, tdPgdPa, tdPrdPa, tKgK, tKrK, tiled_mma_dq, tileloaddP, tileloadK);
         copy(tilesavedQ, tdQrdQ, tdQgdQ);
         // dK=dPt*Q
-        gemm_ker<k_tile>(tdKrdK, tdKrdPt, tdKrQt, tdPtgdPt, tdPtrdPt, tQtgQt, tQtrQt, tiled_mma_dkv, tileloaddPt, tileloadQt, thr_copy_dpt, thr_copy_qt);
+        gemm_ker(tdKrdK, tdKrdPt, tdKrQt, tdPtgdPt, tdPtrdPt, tQtgQt, tQtrQt, tiled_mma_dkv, tileloaddPt, tileloadQt);
         // update ptr/atom copy
         mQ.data() = mQ.data() + int(kBlockM * param.q_r_stride);
         mdO.data() = mdO.data() + int(kBlockM * param.o_r_stride);
@@ -1550,7 +1562,8 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         clear(tdPrdP);
         clear(tdQrdQ);
         // S=QKt
-        gemm_ker<k_tile>(tSrS, tSrQ, tSrKt, tQgQ, tQrQ, tKtgKt, tKtrKt, tiled_mma_sdp, tileloadQ, tileloadKt, thr_copy_q, thr_copy_kt);
+        prefetch(tiled_mma_sdp, tile_sdp, tileloadQ, tileloadKt, gQ, gKtV);
+        gemm_ker(tSrS, tSrQ, tSrKt, tQgQ, tQrQ, tKtgKt, tKtrKt, tiled_mma_sdp, tileloadQ, tileloadKt);
         load_1colvec(lse, mLSE, taccScS_row);
         Tensor dP_sum = make_fragment_like(lse);
         load_1colvec(dP_sum, mdPsum, taccScS_row);
@@ -1563,7 +1576,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         copy(tilesaveP, tSrSl, tPgP); // save P to internal buffers
         copy(tilesaveS, tSrSl, tPgP); // save P to external tensor for verification
         // dP=dO*Vt
-        gemm_ker<k_tile>(tdPrdP, tdPrdO, tdPrV, tdOgdO, tdOrdO, tVgV, tVrV, tiled_mma_sdp, tileloaddO, tileloadV, thr_copy_do, thr_copy_v);
+        gemm_ker(tdPrdP, tdPrdO, tdPrV, tdOgdO, tdOrdO, tVgV, tVrV, tiled_mma_sdp, tileloaddO, tileloadV);
         Tensor dS = make_tensor(tdPrdP.data(), scores.layout());
         // dS=P(dP-sum_row(P))*scale
         softmax_backward(scores, dP_sum, dS, param.scale_softmax);
@@ -1572,7 +1585,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         copy(tilesavedPd, tdPrdPl, tPgP); // save dP to external tensor for verification
 
         // dV=Pt*dO
-        gemm_ker(tdVrdV, tdVrPt, tdVrdOt, tPtgPt, tPtrPt, tdOtgdOt, tdOtrdOt, tiled_mma_dkv, tileloadPt, tileloaddOt, thr_copy_pt, thr_copy_dot);
+        gemm_ker(tdVrdV, tdVrPt, tdVrdOt, tPtgPt, tPtrPt, tdOtgdOt, tdOtrdOt, tiled_mma_dkv, tileloadPt, tileloaddOt);
         sycl::group_barrier(group);
 
         copy(tilesavedP, tdPrdPl, tPgP); // save dP to buffer after P used by dV
@@ -1581,10 +1594,10 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         if (n_block > 0)
             copy(tileloaddQ, tdQgdQ, tdQrdQ);
         // dQ=dP*K
-        gemm_ker<k_tile>(tdQrdQ, tdQrdP, tdQrK, tdPgdPa, tdPrdPa, tKgK, tKrK, tiled_mma_dq, tileloaddP, tileloadK, thr_copy_dp, thr_copy_k);
+        gemm_ker(tdQrdQ, tdQrdP, tdQrK, tdPgdPa, tdPrdPa, tKgK, tKrK, tiled_mma_dq, tileloaddP, tileloadK);
         copy(tilesavedQ, tdQrdQ, tdQgdQ);
         // dK=dPt*Q
-        gemm_ker<k_tile>(tdKrdK, tdKrdPt, tdKrQt, tdPtgdPt, tdPtrdPt, tQtgQt, tQtrQt, tiled_mma_dkv, tileloaddPt, tileloadQt, thr_copy_dpt, thr_copy_qt);
+        gemm_ker(tdKrdK, tdKrdPt, tdKrQt, tdPtgdPt, tdPtrdPt, tQtgQt, tQtrQt, tiled_mma_dkv, tileloaddPt, tileloadQt);
         // update ptr/atom copy
         mQ.data() = mQ.data() + int(kBlockM * param.q_r_stride);
         mdO.data() = mdO.data() + int(kBlockM * param.o_r_stride);
