@@ -82,38 +82,7 @@ struct OPS_tobf16{
 constexpr int tid = 0;
 constexpr int bid = 0;
 
-
-template<typename TiledMma, class TileMNK,
-         class TiledCopyA, class TiledCopyB,
-         class Tensor0, class Tensor1>
-CUTLASS_DEVICE void
-prefetch(TiledMma, TileMNK &tile_mnk,
-         TiledCopyA &copy_a, TiledCopyB &copy_b,
-         Tensor0 &gA, Tensor1 &gB) {
-    static constexpr auto ATOM_M = get<1>(typename TiledMma::ThrLayoutVMNK{}.shape());
-    static constexpr auto ATOM_N = get<2>(typename TiledMma::ThrLayoutVMNK{}.shape());
-    static constexpr auto ATOM_K = get<3>(typename TiledMma::ThrLayoutVMNK{}.shape());
-    static constexpr auto Num_SGs = ATOM_N * ATOM_M * ATOM_K;
-
-    static constexpr auto BLK_M = get<0>(TileMNK{});
-    static constexpr auto BLK_N = get<1>(TileMNK{});
-    static constexpr auto BLK_K = get<2>(TileMNK{});
-    auto prefetch_a = cute::prefetch_selector<Shape<Int<BLK_M>, Int<BLK_K>>, Num_SGs>(copy_a);
-    auto prefetch_b = cute::prefetch_selector<Shape<Int<BLK_N>, Int<BLK_K>>, Num_SGs>(copy_b);
-    int thread_idx = int(ThreadIdxX());
-    auto thr_prefetch_A = prefetch_a.get_slice(thread_idx);
-    auto thr_prefetch_B = prefetch_b.get_slice(thread_idx);
-
-    auto pAgA = thr_prefetch_A.partition_S(gA);
-    auto pBgB = thr_prefetch_B.partition_S(gB);
-    for (int prefetch_k = 0; prefetch_k < size<3>(pAgA); ++prefetch_k) {
-        prefetch(prefetch_a, pAgA(_, _, _, prefetch_k));
-        prefetch(prefetch_b, pBgB(_, _, _, prefetch_k));
-    }
-}
-
-template<int k_tile = 0, bool A_in_reg = false,
-         typename Tensor0, typename Tensor1, typename Tensor2,
+template<typename Tensor0, typename Tensor1, typename Tensor2,
          typename Tensor3, typename Tensor4,
          typename Tensor5, typename Tensor6,
          typename TiledMma, typename TiledCopyA, typename TiledCopyB>
@@ -126,9 +95,7 @@ gemm_ker(Tensor0 &tCrC, Tensor1 &tCrA, Tensor2 &tCrB,
     CUTLASS_PRAGMA_UNROLL
     for (int k = 0; k < size<3>(tAgA); ++k) {
         barrier_arrive(barrier_scope);
-        if constexpr(!A_in_reg) {
-            cute::copy(copy_a, tAgA(_, _, _, k), tArA);
-        }
+        cute::copy(copy_a, tAgA(_, _, _, k), tArA);
         cute::copy(copy_b, tBgB(_, _, _, k), tBrB);
         cute::gemm(tiled_mma, tCrA, tCrB, tCrC);
         barrier_wait(barrier_scope);
@@ -176,15 +143,6 @@ CUTLASS_DEVICE void softmax_backward(Tensor0 &P, Tensor1 &dP_sum, Tensor2 &dP, c
     }
 }
 
-template <typename To_type, typename Engine, typename Layout>
-CUTLASS_DEVICE auto convert_type(Tensor<Engine, Layout> const &tensor) {
-    using From_type = typename Engine::value_type;
-    constexpr int numel = decltype(size(tensor))::value;
-    cutlass::NumericArrayConverter<To_type, From_type, numel> convert_op;
-    auto frag = convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel> *>(tensor.data()));
-    return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
-}
-
 template <class CVT, class T0, class T1>
 CUTLASS_DEVICE auto convert_type(CVT &cvt, T0 &src, T1 &dst) {
     CUTLASS_PRAGMA_UNROLL
@@ -193,225 +151,13 @@ CUTLASS_DEVICE auto convert_type(CVT &cvt, T0 &src, T1 &dst) {
     }
 }
 
-
-template<typename T, class ProblemShape, class ThrMma,
-         class AStride, class TiledCopyA,
-         class BStride, class TiledCopyB,
-         class AccT>
-void gemm_kernel(T &trait, ProblemShape &shape_mnkl,
-                 ThrMma &thr_mma,
-                 typename T::DType const *A, AStride dA, TiledCopyA,
-                 typename T::DType const *B, BStride dB, TiledCopyB,
-                 AccT &tCrC, const int m_coord, const int n_coord, const int l_coord,
-                 bool debug) {
-
-    auto A_shape = select<0,2,3>(shape_mnkl);
-    auto B_shape = select<1,2,3>(shape_mnkl);
-
-    // Represent the full tensors
-    auto mA = make_tensor(make_gmem_ptr(A), make_layout(A_shape, dA));
-    auto mB = make_tensor(make_gmem_ptr(B), make_layout(B_shape, dB));
-
-    auto copy_a = TiledCopyA{mA};
-    auto copy_b = TiledCopyB{mB};
-
-    Tensor mA_coord = cute::get_xe_tensor(A_shape);   //(m,k,l)
-    Tensor mB_coord = cute::get_xe_tensor(B_shape);   //(n,k,l)
-
-
-    // Get the appropriate blocks for this thread block
-    // int m_coord = BlockIdxX();
-    // int n_coord = BlockIdxY();
-    // int l_coord = BlockIdxZ();
-    // auto cta_coord = make_coord(m_coord, n_coord, l_coord);  // (m,n,k)
-
-    Tensor gA = local_tile(mA_coord, select<0, 2>(trait.tile_mnk), make_coord(m_coord, _, l_coord));  // (BLK_M,BLK_K,k)
-    Tensor gB = local_tile(mB_coord, select<1, 2>(trait.tile_mnk), make_coord(n_coord, _, l_coord));  // (BLK_N,BLK_K,k)
-
-    // Partition global counting tensors for MMA
-    Tensor tCgA = thr_mma.partition_A(gA);
-    Tensor tCgB = thr_mma.partition_B(gB);
-
-    Tensor tCrA = make_tensor<typename T::DType>(make_fragment_layout(copy_a, tCgA(_,_,_,0).shape()));
-    Tensor tCrB = make_tensor<typename T::DType>(make_fragment_layout(copy_b, tCgB(_,_,_,0).shape()));
-
-    ThrCopy thr_copy_a = copy_a.get_slice(compat::local_id::x());
-    ThrCopy thr_copy_b = copy_b.get_slice(compat::local_id::x());
-
-    // Retile registers for copies
-    Tensor tArA = thr_copy_a.retile_D(tCrA);
-    Tensor tBrB = thr_copy_b.retile_D(tCrB);
-
-    // Retile global counting tensors for copies
-    Tensor tAgA = thr_copy_a.retile_S(tCgA);
-    Tensor tBgB = thr_copy_b.retile_S(tCgB);
-
-    //
-    // PREFETCH
-    //
-
-    // constexpr int Num_SGs = size(tiled_mma);
-    static constexpr auto ATOM_M = get<1>(typename T::TiledMma::ThrLayoutVMNK{}.shape());
-    static constexpr auto ATOM_N = get<2>(typename T::TiledMma::ThrLayoutVMNK{}.shape());
-    static constexpr auto ATOM_K = get<3>(typename T::TiledMma::ThrLayoutVMNK{}.shape());
-    static constexpr auto Num_SGs = ATOM_N * ATOM_M * ATOM_K;
-
-    static constexpr auto BLK_M = get<0>(T::tile_mnk);
-    static constexpr auto BLK_N = get<1>(T::tile_mnk);
-    static constexpr auto BLK_K = get<2>(T::tile_mnk);
-
-    auto prefetch_a = cute::prefetch_selector<Shape<Int<BLK_M>,Int<BLK_K>>, Num_SGs>(copy_a);
-    auto prefetch_b = cute::prefetch_selector<Shape<Int<BLK_N>,Int<BLK_K>>, Num_SGs>(copy_b);
-    int thread_idx = int(ThreadIdxX());
-    auto thr_prefetch_A = prefetch_a.get_slice(thread_idx);
-    auto thr_prefetch_B = prefetch_b.get_slice(thread_idx);
-
-    // Partition global tile for prefetch
-    auto pAgA = thr_prefetch_A.partition_S(gA);
-    auto pBgB = thr_prefetch_B.partition_S(gB);
-
-    int prefetch_k = 0;
-
-    // Clear the accumulators
-    // clear(tCrC);
-
-    constexpr int barrier_scope = 2;
-    int k_tile_count = ceil_div(get<2>(shape_mnkl), get<2>(trait.tile_mnk));
-    auto stages = trait.bP;
-    CUTLASS_PRAGMA_UNROLL
-    for (; prefetch_k < stages; prefetch_k++) {
-        if (prefetch_k < k_tile_count) {
-            prefetch(prefetch_a, pAgA(_, _, _, prefetch_k));
-            prefetch(prefetch_b, pBgB(_, _, _, prefetch_k));
-        }
-    }
-
-    CUTLASS_PRAGMA_UNROLL
-    for (int k_tile = 0; k_tile < k_tile_count; k_tile++, prefetch_k++) {
-        barrier_arrive(barrier_scope);
-        // Copy gmem to rmem for the first k_tile
-        copy(copy_a, tAgA(_,_,_,k_tile), tArA);
-        copy(copy_b, tBgB(_,_,_,k_tile), tBrB);
-
-        if (prefetch_k < k_tile_count) {
-            prefetch(prefetch_a, pAgA(_, _, _, prefetch_k));
-            prefetch(prefetch_b, pBgB(_, _, _, prefetch_k));
-        }
-
-        cute::gemm(trait.tiled_mma, tCrA, tCrB, tCrC);
-        barrier_wait(barrier_scope);
-
-    }
-}
-
-template<typename T, class ProblemShape, class ThrMma,
-         class AStride, class TiledCopyA,
-         class BStride, class TiledCopyB,
-         class AccT>
-void gemm_kernel_bb(T &trait, ProblemShape &shape_mnkl,
-                    ThrMma &thr_mma,
-                    typename T::DType const *A, AStride dA, TiledCopyA,
-                    typename T::DType const *B, BStride dB, TiledCopyB,
-                    AccT &tCrC, const int m_coord, const int n_coord, const int lq_coord, const int lk_coord,
-                    bool debug) {
-
-    auto A_shape = select<0,2,3>(shape_mnkl);
-    auto B_shape = select<1,2,4>(shape_mnkl);
-
-    // Represent the full tensors
-    auto mA = make_tensor(make_gmem_ptr(A), make_layout(A_shape, dA));
-    auto mB = make_tensor(make_gmem_ptr(B), make_layout(B_shape, dB));
-
-    auto copy_a = TiledCopyA{mA};
-    auto copy_b = TiledCopyB{mB};
-
-    Tensor mA_coord = cute::get_xe_tensor(A_shape);   //(m,k,l)
-    Tensor mB_coord = cute::get_xe_tensor(B_shape);   //(n,k,lh)
-
-
-    // Get the appropriate blocks for this thread block
-    // int m_coord = BlockIdxX();
-    // int n_coord = BlockIdxY();
-    // int l_coord = BlockIdxZ();
-    // auto cta_coord = make_coord(m_coord, n_coord, l_coord);  // (m,n,k)
-
-    Tensor gA = local_tile(mA_coord, select<0, 2>(trait.tile_mnk), make_coord(m_coord, _, lq_coord));  // (BLK_M,BLK_K,k)
-    Tensor gB = local_tile(mB_coord, select<1, 2>(trait.tile_mnk), make_coord(n_coord, _, lk_coord));  // (BLK_N,BLK_K,k)
-
-    // Partition global counting tensors for MMA
-    Tensor tCgA = thr_mma.partition_A(gA);
-    Tensor tCgB = thr_mma.partition_B(gB);
-
-    Tensor tCrA = make_tensor<typename T::DType>(make_fragment_layout(copy_a, tCgA(_,_,_,0).shape()));
-    Tensor tCrB = make_tensor<typename T::DType>(make_fragment_layout(copy_b, tCgB(_,_,_,0).shape()));
-
-    ThrCopy thr_copy_a = copy_a.get_slice(compat::local_id::x());
-    ThrCopy thr_copy_b = copy_b.get_slice(compat::local_id::x());
-
-    // Retile registers for copies
-    Tensor tArA = thr_copy_a.retile_D(tCrA);
-    Tensor tBrB = thr_copy_b.retile_D(tCrB);
-
-    // Retile global counting tensors for copies
-    Tensor tAgA = thr_copy_a.retile_S(tCgA);
-    Tensor tBgB = thr_copy_b.retile_S(tCgB);
-
-    //
-    // PREFETCH
-    //
-
-    // constexpr int Num_SGs = size(tiled_mma);
-    static constexpr auto ATOM_M = get<1>(typename T::TiledMma::ThrLayoutVMNK{}.shape());
-    static constexpr auto ATOM_N = get<2>(typename T::TiledMma::ThrLayoutVMNK{}.shape());
-    static constexpr auto ATOM_K = get<3>(typename T::TiledMma::ThrLayoutVMNK{}.shape());
-    static constexpr auto Num_SGs = ATOM_N * ATOM_M * ATOM_K;
-
-    static constexpr auto BLK_M = get<0>(T::tile_mnk);
-    static constexpr auto BLK_N = get<1>(T::tile_mnk);
-    static constexpr auto BLK_K = get<2>(T::tile_mnk);
-
-    auto prefetch_a = cute::prefetch_selector<Shape<Int<BLK_M>,Int<BLK_K>>, Num_SGs>(copy_a);
-    auto prefetch_b = cute::prefetch_selector<Shape<Int<BLK_N>,Int<BLK_K>>, Num_SGs>(copy_b);
-    int thread_idx = int(ThreadIdxX());
-    auto thr_prefetch_A = prefetch_a.get_slice(thread_idx);
-    auto thr_prefetch_B = prefetch_b.get_slice(thread_idx);
-
-    // Partition global tile for prefetch
-    auto pAgA = thr_prefetch_A.partition_S(gA);
-    auto pBgB = thr_prefetch_B.partition_S(gB);
-
-    int prefetch_k = 0;
-
-    // Clear the accumulators
-    // clear(tCrC);
-
-    constexpr int barrier_scope = 2;
-    int k_tile_count = ceil_div(get<2>(shape_mnkl), get<2>(trait.tile_mnk));
-    auto stages = trait.bP;
-    CUTLASS_PRAGMA_UNROLL
-    for (; prefetch_k < stages; prefetch_k++) {
-        if (prefetch_k < k_tile_count) {
-            prefetch(prefetch_a, pAgA(_, _, _, prefetch_k));
-            prefetch(prefetch_b, pBgB(_, _, _, prefetch_k));
-        }
-    }
-
-    CUTLASS_PRAGMA_UNROLL
-    for (int k_tile = 0; k_tile < k_tile_count; k_tile++, prefetch_k++) {
-        barrier_arrive(barrier_scope);
-        // Copy gmem to rmem for the first k_tile
-        copy(copy_a, tAgA(_,_,_,k_tile), tArA);
-        copy(copy_b, tBgB(_,_,_,k_tile), tBrB);
-
-        if (prefetch_k < k_tile_count) {
-            prefetch(prefetch_a, pAgA(_, _, _, prefetch_k));
-            prefetch(prefetch_b, pBgB(_, _, _, prefetch_k));
-        }
-
-        cute::gemm(trait.tiled_mma, tCrA, tCrB, tCrC);
-        barrier_wait(barrier_scope);
-
-    }
+template <typename To_type, typename Engine, typename Layout>
+CUTLASS_DEVICE auto convert_type(Tensor<Engine, Layout> const &tensor) {
+    using From_type = typename Engine::value_type;
+    constexpr int numel = decltype(size(tensor))::value;
+    cutlass::NumericArrayConverter<To_type, From_type, numel> convert_op;
+    auto frag = convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel> *>(tensor.data()));
+    return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
 }
 
 template<bool parallel_kv, class Trait>
@@ -1240,7 +986,7 @@ dq_dk_dv_1colblock2(Trait &trait, Param<typename Trait::DType> &param,
     copy(tilesavedK, tdKrdKl, tdKgdK);
 }
 
-template<bool parallel_kv, bool Is_even_MN, class Trait>
+template<bool Is_even_MN, class Trait>
 void
 dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                    const int bidb, const int bidh, const int n_block,
@@ -1278,6 +1024,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         std::conditional_t<Is_even_MN, Int<kBlockN>, int>,
         Int<1>>;
     Shape shapeQ = make_shape(kBlockM, Int<kHeadDim>{}, _1{});
+    Shape shapedQ = Shape<Int<kBlockM>, Int<kHeadDim>, _1>{};
     Shape1 shapeKtV;
     Shape2 shapeK;
     if constexpr(Is_even_MN) {
@@ -1356,7 +1103,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                                  make_stride(block_n_dim, _1{}, _1{})));
     Tensor mdQaccum = make_tensor(make_gmem_ptr(param.dqaccum_ptr + dq_offset),
                                   make_layout(
-                                      shapeQ,
+                                      shapedQ,
                                       make_stride(param.dq_r_stride, _1{}, _1{})));
     Tensor mdK = make_tensor(make_gmem_ptr(param.dk_ptr+k_offset),
                              make_layout(
@@ -1396,6 +1143,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
     auto tilesavedPd = typename Trait::TiledSavedP{mdPd}; // debug
 
     Tensor mQ_coord = cute::get_xe_tensor(shapeQ);
+    Tensor mdQ_coord = cute::get_xe_tensor(shapedQ);
     Tensor mKtV_coord = cute::get_xe_tensor(shapeKtV);
     Tensor mdO_coord = cute::get_xe_tensor(shapeO);
     Tensor mQtdOt_coord = cute::get_xe_tensor(shapeQtOt);
@@ -1423,7 +1171,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
 
     Tensor gSP = local_tile(mSP_coord, select<0, 1>(tile_sdp), make_coord(0, 0, 0)); // dump P
     Tensor gdV = local_tile(mKtV_coord, select<0, 1>(tile_dkv), make_coord(0, 0, 0)); // dump dV
-    Tensor gdQ = local_tile(mQ_coord, select<0, 1>(tile_dq), make_coord(0, 0, 0)); // dump dQ
+    Tensor gdQ = local_tile(mdQ_coord, select<0, 1>(tile_dq), make_coord(0, 0, 0)); // dump dQ
     Tensor gdK = local_tile(mK_coord, select<0, 1>(tile_dkv), make_coord(0, 0, 0)); // dump dK
 
     Tensor tSgQ = thr_mma_sdp.partition_A(gQ);
@@ -1509,7 +1257,6 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
 
     constexpr int k_tile = ceil_div(kHeadDim, kBlockK);
 
-    cutlass::NumericConverter<T, float> converter;
     // clear accumulator
     clear(tdVrdV);
     clear(tdKrdK);
@@ -1529,16 +1276,12 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                                    make_stride(_1{}, param.o_r_stride, _1{})));
             mdQaccum = make_tensor(make_gmem_ptr(mdQaccum.data()),
                                    make_layout(
-                                       make_shape(tail_m, Int<kHeadDim>{}, _1{}),
+                                       shapedQ,
                                        make_stride(param.dq_r_stride, _1{}, _1{})));
             mQt = make_tensor(make_gmem_ptr(mQt.data()),
                               make_layout(
                                   make_shape(Int<kHeadDim>{}, tail_m, _1{}),
                                   make_stride(_1{}, param.q_r_stride, _1{})));
-            // Tensor mK = make_tensor(make_gmem_ptr(param.k_ptr + k_offset),
-            //                         make_layout(
-            //                             shapeK,
-            //                             make_stride(param.k_r_stride, _1{}, _1{})));
             mS = make_tensor(make_gmem_ptr(mS.data()),
                              make_layout(
                                  make_shape(tail_m, block_n_dim, _1{}),
@@ -1549,7 +1292,6 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                                    make_stride(param.s_r_stride, _1{}, _1{}))); // debug
 
             tileloadQ = typename Trait::TiledLoadQ{mQ};
-            // auto tileloadK = typename Trait::TiledLoadK{mK};
             tileloaddO = typename Trait::TiledLoaddO{mdO};
             tileloaddOt = typename Trait::TiledLoaddOt{mdOt};
             tileloaddQ = typename Trait::TiledLoaddQ{mdQaccum};
@@ -1559,10 +1301,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
             tilesavedPd = typename Trait::TiledSavedP{mdPd};
         }
         clear(tSrS);
-        clear(tdPrdP);
-        clear(tdQrdQ);
         // S=QKt
-        prefetch(tiled_mma_sdp, tile_sdp, tileloadQ, tileloadKt, gQ, gKtV);
         gemm_ker(tSrS, tSrQ, tSrKt, tQgQ, tQrQ, tKtgKt, tKtrKt, tiled_mma_sdp, tileloadQ, tileloadKt);
         load_1colvec(lse, mLSE, taccScS_row);
         Tensor dP_sum = make_fragment_like(lse);
@@ -1571,18 +1310,19 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
 
         // P=softmax(S,lse)
         scale_apply_exp2(scores, lse, param.scale_softmax_log2);
-        auto tSrSl = make_tensor_like<T>(tSrS);
-        convert_type(converter, tSrS, tSrSl);
+        auto tSrSl = convert_type<T>(tSrS);
         copy(tilesaveP, tSrSl, tPgP); // save P to internal buffers
         copy(tilesaveS, tSrSl, tPgP); // save P to external tensor for verification
+        clear(tdPrdP);
         // dP=dO*Vt
         gemm_ker(tdPrdP, tdPrdO, tdPrV, tdOgdO, tdOrdO, tVgV, tVrV, tiled_mma_sdp, tileloaddO, tileloadV);
         Tensor dS = make_tensor(tdPrdP.data(), scores.layout());
         // dS=P(dP-sum_row(P))*scale
         softmax_backward(scores, dP_sum, dS, param.scale_softmax);
-        auto tdPrdPl = make_tensor_like<T>(tdPrdP);
-        convert_type(converter, tdPrdP, tdPrdPl);
+        auto tdPrdPl = convert_type<T>(tdPrdP);
         copy(tilesavedPd, tdPrdPl, tPgP); // save dP to external tensor for verification
+        if (n_block > 0) // TODO: need actual prefetch here. yk
+            copy(tileloaddQ, tdQgdQ, tdQrdQ);
 
         // dV=Pt*dO
         gemm_ker(tdVrdV, tdVrPt, tdVrdOt, tPtgPt, tPtrPt, tdOtgdOt, tdOtrdOt, tiled_mma_dkv, tileloadPt, tileloaddOt);
@@ -1591,8 +1331,10 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         copy(tilesavedP, tdPrdPl, tPgP); // save dP to buffer after P used by dV
         sycl::group_barrier(group);
 
-        if (n_block > 0)
+        clear(tdQrdQ);
+        if (n_block > 0) {
             copy(tileloaddQ, tdQgdQ, tdQrdQ);
+        }
         // dQ=dP*K
         gemm_ker(tdQrdQ, tdQrdP, tdQrK, tdPgdPa, tdPrdPa, tKgK, tKrK, tiled_mma_dq, tileloaddP, tileloadK);
         copy(tilesavedQ, tdQrdQ, tdQgdQ);
@@ -1619,81 +1361,10 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         tilesaveS = typename Trait::TiledSaveS{mS}; // debug
         tilesavedPd = typename Trait::TiledSaveS{mdPd}; // debug
     }
-    auto tdVrdVl = make_tensor_like<T>(tdVrdV);
-    convert_type(converter, tdVrdV, tdVrdVl);
+    auto tdVrdVl = convert_type<T>(tdVrdV);
     copy(tilesavedV, tdVrdVl, tdVgdV);
-    auto tdKrdKl = make_tensor_like<T>(tdKrdK);
-    convert_type(converter,tdKrdK, tdKrdKl);
+    auto tdKrdKl = convert_type<T>(tdKrdK);
     copy(tilesavedK, tdKrdKl, tdKgdK);
-}
-
-template<int NUM_SG, class Tensor, class STensor>
-void reduce_row(Tensor &t, STensor &sram) {
-    auto group = compat::get_nd_item<1>().get_group();
-    auto sg = compat::get_nd_item<1>().get_sub_group();
-    const auto sg_local_id = sg.get_local_id();
-    const auto sg_group_id = sg.get_group_id();
-    const auto sg_group_id_N = sg_group_id % NUM_SG;
-    const auto sg_group_id_M = sg_group_id / NUM_SG;
-    auto stensor = sram(_, _, sg_group_id_M);
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i< size(t); ++i) {
-        t(i) = reduce_over_group(sg, t(i), sycl::plus<>());
-    }
-
-    if (sg_local_id == 0) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < size(t); ++i) {
-            stensor(i, sg_group_id_N) = t(i);
-        }
-    }
-    // have to wait here
-    sycl::group_barrier(group);
-    if (sg_local_id == 0) {
-        for (int i = 0; i < size(t); ++i) {
-            t(i) = 0.0f;
-            CUTLASS_PRAGMA_UNROLL
-            for (int j = 0; j < NUM_SG; ++j) {
-                t(i) += stensor(i, j);
-            }
-        }
-    }
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < size(t); ++i) {
-        t(i) = sycl::group_broadcast(sg, t(i), 0);
-    }
-}
-
-template<int Thread_per_row, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
-void
-dot_do_o(Tensor<Engine0, Layout0> &dO, Tensor<Engine0, Layout0> &O, Tensor<Engine1, Layout1> &dPsum) {
-    // Tensor dO_reshaped = make_tensor(dO.data(),
-    //                                  make_layout(get<1>(dO.layout()),
-    //                                              make_layout(get<0>(dO.layout()),
-    //                                                          get<2>(dO.layout()))));
-    // Tensor O_reshaped = make_tensor(O.data(), dO_reshaped.layout());
-    // if (cute::thread(0, 0)) {
-    //     print("dO:");
-    //     print(dO_reshaped);
-    //     // print("\nO:");
-    //     // print(O);
-    //     print("\n");
-    // }
-    // auto group = compat::get_nd_item<1>().get_group();
-    // CUTLASS_PRAGMA_UNROLL
-    // for (int mi = 0; mi < size<0>(dO_reshaped); ++mi) {
-    //     float dP_sum_cur = (float)dO_reshaped(mi, 0) * (float)O_reshaped(mi, 0);
-    //     CUTLASS_PRAGMA_UNROLL
-    //     for (int ni = 1; ni < size<1>(dO_reshaped); ni++) {
-    //         dP_sum_cur += (float)dO_reshaped(mi, ni) * (float)O_reshaped(mi, ni);
-    //     }
-    //     dPsum(mi * gdP_col_stride + / Thread_per_row) = dP_sum_cur;
-    //     // FLASH_NAMESPACE::SumOp<float> sum_op;
-    //     // dP_sum_cur = sycl::reduce_over_group(compat::get_sub_group(), dP_sum_cur, sycl::plus<float>());
-    //     // if (threadIdx.x % THREADS_PER_ROW == 0) {
-    //     //     dP_sum(mi * gdP_col_stride + threadIdx.x / THREADS_PER_ROW) = dP_sum_cur;
-    //     // }
-    // }
 }
 
 template <typename Layout>
@@ -1918,12 +1589,11 @@ mha_backward(T trait,
              Param<typename T::DType> param) {
     const int bidb = BlockIdxZ();
     const int bidh = BlockIdxY();
-    constexpr bool parallel_seq_kv = false;
     // const int max_n_block = ceil_div(param.seq_len_kv, trait.kBlockN);
     for (int n_block = 0; n_block < param.n_block; ++n_block)
-        dq_dk_dv_1colblock<parallel_seq_kv, true>(trait, param, bidb, bidh, n_block);
+        dq_dk_dv_1colblock<true>(trait, param, bidb, bidh, n_block);
     if (param.tail_n > 0)
-        dq_dk_dv_1colblock<parallel_seq_kv, false>(trait, param, bidb, bidh, param.n_block, param.tail_n);
+        dq_dk_dv_1colblock<false>(trait, param, bidb, bidh, param.n_block, param.tail_n);
 }
 
 template<class T>
@@ -2042,7 +1712,13 @@ mhd_convert_dq(T trait,
     }
 }
 
-template<typename T, class ProblemShape, int kBlockM, int kBlockN, int kHeadDim, bool is_bhsd>
+template<class...> class mhaodoDeviceName;
+template<class...> class mhabwdDeviceName;
+template<class...> class mhacvtDeviceName;
+
+template<typename T, class ProblemShape, int kBlockM, int kBlockN, int kBlockK,
+         int kHeadDim, int kNSGs, int AtomLayoutMSdP, int AtomLayoutNdKV,
+         int AtomLayoutMdQ, bool is_bhsd>
 void launch_mha_backward_headdim(ProblemShape problem_shape,
                                  const T *do_d,
                                  const T *o_d,
@@ -2059,9 +1735,8 @@ void launch_mha_backward_headdim(ProblemShape problem_shape,
                                  T *dp_d,
                                  const int seq_len_q_pad,
                                  const int seq_len_kv_pad) {
-    constexpr int numSGs = 8;
-    constexpr int kBlockK = 32;
-    auto trait = FAKernel<T, kHeadDim, kBlockM, kBlockN, kBlockK, numSGs>{};
+    auto trait = FAKernel<T, kHeadDim, kBlockM, kBlockN, kBlockK, kNSGs,
+                          AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ>{};
 
     const int BATCH = get<0>(problem_shape);
     const int NUM_HEAD_Q = get<1>(problem_shape);
@@ -2095,7 +1770,7 @@ void launch_mha_backward_headdim(ProblemShape problem_shape,
     }
 
     auto dimGrid0 = compat::dim3(size(M_BLOCK), size(param.num_head_q), size(param.batch));
-    auto dimBlock0 = compat::dim3(size(numSGs * trait.SubgroupSize), size(1), size(1));
+    auto dimBlock0 = compat::dim3(size(kNSGs * trait.SubgroupSize), size(1), size(1));
     compat::experimental::launch_properties launch_props0{
         // sycl::ext::oneapi::experimental::work_group_scratch_size(0),
     };
@@ -2103,15 +1778,17 @@ void launch_mha_backward_headdim(ProblemShape problem_shape,
         sycl::ext::oneapi::experimental::sub_group_size<trait.SubgroupSize>};
     compat::experimental::launch_policy policy0{dimGrid0, dimBlock0, launch_props0, kernel_props0};
     auto event0 = compat::experimental::launch<
-        mha_dot_do_o<decltype(trait)>>(policy0,
-                                       trait,
-                                       param);
+        mha_dot_do_o<decltype(trait)>,
+        mhaodoDeviceName<decltype(trait)>>(policy0,
+                                           trait,
+                                           param);
     EventManager::getInstance().addEvent(event0);
+    compat::wait_and_throw();
 
     auto dimGrid1 = compat::dim3(size(1), size(param.num_head_q), size(param.batch));
     assert((trait.num_head_q % trait.num_head_kv == 0) && "num_head_q must be dividable by num_head_kv");
     assert((trait.num_head_q >= trait.num_head_kv) && "num_head_q must be bigger than or equal to num_head_kv");
-    auto dimBlock1 = compat::dim3(size(numSGs * trait.SubgroupSize), size(1), size(1));
+    auto dimBlock1 = compat::dim3(size(kNSGs * trait.SubgroupSize), size(1), size(1));
     // auto dimBlock = compat::dim3(size(trait.tiled_mma_sdp));
 
     compat::experimental::launch_properties launch_props1{
@@ -2121,13 +1798,15 @@ void launch_mha_backward_headdim(ProblemShape problem_shape,
         sycl::ext::oneapi::experimental::sub_group_size<trait.SubgroupSize>};
     compat::experimental::launch_policy policy1{dimGrid1, dimBlock1, launch_props1, kernel_props1};
     auto event1 = compat::experimental::launch<
-        mha_backward<decltype(trait)>>(policy1,
-                                       trait,
-                                       param);
+        mha_backward<decltype(trait)>,
+        mhabwdDeviceName<decltype(trait)>>(policy1,
+                                           trait,
+                                           param);
     EventManager::getInstance().addEvent(event1);
+    compat::wait_and_throw();
 
     auto dimGrid2 = compat::dim3(size(M_BLOCK), size(param.num_head_q), size(param.batch));
-    auto dimBlock2 = compat::dim3(size(numSGs * trait.SubgroupSize), size(1), size(1));
+    auto dimBlock2 = compat::dim3(size(kNSGs * trait.SubgroupSize), size(1), size(1));
     compat::experimental::launch_properties launch_props2{
         // sycl::ext::oneapi::experimental::work_group_scratch_size(0),
     };
@@ -2135,13 +1814,15 @@ void launch_mha_backward_headdim(ProblemShape problem_shape,
         sycl::ext::oneapi::experimental::sub_group_size<trait.SubgroupSize>};
     compat::experimental::launch_policy policy2{dimGrid2, dimBlock2, launch_props2, kernel_props2};
     auto event2 = compat::experimental::launch<
-        mhd_convert_dq<decltype(trait)>>(policy2,
-                                         trait,
-                                         param);
+        mhd_convert_dq<decltype(trait)>,
+        mhacvtDeviceName<decltype(trait)>>(policy2,
+                                           trait,
+                                           param);
     EventManager::getInstance().addEvent(event2);
+    compat::wait_and_throw();
 }
 
-template<typename T, class ProblemShape, int kBlockM, int kBlockN, bool is_bhsd>
+template<typename T, class ProblemShape, bool is_bhsd>
 void launch_mha_backward(ProblemShape problem_shape,
                          const T *do_d,
                          const T *o_d,
@@ -2160,8 +1841,18 @@ void launch_mha_backward(ProblemShape problem_shape,
                          const int seq_len_kv_pad) {
     const int headdim = get<5>(problem_shape);
     if (headdim == 64) {
+        constexpr int kBlockM = 64;
+        constexpr int kBlockN = 32;
+        constexpr int kBlockK = 32;
         constexpr int kHeadDim = 64;
-        launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN, kHeadDim, is_bhsd>(
+        constexpr int kNSGs = 8;
+        constexpr int AtomLayoutMSdP = 4;
+        constexpr int AtomLayoutNdKV = 2;
+        constexpr int AtomLayoutMdQ = 2;
+        launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN,
+                                    kBlockK, kHeadDim, kNSGs,
+                                    AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
+                                    is_bhsd>(
             problem_shape,
             do_d, o_d, q_d, k_d, v_d,
             lse_d, odo_d,
@@ -2169,8 +1860,18 @@ void launch_mha_backward(ProblemShape problem_shape,
             s_d, dp_d,
             seq_len_q_pad, seq_len_kv_pad);
     } else if (headdim == 96) {
+        constexpr int kBlockM = 64;
+        constexpr int kBlockN = 64;
+        constexpr int kBlockK = 16;
         constexpr int kHeadDim = 96;
-        launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN, kHeadDim, is_bhsd>(
+        constexpr int kNSGs = 8;
+        constexpr int AtomLayoutMSdP = 4;
+        constexpr int AtomLayoutNdKV = 4;
+        constexpr int AtomLayoutMdQ = 2;
+        launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN,
+                                    kBlockK, kHeadDim, kNSGs,
+                                    AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
+                                    is_bhsd>(
             problem_shape,
             do_d, o_d, q_d, k_d, v_d,
             lse_d, odo_d,
@@ -2178,8 +1879,18 @@ void launch_mha_backward(ProblemShape problem_shape,
             s_d, dp_d,
             seq_len_q_pad, seq_len_kv_pad);
     } else if (headdim == 128) {
+        constexpr int kBlockM = 64;
+        constexpr int kBlockN = 32;
+        constexpr int kBlockK = 32;
         constexpr int kHeadDim = 128;
-        launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN, kHeadDim, is_bhsd>(
+        constexpr int kNSGs = 8;
+        constexpr int AtomLayoutMSdP = 4;
+        constexpr int AtomLayoutNdKV = 2;
+        constexpr int AtomLayoutMdQ = 2;
+        launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN,
+                                    kBlockK, kHeadDim, kNSGs,
+                                    AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
+                                    is_bhsd>(
             problem_shape,
             do_d, o_d, q_d, k_d, v_d,
             lse_d, odo_d,
@@ -2187,8 +1898,18 @@ void launch_mha_backward(ProblemShape problem_shape,
             s_d, dp_d,
             seq_len_q_pad, seq_len_kv_pad);
     } else if (headdim == 192) {
+        constexpr int kBlockM = 64;
+        constexpr int kBlockN = 32;
+        constexpr int kBlockK = 32;
         constexpr int kHeadDim = 192;
-        launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN, kHeadDim, is_bhsd>(
+        constexpr int kNSGs = 8;
+        constexpr int AtomLayoutMSdP = 4;
+        constexpr int AtomLayoutNdKV = 2;
+        constexpr int AtomLayoutMdQ = 2;
+        launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN,
+                                    kBlockK, kHeadDim, kNSGs,
+                                    AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
+                                    is_bhsd>(
             problem_shape,
             do_d, o_d, q_d, k_d, v_d,
             lse_d, odo_d,
@@ -2196,8 +1917,18 @@ void launch_mha_backward(ProblemShape problem_shape,
             s_d, dp_d,
             seq_len_q_pad, seq_len_kv_pad);
     } else if (headdim == 256) {
+        constexpr int kBlockM = 64;
+        constexpr int kBlockN = 32;
+        constexpr int kBlockK = 32;
         constexpr int kHeadDim = 256;
-        launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN, kHeadDim, is_bhsd>(
+        constexpr int kNSGs = 8;
+        constexpr int AtomLayoutMSdP = 4;
+        constexpr int AtomLayoutNdKV = 2;
+        constexpr int AtomLayoutMdQ = 2;
+        launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN,
+                                    kBlockK, kHeadDim, kNSGs,
+                                    AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
+                                    is_bhsd>(
             problem_shape,
             do_d, o_d, q_d, k_d, v_d,
             lse_d, odo_d,
@@ -2305,7 +2036,7 @@ int main(int argc, char**argv) {
 
     auto problem_shape = ProblemShapeRegular(BATCH, NUM_HEAD_Q, NUM_HEAD_KV, SEQ_LEN_QO, SEQ_LEN_KV, HEAD_SIZE_QK, HEAD_SIZE_VO);
     if (is_bhsd) {
-        launch_mha_backward<T, decltype(problem_shape), kBlockM, kBlockN, true>(
+        launch_mha_backward<T, decltype(problem_shape), true>(
             problem_shape,
             do_d, o_d,
             q_d, k_d, v_d,
@@ -2313,7 +2044,7 @@ int main(int argc, char**argv) {
             dqaccum_d, dq_d, dk_d, dv_d,
             s_d, dp_d, SEQ_LEN_QO_PAD, SEQ_LEN_KV_PAD);
     } else {
-        launch_mha_backward<T, decltype(problem_shape), kBlockM, kBlockN, false>(
+        launch_mha_backward<T, decltype(problem_shape), false>(
             problem_shape,
             do_d, o_d,
             q_d, k_d, v_d,
