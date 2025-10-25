@@ -94,11 +94,14 @@ constexpr int bid = 0;
 template<typename Tensor0, typename Tensor1, typename Tensor2,
          typename Tensor3, typename Tensor4,
          typename Tensor5, typename Tensor6,
-         typename TiledMma, typename TiledCopyA, typename TiledCopyB>
+         typename Tensor7, typename Tensor8,
+         typename TiledMma, typename TileMNK,
+         typename TiledCopyA, typename TiledCopyB>
 CUTLASS_DEVICE void
 gemm_ker(Tensor0 &tCrCmn, Tensor1 &tCrA, Tensor2 &tCrB,
-         Tensor3 &tAgAmk, Tensor4 &tArA,
-         Tensor5 &tBgBnk, Tensor6 &tBrB, TiledMma &tiled_mma,
+         Tensor3 &tAgAmk, Tensor4 &tArA, Tensor5 &gA,
+         Tensor6 &tBgBnk, Tensor7 &tBrB, Tensor8 &gB,
+         TiledMma &tiled_mma, TileMNK &tile_mnk,
          TiledCopyA &copy_a, TiledCopyB &copy_b) {
     constexpr int barrier_scope = 2;
     CUTLASS_PRAGMA_UNROLL
@@ -234,7 +237,6 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
     constexpr int kHeadDim = Trait::kHeadDim;
     constexpr int kBlockM = Trait::kBlockM;
     constexpr int kBlockN = Trait::kBlockN;
-    constexpr int kBlockK = Trait::kBlockK;
     auto sg = compat::get_nd_item<1>().get_sub_group();
     auto group = compat::get_nd_item<1>().get_group();
     auto first_thread_in_sg_idx = sg.get_group_linear_id() * trait.SubgroupSize;
@@ -407,7 +409,6 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
     Tensor gK = local_tile(mK_coord, select<1, 2>(tile_dq), make_coord(_,_,0)); // operand B dQ
     Tensor gdPt = local_tile(mPt_coord, select<0, 2>(tile_dkv), make_coord(_,_,0)); // load dpt
     Tensor gQtdOt = local_tile(mQtdOt_coord, select<1, 2>(tile_dkv), make_coord(_,_,0)); // load Q as operand B
-    Tensor gQtdOt2 = local_tile(mQtdOt_coord, select<1, 2>(tile_dkv), make_coord(_,_,0)); // load Q as operand B
 
     Tensor gSP = local_tile(mSP_coord, select<0, 1>(tile_sdp), make_coord(_,_,0)); // dump P
     Tensor gdV = local_tile(mKtV_coord, select<0, 1>(tile_dkv), make_coord(_,_,0)); // dump dV
@@ -419,7 +420,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
     Tensor tdPgdO = thr_mma_sdp.partition_A(gdO);
     Tensor tdPgV = thr_mma_sdp.partition_B(gV);
     Tensor tdVgPt = thr_mma_dkv.partition_A(gPt);
-    Tensor tdVgdOt = thr_mma_dkv.partition_B(gQtdOt2);
+    Tensor tdVgdOt = thr_mma_dkv.partition_B(gQtdOt);
     Tensor tdQgdP = thr_mma_dq.partition_A(gdPa);
     Tensor tdQgK = thr_mma_dq.partition_B(gK);
     Tensor tdKgdPt = thr_mma_dkv.partition_A(gdPt);
@@ -481,8 +482,6 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                                                   get<1>(tile_sdp),
                                                   ceil_div(Int<kBlockM>{}, get<0>(tile_sdp)),
                                                   ceil_div(Int<kBlockN>{}, get<1>(tile_sdp))));
-                                       // Shape<Int<16 * Trait::AtomLayoutMSdP>,
-                                       // Int<16 * Trait::kNSGs / Trait::AtomLayoutMSdP>>{});
     Tensor tdPrdP = partition_fragment_C(tiled_mma_sdp,
                                          make_shape(get<0>(tile_sdp),
                                                     get<1>(tile_sdp),
@@ -516,7 +515,6 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
     const int max_m_block = ceil_div(param.seq_len_q, kBlockM);
     const int tail_m = param.seq_len_q % kBlockM;
 
-    constexpr int k_tile = ceil_div(kHeadDim, kBlockK);
     // clear accumulator
     clear(tdVrdV);
     clear(tdKrdK);
@@ -563,7 +561,8 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         }
         clear(tSrS);
         // S=QKt
-        gemm_ker(tSrS, tSrQ, tSrKt, tQgQ, tQrQ, tKtgKt, tKtrKt, tiled_mma_sdp, tileloadQ, tileloadKt);
+        gemm_ker(tSrS, tSrQ, tSrKt, tQgQ, tQrQ, gQ, tKtgKt, tKtrKt, gKtV,
+                 tiled_mma_sdp, tile_sdp, tileloadQ, tileloadKt);
         load_1colvec(lse, mLSE, taccScS_row);
         Tensor dP_sum = make_fragment_like(lse);
         load_1colvec(dP_sum, mdPsum, taccScS_row);
@@ -577,7 +576,8 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
 
         clear(tdPrdP);
         // dP=dO*Vt
-        gemm_ker(tdPrdP, tdPrdO, tdPrV, tdOgdO, tdOrdO, tVgV, tVrV, tiled_mma_sdp, tileloaddO, tileloadV);
+        gemm_ker(tdPrdP, tdPrdO, tdPrV, tdOgdO, tdOrdO, gdO, tVgV, tVrV, gKtV,
+                 tiled_mma_sdp, tile_sdp, tileloaddO, tileloadV);
         Tensor dS = make_tensor(tdPrdP.data(), scores.layout());
         // dS=P(dP-sum_row(P))*scale
         softmax_backward(scores, dP_sum, dS, param.scale_softmax);
@@ -588,7 +588,8 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
             copy(tileloaddQ, tdQgdQ, tdQrdQ);
 
         // dV=Pt*dO
-        gemm_ker(tdVrdV, tdVrPt, tdVrdOt, tPtgPt, tPtrPt, tdOtgdOt, tdOtrdOt, tiled_mma_dkv, tileloadPt, tileloaddOt);
+        gemm_ker(tdVrdV, tdVrPt, tdVrdOt, tPtgPt, tPtrPt, gPt, tdOtgdOt, tdOtrdOt, gQtdOt,
+                 tiled_mma_dkv, tile_dkv, tileloadPt, tileloaddOt);
 
         sycl::group_barrier(group);
 
@@ -604,13 +605,15 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                 mha_load<false>(tileloaddQ, tdQgdQ, tdQrdQ);
         }
         // dQ=dP*K
-        gemm_ker(tdQrdQ, tdQrdP, tdQrK, tdPgdPa, tdPrdPa, tKgK, tKrK, tiled_mma_dq, tileloaddP, tileloadK);
+        gemm_ker(tdQrdQ, tdQrdP, tdQrK, tdPgdPa, tdPrdPa, gdPa, tKgK, tKrK, gK,
+                 tiled_mma_dq, tile_dq, tileloaddP, tileloadK);
         if (Is_even_M)
             mha_save<true>(tilesavedQ, tdQrdQ, tdQgdQ);
         else
             mha_save<false>(tilesavedQ, tdQrdQ, tdQgdQ);
         // dK=dPt*Q
-        gemm_ker(tdKrdK, tdKrdPt, tdKrQt, tdPtgdPt, tdPtrdPt, tQtgQt, tQtrQt, tiled_mma_dkv, tileloaddPt, tileloadQt);
+        gemm_ker(tdKrdK, tdKrdPt, tdKrQt, tdPtgdPt, tdPtrdPt, gdPt, tQtgQt, tQtrQt, gQtdOt,
+                 tiled_mma_dkv, tile_dkv, tileloaddPt, tileloadQt);
         // update ptr/atom copy
         mQ.data() = mQ.data() + int(kBlockM * param.q_r_stride);
         mdO.data() = mdO.data() + int(kBlockM * param.o_r_stride);
@@ -947,7 +950,7 @@ template<class...> class mhaodoDeviceName;
 template<class...> class mhabwdDeviceName;
 template<class...> class mhacvtDeviceName;
 
-template<typename T, class ProblemShape, int kBlockM, int kBlockN, int kBlockK,
+template<typename T, class ProblemShape, int kBlockM, int kBlockN,
          int kHeadDim, int kNSGs, int AtomLayoutMSdP, int AtomLayoutNdKV,
          int AtomLayoutMdQ, bool is_bhsd>
 void launch_mha_backward_headdim(ProblemShape problem_shape,
@@ -966,7 +969,7 @@ void launch_mha_backward_headdim(ProblemShape problem_shape,
                                  T *dp_d,
                                  const int seq_len_q_pad,
                                  const int seq_len_kv_pad) {
-    auto trait = FAKernel<T, kHeadDim, kBlockM, kBlockN, kBlockK, kNSGs,
+    auto trait = FAKernel<T, kHeadDim, kBlockM, kBlockN, kNSGs,
                           AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ>{};
 
     const int BATCH = get<0>(problem_shape);
@@ -1074,7 +1077,6 @@ void launch_mha_backward(ProblemShape problem_shape,
     if (headdim == 64) {
         constexpr int kBlockM = 64;
         constexpr int kBlockN = 32;
-        constexpr int kBlockK = 32;
         constexpr int kHeadDim = 64;
         constexpr int kNSGs = 8;
         constexpr int AtomLayoutMSdP = 4;
@@ -1083,7 +1085,7 @@ void launch_mha_backward(ProblemShape problem_shape,
         static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
         static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
         launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN,
-                                    kBlockK, kHeadDim, kNSGs,
+                                    kHeadDim, kNSGs,
                                     AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
                                     is_bhsd>(
             problem_shape,
@@ -1095,7 +1097,6 @@ void launch_mha_backward(ProblemShape problem_shape,
     } else if (headdim == 96) {
         constexpr int kBlockM = 64;
         constexpr int kBlockN = 64;
-        constexpr int kBlockK = 32;
         constexpr int kHeadDim = 96;
         constexpr int kNSGs = 8;
         constexpr int AtomLayoutMSdP = 2;
@@ -1104,7 +1105,7 @@ void launch_mha_backward(ProblemShape problem_shape,
         static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
         static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
         launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN,
-                                    kBlockK, kHeadDim, kNSGs,
+                                    kHeadDim, kNSGs,
                                     AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
                                     is_bhsd>(
             problem_shape,
@@ -1116,7 +1117,6 @@ void launch_mha_backward(ProblemShape problem_shape,
     } else if (headdim == 128) {
         constexpr int kBlockM = 64;
         constexpr int kBlockN = 32;
-        constexpr int kBlockK = 32;
         constexpr int kHeadDim = 128;
         constexpr int kNSGs = 8;
         constexpr int AtomLayoutMSdP = 4;
@@ -1125,7 +1125,7 @@ void launch_mha_backward(ProblemShape problem_shape,
         static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
         static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
         launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN,
-                                    kBlockK, kHeadDim, kNSGs,
+                                    kHeadDim, kNSGs,
                                     AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
                                     is_bhsd>(
             problem_shape,
@@ -1137,7 +1137,6 @@ void launch_mha_backward(ProblemShape problem_shape,
     } else if (headdim == 192) {
         constexpr int kBlockM = 64;
         constexpr int kBlockN = 32;
-        constexpr int kBlockK = 32;
         constexpr int kHeadDim = 192;
         constexpr int kNSGs = 8;
         constexpr int AtomLayoutMSdP = 4;
@@ -1146,7 +1145,7 @@ void launch_mha_backward(ProblemShape problem_shape,
         static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
         static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
         launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN,
-                                    kBlockK, kHeadDim, kNSGs,
+                                    kHeadDim, kNSGs,
                                     AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
                                     is_bhsd>(
             problem_shape,
@@ -1158,7 +1157,6 @@ void launch_mha_backward(ProblemShape problem_shape,
     } else if (headdim == 256) {
         constexpr int kBlockM = 64;
         constexpr int kBlockN = 32;
-        constexpr int kBlockK = 32;
         constexpr int kHeadDim = 256;
         constexpr int kNSGs = 8;
         constexpr int AtomLayoutMSdP = 4;
@@ -1167,7 +1165,7 @@ void launch_mha_backward(ProblemShape problem_shape,
         static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
         static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
         launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN,
-                                    kBlockK, kHeadDim, kNSGs,
+                                    kHeadDim, kNSGs,
                                     AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
                                     is_bhsd>(
             problem_shape,
