@@ -3,7 +3,7 @@
 #include <cute/tensor.hpp>
 using namespace cute;
 
-template <class T_, int kHeadDim_, int kBlockM_, int kBlockN_, int kBlockK_, int kNSGs_,
+template <class T_, int kHeadDim_, int kBlockM_, int kBlockN_, int kNSGs_,
           int AtomLayoutMSdP_ = 2, int AtomLayoutNdKV_ = 2, int AtomLayoutMdQ_ = 2>
 struct FAKernel {
     /*
@@ -22,7 +22,6 @@ struct FAKernel {
     static constexpr int kHeadDim = kHeadDim_;
     static constexpr int kBlockM = kBlockM_;
     static constexpr int kBlockN = kBlockN_;
-    static constexpr int kBlockK = kBlockK_;
     static constexpr int kNSGs = kNSGs_;
     static constexpr int AtomLayoutMSdP = AtomLayoutMSdP_;
     static constexpr int AtomLayoutNdKV = AtomLayoutNdKV_;
@@ -31,19 +30,19 @@ struct FAKernel {
     using SubgroupLayoutdKV = Layout<Shape<Int<AtomLayoutNdKV>, Int<kNSGs / AtomLayoutNdKV>, _1>>;
     using SubgroupLayoutdQ = Layout<Shape<Int<AtomLayoutMdQ>, Int<kNSGs / AtomLayoutMdQ>, _1>>;
 
-    using TileShapeSdP = Tile<Int<16 * AtomLayoutMSdP>, Int<16 * kNSGs / AtomLayoutMSdP>, _16>;
+    using TileShapeSdP = Tile<Int<16 * AtomLayoutMSdP>, Int<16 * kNSGs / AtomLayoutMSdP>, _32>;
     static_assert(size<0>(TileShapeSdP{}) <= kBlockM && "tile size M must be smaller than or equal to kBlockM");
     static_assert(kBlockM % size<0>(TileShapeSdP{}) == 0 && "kBlockM must be dividable by tile size M");
     static_assert(size<1>(TileShapeSdP{}) <= kBlockN && "tile size N must be smaller than or equal to kBlockN");
     static_assert(kBlockN % size<1>(TileShapeSdP{}) == 0 && "kBlockN must be dividable by tile size N ");
 
-    using TileShapedKV = Tile<Int<16 * AtomLayoutNdKV>, Int<16 * kNSGs / AtomLayoutNdKV>, _16>;
+    using TileShapedKV = Tile<Int<16 * AtomLayoutNdKV>, Int<16 * kNSGs / AtomLayoutNdKV>, _32>;
     static_assert(size<0>(TileShapedKV{}) <= kBlockN && "tile size M must be smaller than or equal to kBlockN");
     static_assert(kBlockN % size<0>(TileShapedKV{}) == 0 && "kBlockN must be dividable by tile size M");
     static_assert(size<1>(TileShapedKV{}) <= kHeadDim && "tile size N must be smaller than or equal to kHeadDim");
     static_assert(kHeadDim % size<1>(TileShapedKV{}) == 0 && "kHeadDim must be dividable by tile size N");
 
-    using TileShapedQ = Tile<Int<16 * AtomLayoutMdQ>, Int<16 * kNSGs / AtomLayoutMdQ>, _16>;
+    using TileShapedQ = Tile<Int<16 * AtomLayoutMdQ>, Int<16 * kNSGs / AtomLayoutMdQ>, _32>;
     static_assert(size<0>(TileShapedQ{}) <= kBlockM && "tile size M must be smaller than or equal to kBlockM");
     static_assert(kBlockM % size<0>(TileShapedQ{}) == 0 && "kBlockM must dividable by tile size M");
     static_assert(size<1>(TileShapedQ{}) <= kHeadDim && "tile size N must be smaller than or equal to kHeadDim");
@@ -68,84 +67,84 @@ struct FAKernel {
     // for load Q and Kt in S=QKt
     using TiledLoadQ = decltype(make_tiled_copy(
                                     Copy_Atom<Copy_Traits<XE_2D_U16x16x16_LD_N, StrideR>, DType>{},
-                                    Layout<Shape<_1,_16>>{}, // Thr layout 1x16 k-major
-                                    Layout<Shape<_16,_1>>{}));              // Val layout  16x1
+                                    Layout<Shape<_4,_16>>{}, // Thr layout 1x16 k-major
+                                    Layout<Shape<_16,_4>>{}));              // Val layout  16x1
     using TiledLoadKt = decltype(make_tiled_copy(
                                      Copy_Atom<Copy_Traits<XE_2D_U16x16x16_LD_T, StrideR>, DType>{},
-                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
-                                     Layout<Shape<_16,_1>>{}));              // Val layout  16x1
+                                     Layout<Shape<_4,_16>>{}, // Thr layout 1x16 n-major
+                                     Layout<Shape<_16,_4>>{}));              // Val layout  16x1
 
     // for load dO and Vt in dP=dO*Vt
     using TiledLoaddO = decltype(make_tiled_copy(
                                      Copy_Atom<Copy_Traits<XE_2D_U16x16x16_LD_N, StrideR>, DType>{},
-                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 k-major
-                                     Layout<Shape<_16,_1>>{}));              // Val layout  16x1
+                                     Layout<Shape<_4,_16>>{}, // Thr layout 1x16 k-major
+                                     Layout<Shape<_16,_4>>{}));              // Val layout  16x1
 
     using TiledLoadV = decltype(make_tiled_copy(
                                     Copy_Atom<Copy_Traits<XE_2D_U16x16x16_LD_T, StrideR>, DType>{},
-                                    Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
-                                    Layout<Shape<_16,_1>>{}));              // Val layout  16x1
+                                    Layout<Shape<_4,_16>>{}, // Thr layout 1x16 n-major
+                                    Layout<Shape<_16,_4>>{}));              // Val layout  16x1
 
     // for load Pt and dO in dV=Pt*dO
     using TiledLoadPt = decltype(make_tiled_copy(
                                      Copy_Atom<Copy_Traits<XE_2D_U16x16x16_LD_T, StrideC>, DType>{},
-                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 m-major
-                                     Layout<Shape<_16,_1>>{})); // // Val layout  8x1
+                                     Layout<Shape<_4,_16>>{}, // Thr layout 1x16 m-major
+                                     Layout<Shape<_16,_4>>{})); // // Val layout  8x1
     using TiledLoaddOt = decltype(make_tiled_copy(
                                      Copy_Atom<Copy_Traits<XE_2D_U16x16x16_LD_V, StrideC>, DType>{}, // should be V here
-                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
-                                     Layout<Shape<_16,_1>>{})); // val layout 16x1
+                                     Layout<Shape<_4,_16>>{}, // Thr layout 1x16 n-major
+                                     Layout<Shape<_16,_4>>{})); // val layout 16x1
 
     // for load dP, K and dQ in dQ=dP*K
     using TiledLoaddP = decltype(make_tiled_copy(
                                      Copy_Atom<Copy_Traits<XE_2D_U16x8x16_LD_N, StrideR>, DType>{},
-                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 k-major
-                                     Layout<Shape<_8,_1>>{})); // val layout 16x1
+                                     Layout<Shape<_4,_16>>{}, // Thr layout 1x16 k-major
+                                     Layout<Shape<_8,_4>>{})); // val layout 16x1
     using TiledLoadK = decltype(make_tiled_copy(
                                     Copy_Atom<Copy_Traits<XE_2D_U16x8x16_LD_N, StrideC>, DType>{},
-                                    Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
-                                    Layout<Shape<_8,_1>>{})); // val layout 16x1
+                                    Layout<Shape<_4,_16>>{}, // Thr layout 1x16 n-major
+                                    Layout<Shape<_8,_4>>{})); // val layout 16x1
 
     using TiledLoaddQ = decltype(make_tiled_copy(
                                      Copy_Atom<Copy_Traits<XE_2D_U32x8x16_LD_N, StrideR>, VType>{},
-                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
-                                     Layout<Shape<_8,_1>>{})); // val layout 8x1
+                                     Layout<Shape<_4,_16>>{}, // Thr layout 1x16 n-major
+                                     Layout<Shape<_8,_4>>{})); // val layout 8x1
 
     //  for load dPt, Q in dK=dPt*Q
     using TiledLoaddPt = decltype(make_tiled_copy(
                                       Copy_Atom<Copy_Traits<XE_2D_U16x16x16_LD_T, StrideC>, DType>{},
-                                      Layout<Shape<_1,_16>>{}, // Thr layout 1x16 k-major
-                                      Layout<Shape<_16,_1>>{}));              // Val layout  16x1
+                                      Layout<Shape<_4,_16>>{}, // Thr layout 1x16 k-major
+                                      Layout<Shape<_16,_4>>{}));              // Val layout  16x1
     using TiledLoadQt = decltype(make_tiled_copy(
                                      Copy_Atom<Copy_Traits<XE_2D_U16x16x16_LD_N, StrideC>, DType>{},
-                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
-                                     Layout<Shape<_16,_1>>{}));              // Val layout  16x1
+                                     Layout<Shape<_4,_16>>{}, // Thr layout 1x16 n-major
+                                     Layout<Shape<_16,_4>>{}));              // Val layout  16x1
 
     // for save S in S=QKt and P
     using TiledSaveS = decltype(make_tiled_copy(
                                     Copy_Atom<Copy_Traits<XE_2D_U16x8x16_ST_N, StrideR>, DType>{},
-                                    Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
-                                    Layout<Shape<_8,_1>>{}));              // Val layout  8x1
+                                    Layout<Shape<_4,_16>>{}, // Thr layout 1x16 n-major
+                                    Layout<Shape<_8,_4>>{}));              // Val layout  8x1
     // for save dP in dP=dO*Vt
     using TiledSavedP = decltype(make_tiled_copy(
                                      Copy_Atom<Copy_Traits<XE_2D_U16x8x16_ST_N, StrideR>, DType>{},
-                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
-                                     Layout<Shape<_8,_1>>{}));              // Val layout  8x1
+                                     Layout<Shape<_4,_16>>{}, // Thr layout 1x16 n-major
+                                     Layout<Shape<_8,_4>>{}));              // Val layout  8x1
     // for save dV in dV=Pt*dO
     using TiledSavedV = decltype(make_tiled_copy(
                                      Copy_Atom<Copy_Traits<XE_2D_U16x8x16_ST_N, StrideR>, DType>{},
-                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
-                                     Layout<Shape<_8,_1>>{})); // Val layout  8x1
+                                     Layout<Shape<_4,_16>>{}, // Thr layout 1x16 n-major
+                                     Layout<Shape<_8,_4>>{})); // Val layout  8x1
     // for save dQ in dQ=dP*K
     using TiledSavedQ = decltype(make_tiled_copy(
                                      Copy_Atom<Copy_Traits<XE_2D_U32x8x16_ST_N, StrideR>, VType>{},
-                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
-                                     Layout<Shape<_8,_1>>{})); // val layout 8x1
+                                     Layout<Shape<_4,_16>>{}, // Thr layout 1x16 n-major
+                                     Layout<Shape<_8,_4>>{})); // val layout 8x1
     // for save dK=dPt*Q
     using TiledSavedK = decltype(make_tiled_copy(
                                      Copy_Atom<Copy_Traits<XE_2D_U16x8x16_ST_N, StrideR>, DType>{},
-                                     Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
-                                     Layout<Shape<_8,_1>>{})); // Val layout  8x1
+                                     Layout<Shape<_4,_16>>{}, // Thr layout 1x16 n-major
+                                     Layout<Shape<_8,_4>>{})); // Val layout  8x1
 
     static constexpr int SubgroupSize = 16;
     static constexpr int smem_size = 0;
