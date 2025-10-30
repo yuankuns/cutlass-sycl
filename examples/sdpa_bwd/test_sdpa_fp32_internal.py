@@ -263,9 +263,9 @@ def test_sdpa(dtype,
     q = torch.empty(batch, num_heads_q, seq_len_qo, head_size_qk, requires_grad=True).to(dtype)
     k = torch.empty(batch, num_heads_kv, seq_len_kv, head_size_qk, requires_grad=True).to(dtype)
     v = torch.empty(batch, num_heads_kv, seq_len_kv, head_size_vo, requires_grad=True).to(dtype)
-    q.normal_(0, 1)
-    k.normal_(0, 1)
-    v.normal_(0, 1)
+    q.normal_(0, 5)
+    k.normal_(0, 5)
+    v.normal_(0, 5)
     q2 = q.clone()
     k2 = k.clone()
     v2 = v.clone()
@@ -347,7 +347,7 @@ def loop_run():
 if __name__ == '__main__':
     # test_sdpa(torch.bfloat16, 123, 128, 4, 4, 900, 900, 128, 128)
     # loop_run()
-    test_sdpa(torch.float16, 123, 1, 32, 32, 516, 516, 128, 128, is_causal=True, is_bhsd = False)
+    test_sdpa(torch.float16, 123, 1, 32, 32, 2016, 2016, 128, 128, is_causal=False, is_bhsd = False)
     # GRAD_DICT = {}
     # test_sdpa(torch.float16, 123, 4, 4, 4, 512, 512, 96, 96, is_causal=True, is_bhsd = False)
     # GRAD_DICT = {}

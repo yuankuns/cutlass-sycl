@@ -206,14 +206,24 @@ mha_load(TileCopy &tile_copy,
     }
 }
 
-template<class Tensor0, class Tensor1, class Tensor2>
-CUTLASS_DEVICE void load_1colvec(Tensor0 &reg, Tensor1 &mT, Tensor2 &coord_row) {
-    CUTLASS_PRAGMA_UNROLL
-    for (int mi = 0; mi < size(reg); ++mi) {
-        reg(mi) = mT(get<0>(coord_row(mi)));
+template<bool Is_even_M, class Tensor0, class Tensor1, class Tensor2>
+CUTLASS_DEVICE void
+load_1colvec(Tensor0 &reg, Tensor1 &mT, Tensor2 &coord_row,
+             int tail_m = 0) {
+    if constexpr(Is_even_M) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int mi = 0; mi < size(reg); ++mi) {
+            reg(mi) = mT(get<0>(coord_row(mi)));
+        }
+    } else {
+        for (int mi = 0; mi < size(reg); ++mi) {
+            int row = get<0>(coord_row(mi));
+            if (row < tail_m) {
+                reg(mi) = mT(row);
+            }
+        }
     }
 }
-
 template<typename Layout>
 CUTLASS_DEVICE auto convert_layout_acc_layout(Layout acc_layout) {
     static_assert(decltype(size<0>(acc_layout))::value == 8);
@@ -613,9 +623,19 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         if constexpr(is_causal)
             apply_mask_causal(scores, taccScS_rc, m_block * kBlockM, n_block * kBlockN);
 
-        load_1colvec(lse, mLSE, taccScS_row);
+        if (Is_even_M) {
+            load_1colvec<true>(lse, mLSE, taccScS_row);
+        } else {
+            load_1colvec<false>(lse, mLSE, taccScS_row, tail_m);
+        }
+
         Tensor dP_sum = make_fragment_like(lse);
-        load_1colvec(dP_sum, mdPsum, taccScS_row);
+
+        if (Is_even_M)
+            load_1colvec<true>(dP_sum, mdPsum, taccScS_row);
+        else
+            load_1colvec<false>(dP_sum, mdPsum, taccScS_row, tail_m);
+
         // P=softmax(S,lse)
         scale_apply_exp2(scores, lse, param.scale_softmax_log2);
         auto tSrSl = convert_type<T>(tSrS);
