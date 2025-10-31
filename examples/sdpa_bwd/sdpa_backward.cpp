@@ -240,7 +240,7 @@ CUTLASS_DEVICE void scale_apply_exp2(Tensor<Engine0, Layout0> &tensor, Tensor<En
     CUTE_STATIC_ASSERT_V(size<0>(max) == size<0>(tensor));
     CUTLASS_PRAGMA_UNROLL
     for (int mi = 0; mi < size<0>(tensor); ++mi) {
-        const float max_scaled = max(mi) == INFINITY ? 0.f : max(mi) * M_LOG2E;
+        const float max_scaled = max(mi) == -INFINITY ? 0.f : max(mi) * M_LOG2E;
         CUTLASS_PRAGMA_UNROLL
         for (int ni = 0; ni < size<1>(tensor); ++ni)  {
             tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
@@ -254,17 +254,13 @@ CUTLASS_DEVICE void softmax_backward(Tensor0 &P, Tensor1 &dP_sum, Tensor2 &dP, c
     for (int mi = 0; mi < size<0>(dP); ++mi) {
         CUTLASS_PRAGMA_UNROLL
         for (int mj = 0; mj < size<1>(dP); ++mj) {
-            if (P(mi, mj) >= 0)
-                dP(mi, mj) = P(mi, mj) * (dP(mi, mj) - dP_sum(mi)) * scale;
-            else
-                dP(mi, mj) = P(mi, mj) * dP_sum(mi) * scale;
+            dP(mi, mj) = P(mi, mj) * (dP(mi, mj) - dP_sum(mi)) * scale;
         }
     }
 }
 
-template <typename T, class CVT, class T0>
-CUTLASS_DEVICE auto convert_type(CVT &cvt, T0 &src) {
-    Tensor dst = make_tensor_like<T>(src);
+template <class CVT, class T0, class T1>
+CUTLASS_DEVICE auto convert_type(CVT &cvt, T0 &src, T1 &dst) {
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(src); ++i) {
         dst(i) = cvt(src(i));
@@ -702,11 +698,6 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         tilesaveS = typename Trait::TiledSaveS{mS}; // debug
         tilesavedPd = typename Trait::TiledSaveS{mdPd}; // debug
     }
-    // if (n_block == 0 and cute::thread(0, 0)) {
-    //     print("dV:\n");
-    //     print_t(tdVrdV);
-    //     print("\n");
-    // }
     auto tdVrdVl = convert_type<T>(tdVrdV);
     mha_save<Is_even_N>(tilesavedV, tdVrdVl, tdVgdV);
     auto tdKrdKl = convert_type<T>(tdKrdK);
@@ -1387,8 +1378,8 @@ int main(int argc, char**argv) {
                 s_d, dp_d, SEQ_LEN_QO_PAD, SEQ_LEN_KV_PAD);
         }
     }
-    float atol = 5e-2f;
-    float rtol = 1e-2f;
+    float atol = 1e-3f;
+    float rtol = 1e-3f;
     std::vector<V> odo_test(odo_npy.num_vals);
     compat::memcpy<V>(odo_test.data(), odo_d, odo_test.size());
     compat::wait_and_throw();
