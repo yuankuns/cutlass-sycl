@@ -401,13 +401,14 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                              make_layout(
                                  shapeKtV,
                                  make_stride(param.dk_r_stride, _1{}, _1{})));
-
+#ifdef _DEBUG_
     Tensor mS = make_tensor(make_gmem_ptr(param.s_ptr + s_offset), make_layout(
                                 shapeSP,
                                 make_stride(param.s_r_stride, _1{}, _1{})));
     Tensor mdPd = make_tensor(make_gmem_ptr(param.dp_ptr + s_offset), make_layout(
                                 shapeSP,
                                 make_stride(param.s_r_stride, _1{}, _1{})));
+#endif
 
     Shape tile_sdp = typename Trait::TileShapeSdP{};
     Shape tile_dkv = typename Trait::TileShapedKV{};
@@ -430,10 +431,10 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
     auto tilesavedP = typename Trait::TiledSavedP{mdP};
     auto tilesavedQ = typename Trait::TiledSavedQ{mdQaccum};
     auto tilesavedK = typename Trait::TiledSavedK{mdK};
-
+#ifdef _DEBUG_
     auto tilesaveS = typename Trait::TiledSaveS{mS}; // debug
     auto tilesavedPd = typename Trait::TiledSavedP{mdPd}; // debug
-
+#endif
     Tensor mQ_coord = cute::get_xe_tensor(shapeQ);
     Tensor mdQ_coord = cute::get_xe_tensor(shapedQ);
     Tensor mKtV_coord = cute::get_xe_tensor(shapeKtV);
@@ -594,6 +595,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                               make_layout(
                                   make_shape(Int<kHeadDim>{}, tail_m, _1{}),
                                   make_stride(_1{}, param.q_r_stride, _1{})));
+#ifdef _DEBUG_
             mS = make_tensor(make_gmem_ptr(mS.data()),
                              make_layout(
                                  make_shape(tail_m, block_n_dim, _1{}),
@@ -602,15 +604,17 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                                make_layout(
                                    make_shape(tail_m, block_n_dim, _1{}),
                                    make_stride(param.s_r_stride, _1{}, _1{}))); // debug
-
+#endif
             tileloadQ = typename Trait::TiledLoadQ{mQ};
             tileloaddO = typename Trait::TiledLoaddO{mdO};
             tileloaddOt = typename Trait::TiledLoaddOt{mdOt};
             tileloaddQ = typename Trait::TiledLoaddQ{mdQaccum};
             tileloadQt = typename Trait::TiledLoadQt{mQt};
             tilesavedQ = typename Trait::TiledSavedQ{mdQaccum};
+#ifdef _DEBUG_
             tilesaveS = typename Trait::TiledSaveS{mS};
             tilesavedPd = typename Trait::TiledSavedP{mdPd};
+#endif
         }
         clear(tSrS);
         // S=QKt
@@ -637,7 +641,9 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         scale_apply_exp2(scores, lse, param.scale_softmax_log2);
         auto tSrSl = convert_type<T>(tSrS);
         mha_save<Is_even_N>(tilesaveP, tSrSl, tPgP); // save P to internal buffers
+#ifdef _DEBUG_
         mha_save<Is_even_N>(tilesaveS, tSrSl, tPgP); // save P to external tensor for verification
+#endif
         clear(tdPrdP);
         // dP=dO*Vt
         gemm_ker(tdPrdP, tdPrdO, tdPrV, tdOgdO, tdOrdO, gdO, tVgV, tVrV, gKtV,
@@ -646,7 +652,9 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         // dS=P(dP-sum_row(P))*scale
         softmax_backward(scores, dP_sum, dS, param.scale_softmax);
         auto tdPrdPl = convert_type<T>(tdPrdP);
+#ifdef _DEBUG_
         mha_save<Is_even_N>(tilesavedPd, tdPrdPl, tPgP); // save dP to external tensor for verification
+#endif
 
         if (n_block > 0) // TODO: need actual prefetch here. yk
             copy(tileloaddQ, tdQgdQ, tdQrdQ);
@@ -684,8 +692,10 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         mdOt.data() = mdOt.data() + int(kBlockM * param.o_r_stride);
         mdQaccum.data() = mdQaccum.data() + int(kBlockM * param.dq_r_stride);
         mQt.data() = mQt.data() + int(kBlockM * param.q_r_stride);
+#ifdef _DEBUG_
         mS.data() = mS.data() + int(kBlockM * param.s_r_stride); // debug
         mdPd.data() = mdPd.data() + int(kBlockM * param.s_r_stride); // debug
+#endif
         mLSE.data() = mLSE.data() + int(kBlockM);
         mdPsum.data() = mdPsum.data() + int(kBlockM);
 
@@ -695,9 +705,10 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         tileloaddQ = typename Trait::TiledLoaddQ{mdQaccum};
         tileloadQt = typename Trait::TiledLoadQt{mQt};
         tilesavedQ = typename Trait::TiledSavedQ{mdQaccum};
-
+#ifdef _DEBUG_
         tilesaveS = typename Trait::TiledSaveS{mS}; // debug
         tilesavedPd = typename Trait::TiledSaveS{mdPd}; // debug
+#endif
     }
     auto tdVrdVl = convert_type<T>(tdVrdV);
     mha_save<Is_even_N>(tilesavedV, tdVrdVl, tdVgdV);
@@ -1389,6 +1400,7 @@ int main(int argc, char**argv) {
     printf("odo val: ");
     verify(odo_npy.data<V>(), odo_test.data(), BATCH, NUM_HEAD_Q, SEQ_LEN_QO, atol, rtol);
 
+#ifdef _DEBUG_
     std::vector<T> s_test(BATCH * NUM_HEAD_Q * SEQ_LEN_QO_PAD * SEQ_LEN_KV_PAD);
     compat::memcpy<T>(s_test.data(), s_d, s_test.size());
     compat::wait_and_throw();
@@ -1400,7 +1412,7 @@ int main(int argc, char**argv) {
     compat::wait_and_throw();
     printf("dS val: ");
     verify(ds_npy.data<T>(), dp_test.data(), BATCH * NUM_HEAD_Q, SEQ_LEN_QO, SEQ_LEN_QO_PAD, SEQ_LEN_KV, SEQ_LEN_KV_PAD, atol, rtol);
-    compat::wait_and_throw();
+#endif
 
     std::vector<T> dv_test(BATCH * NUM_HEAD_Q * SEQ_LEN_KV * HEAD_SIZE_VO);
     compat::memcpy<T>(dv_test.data(), dv_d, dv_test.size());
