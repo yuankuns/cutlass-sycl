@@ -28,12 +28,12 @@ debug_info() {
 }
 
 template<class T>
-void print_t(T t) {
-    print(t);
-    for (int i = 0; i < size(t); ++i) {
+void print_t(T r) {
+    print(r);
+    for (int i = 0; i < size(r); ++i) {
         if (i % 8 == 0)
             print("\n(%03d): ", i / 8);
-        print("%10.7f ", (float)t(i));
+        print("%10.7f ", (float)r(i));
     }
     print("\n");
 }
@@ -1080,6 +1080,16 @@ void launch_mha_backward_headdim(ProblemShape problem_shape,
         setup_bshd_stride(param);
     }
 
+#ifdef _BENCH_
+    printf("Launching mha backward kernel with 50 times\n");
+    int count = 50;
+    auto start = std::chrono::high_resolution_clock::now();
+    auto dur0 = start - start;
+    auto dur1 = start - start;
+    auto dur2 = start - start;
+    for (int iii=0; iii < count; ++iii) {
+    auto start0 = std::chrono::high_resolution_clock::now();
+#endif
     auto dimGrid0 = compat::dim3(size(M_BLOCK), size(param.num_head_q), size(param.batch));
     auto dimBlock0 = compat::dim3(size(kNSGs * trait.SubgroupSize), size(1), size(1));
     compat::experimental::launch_properties launch_props0{
@@ -1095,7 +1105,12 @@ void launch_mha_backward_headdim(ProblemShape problem_shape,
                                            param);
     EventManager::getInstance().addEvent(event0);
     compat::wait_and_throw();
+#ifdef _BENCH_
+    auto end0 = std::chrono::high_resolution_clock::now();
+    dur0 += end0 - start0;
 
+    auto start1 = std::chrono::high_resolution_clock::now();
+#endif
     auto dimGrid1 = compat::dim3(size(1), size(param.num_head_q), size(param.batch));
     assert((param.num_head_q % param.num_head_kv == 0) && "num_head_q must be dividable by num_head_kv");
     assert((param.num_head_q >= param.num_head_kv) && "num_head_q must be bigger than or equal to num_head_kv");
@@ -1115,7 +1130,12 @@ void launch_mha_backward_headdim(ProblemShape problem_shape,
                                            param);
     EventManager::getInstance().addEvent(event1);
     compat::wait_and_throw();
+#ifdef _BENCH_
+    auto end1 = std::chrono::high_resolution_clock::now();
+    dur1 += end1 - start1;
 
+    auto start2 = std::chrono::high_resolution_clock::now();
+#endif
     auto dimGrid2 = compat::dim3(size(M_BLOCK), size(param.num_head_q), size(param.batch));
     auto dimBlock2 = compat::dim3(size(kNSGs * trait.SubgroupSize), size(1), size(1));
     compat::experimental::launch_properties launch_props2{
@@ -1131,6 +1151,18 @@ void launch_mha_backward_headdim(ProblemShape problem_shape,
                                            param);
     EventManager::getInstance().addEvent(event2);
     compat::wait_and_throw();
+#ifdef _BENCH_
+    auto end2 = std::chrono::high_resolution_clock::now();
+    dur2 += end2 - start2;
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    auto dur = end - start;
+    printf("mha dot do kernel time, odo :%f mha bwd: %f dq: %f total: %f us\n",
+           std::chrono::duration_cast<std::chrono::microseconds>(dur0).count() / float(count),
+           std::chrono::duration_cast<std::chrono::microseconds>(dur1).count() / float(count),
+           std::chrono::duration_cast<std::chrono::microseconds>(dur2).count() / float(count),
+           std::chrono::duration_cast<std::chrono::microseconds>(dur).count() / float(count));
+#endif
 }
 
 template<typename T, class ProblemShape, int kMPad, int kNPad, bool is_causal, bool is_bhsd>
@@ -1394,6 +1426,7 @@ int main(int argc, char**argv) {
     }
     float atol = 1e-3f;
     float rtol = 1e-3f;
+
     std::vector<V> odo_test(odo_npy.num_vals);
     compat::memcpy<V>(odo_test.data(), odo_d, odo_test.size());
     compat::wait_and_throw();
