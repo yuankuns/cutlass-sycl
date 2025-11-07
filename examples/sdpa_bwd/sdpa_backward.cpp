@@ -38,6 +38,17 @@ void print_t(T r) {
     print("\n");
 }
 
+template<class T1, class T2>
+void print_t(T1 m, T2 g) {
+    print(m);
+    for (int i = 0; i < size(g); ++i) {
+        if (i % 8 == 0)
+            print("\n(%03d): ", i / 8);
+        print("%10.7f ", (float)m(g(i)));
+    }
+    print("\n");
+}
+
 template<class T>
 void print_t_2d(T t) {
     static_assert(rank(t) == 2, "Only support 2D Tensor");
@@ -161,6 +172,7 @@ gemm_ker(Tensor0 &tCrCmn, Tensor1 &tCrA, Tensor2 &tCrB,
     }
 }
 
+
 template <bool Is_even_MN, class TileCopy,
           class Engine0, class Layout0,
           class Engine1, class Layout1>
@@ -202,6 +214,29 @@ mha_load(TileCopy &tile_copy,
             auto src_block = src(_, _, _, m, _);
             auto dst_block = dst(_, _, _, m, _);
             copy(tile_copy, src_block, dst_block);
+        }
+    }
+}
+
+template <class Engine0, class Layout0,
+          class Engine1, class Layout1,
+          class Engine2, class Layout2>
+CUTLASS_DEVICE void
+mha_atomic_add(Tensor<Engine0, Layout0>& m_tile,
+               Tensor<Engine1, Layout1>& g_tile,
+               Tensor<Engine2, Layout2>& r_tile,
+               const int local_id) {
+    CUTLASS_PRAGMA_UNROLL
+    for (int mi = 0; mi < size<3>(g_tile); ++mi) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int ni = 0; ni < size<4>(g_tile); ++ni) {
+            auto g = g_tile(_, _, _, mi, ni);
+            auto r = r_tile(_, _, _, mi, ni);
+            CUTLASS_PRAGMA_UNROLL
+            for (int ki = 0; ki < size(g); ++ki) {
+                auto [m, n, l] = g(ki);
+                cutlass::atomicAdd(&m_tile(m, n + local_id, 0), r(ki));
+            }
         }
     }
 }
@@ -277,7 +312,7 @@ CUTLASS_DEVICE auto convert_type(Tensor<Engine, Layout> const &tensor) {
     return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
 }
 
-template<bool Is_even_N, class Trait>
+template<bool Is_even_N, bool Seq_parallel, class Trait>
 void
 dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                    const int bidb, const int bidh, const int bidhkv, const int n_block,
@@ -287,9 +322,13 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
     constexpr int kHeadDim = Trait::kHeadDim;
     constexpr int kBlockM = Trait::kBlockM;
     constexpr int kBlockN = Trait::kBlockN;
+    constexpr int kNSGs = Trait::kNSGs;
+    constexpr int SubgroupSize = Trait::SubgroupSize;
+    constexpr int AtomLayoutMdQ = Trait::AtomLayoutMdQ;
     constexpr bool is_causal = Trait::is_causal;
     auto sg = compat::get_nd_item<1>().get_sub_group();
     auto group = compat::get_nd_item<1>().get_group();
+    const int local_id = sg.get_local_id();
     auto first_thread_in_sg_idx = sg.get_group_linear_id() * trait.SubgroupSize;
     auto bofst = Boffset(param);
 
@@ -655,9 +694,9 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
 #ifdef _DEBUG_
         mha_save<Is_even_N>(tilesavedPd, tdPrdPl, tPgP); // save dP to external tensor for verification
 #endif
-
-        if (n_block > 0) // TODO: need actual prefetch here. yk
-            copy(tileloaddQ, tdQgdQ, tdQrdQ);
+        if constexpr(not Seq_parallel)
+            if (n_block > 0) // TODO: need actual prefetch here. yk
+                copy(tileloaddQ, tdQgdQ, tdQrdQ);
 
         // dV=Pt*dO
         gemm_ker(tdVrdV, tdVrPt, tdVrdOt, tPtgPt, tPtrPt, gPt, tdOtgdOt, tdOtrdOt, gQtdOt,
@@ -670,19 +709,25 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         sycl::group_barrier(group);
 
         clear(tdQrdQ);
-        if (n_block > 0) {
-            if (Is_even_M)
-                mha_load<true>(tileloaddQ, tdQgdQ, tdQrdQ);
-            else
-                mha_load<false>(tileloaddQ, tdQgdQ, tdQrdQ);
-        }
+        if constexpr(not Seq_parallel)
+            if (n_block > 0) {
+                if (Is_even_M)
+                    mha_load<true>(tileloaddQ, tdQgdQ, tdQrdQ);
+                else
+                    mha_load<false>(tileloaddQ, tdQgdQ, tdQrdQ);
+            }
         // dQ=dP*K
         gemm_ker(tdQrdQ, tdQrdP, tdQrK, tdPgdPa, tdPrdPa, gdPa, tKgK, tKrK, gK,
                  tiled_mma_dq, tile_dq, tileloaddP, tileloadK);
-        if (Is_even_M)
-            mha_save<true>(tilesavedQ, tdQrdQ, tdQgdQ);
-        else
-            mha_save<false>(tilesavedQ, tdQrdQ, tdQgdQ);
+        if constexpr(Seq_parallel) {
+            mha_atomic_add(mdQaccum, tdQgdQ, tdQrdQ, local_id);
+        } else {
+            if (Is_even_M)
+                mha_save<true>(tilesavedQ, tdQrdQ, tdQgdQ);
+            else
+                mha_save<false>(tilesavedQ, tdQrdQ, tdQgdQ);
+        }
+
         // dK=dPt*Q
         gemm_ker(tdKrdK, tdKrdPt, tdKrQt, tdPtgdPt, tdPtrdPt, gdPt, tQtgQt, tQtrQt, gQtdOt,
                  tiled_mma_dkv, tile_dkv, tileloaddPt, tileloadQt);
@@ -881,16 +926,30 @@ compute_o_dot_do2(T & trait, Param<typename T::DType> param) {
 
 template<class T>
 void
-mha_backward(T trait,
-             Param<typename T::DType> param) {
+mha_backward_seq(T trait,
+                 Param<typename T::DType> param) {
     const int bidb = BlockIdxZ();
     const int bidhq = BlockIdxY();
     const int bidhkv = bidhq / param.num_qh_per_kvh;
     // const int max_n_block = ceil_div(param.seq_len_kv, trait.kBlockN);
     for (int n_block = 0; n_block < param.n_block; ++n_block)
-        dq_dk_dv_1colblock<true>(trait, param, bidb, bidhq, bidhkv, n_block);
+        dq_dk_dv_1colblock<true, false>(trait, param, bidb, bidhq, bidhkv, n_block);
     if (param.tail_n > 0)
-        dq_dk_dv_1colblock<false>(trait, param, bidb, bidhq, bidhkv, param.n_block, param.tail_n);
+        dq_dk_dv_1colblock<false, false>(trait, param, bidb, bidhq, bidhkv, param.n_block, param.tail_n);
+}
+
+template<class T>
+void
+mha_backward_parallel(T trait,
+                      Param<typename T::DType> param) {
+    const int bidb = BlockIdxZ();
+    const int bidhq = BlockIdxY();
+    const int n_block = BlockIdxX();
+    const int bidhkv = bidhq / param.num_qh_per_kvh;
+    if (param.tail_n > 0 and n_block == param.n_block)
+        dq_dk_dv_1colblock<false, true>(trait, param, bidb, bidhq, bidhkv, param.n_block, param.tail_n);
+    else
+        dq_dk_dv_1colblock<true, true>(trait, param, bidb, bidhq, bidhkv, n_block);
 }
 
 template<class T>
@@ -1079,7 +1138,6 @@ void launch_mha_backward_headdim(ProblemShape problem_shape,
     } else {
         setup_bshd_stride(param);
     }
-
 #ifdef _BENCH_
     printf("Launching mha backward kernel with 50 times\n");
     int count = 50;
@@ -1111,7 +1169,8 @@ void launch_mha_backward_headdim(ProblemShape problem_shape,
 
     auto start1 = std::chrono::high_resolution_clock::now();
 #endif
-    auto dimGrid1 = compat::dim3(size(1), size(param.num_head_q), size(param.batch));
+    auto dimGrid1 = compat::dim3(size(ceil_div(SEQ_LEN_KV, kBlockN)),
+                                 size(param.num_head_q), size(param.batch));
     assert((param.num_head_q % param.num_head_kv == 0) && "num_head_q must be dividable by num_head_kv");
     assert((param.num_head_q >= param.num_head_kv) && "num_head_q must be bigger than or equal to num_head_kv");
     auto dimBlock1 = compat::dim3(size(kNSGs * trait.SubgroupSize), size(1), size(1));
@@ -1124,7 +1183,7 @@ void launch_mha_backward_headdim(ProblemShape problem_shape,
         sycl::ext::oneapi::experimental::sub_group_size<trait.SubgroupSize>};
     compat::experimental::launch_policy policy1{dimGrid1, dimBlock1, launch_props1, kernel_props1};
     auto event1 = compat::experimental::launch<
-        mha_backward<decltype(trait)>,
+        mha_backward_parallel<decltype(trait)>,
         mhabwdDeviceName<decltype(trait)>>(policy1,
                                            trait,
                                            param);
@@ -1474,4 +1533,5 @@ int main(int argc, char**argv) {
     compat::wait_and_throw();
     printf("dQ val: ");
     verify(dq_npy.data<T>(), dq_test.data(), BATCH * NUM_HEAD_Q, SEQ_LEN_QO, HEAD_SIZE_QK, atol, rtol);
+
 }
