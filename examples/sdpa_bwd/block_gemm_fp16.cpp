@@ -29,6 +29,7 @@
  *
  **************************************************************************************************/
 
+#include <random>
 #include <sycl/sycl.hpp>
 #include <cute/util/compat.hpp>
 
@@ -44,6 +45,16 @@
 #include "sdpa_util.hpp"
 
 using namespace cute;
+
+template<typename T>
+void
+random_init(int seed, T *dst, size_t N, int a = -1, int b = 1) {
+    std::mt19937 gen(seed);
+    std::uniform_real_distribution<float> dis(a, b);
+    for (int i = 0; i < N; ++i) {
+        dst[i] = static_cast<T>(dis(gen));
+    }
+}
 
 template<class T1, class T2>
 void print_t(T1 m, T2 g) {
@@ -680,15 +691,10 @@ int main(int argc, char** argv)
     std::vector<TA> h_A(m * k * l);
     std::vector<TB> h_B(n * k * l);
     std::vector<TC> test_gemm(m * n * l);
-    std::vector<TC> refe_torch(m * n * l);
     std::vector<TC> refe_gemm(m * n * l);
-    // for (int j = 0; j < m*k; ++j) h_A[j] = static_cast<TA>( (rand()%21) - 10 );
-    // for (int j = 0; j < n*k; ++j) h_B[j] = static_cast<TB>( (rand()%21) - 10 );
-    // for (int j = 0; j < m*n; ++j) h_C[j] = static_cast<TC>(-1);
-
-    read_file(h_A.data(), "A.bin", m * k * l);
-    read_file(h_B.data(), "B.bin", n * k * l);
-    read_file(refe_torch.data(), "C.bin", m * n * l);
+    int seed = 123;
+    random_init(seed + 1, h_A.data(), m * k * l);
+    random_init(seed + 2, h_B.data(), n * k * l);
 
     printf("A: ");
     for (int i = 0; i < 16; ++i) {
@@ -700,11 +706,6 @@ int main(int argc, char** argv)
         printf("%7.4f ", (float)h_B[i]);
     }
     printf("\n");
-    printf("C: ");
-    for (int i = 0; i < 16; ++i) {
-        printf("%7.4f ", (float)refe_torch[i]);
-    }
-    printf("\n");
 
     auto d_A = compat::malloc<TA>(m * k * l);
     auto d_B = compat::malloc<TB>(k * n * l);
@@ -713,7 +714,6 @@ int main(int argc, char** argv)
 
     compat::memcpy<TA>(d_A, h_A.data(), m * k * l);
     compat::memcpy<TB>(d_B, h_B.data(), k * n * l);
-    // compat::memcpy<TC>(d_C, h_C.data(), m*n);
 
     int ldA = 0, ldB = 0, ldC = m;
 
@@ -763,10 +763,7 @@ int main(int argc, char** argv)
 
     float atol = 1e-3;
     float rtol = 1e-3;
-    printf("verify data device with torch\n");
-    verify(refe_torch.data(), test_gemm.data(), l, m, n, atol, rtol);
-    printf("verify data host with torch\n");
-    verify(refe_torch.data(), refe_gemm.data(), l, m, n, atol, rtol);
+
     printf("verify data device with host\n");
     verify(refe_gemm.data(), test_gemm.data(), l, m, n, atol, rtol);
     double tflops = (2.0 * m * n * k * l) * 1e-12;

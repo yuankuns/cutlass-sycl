@@ -14,6 +14,10 @@ cutlass_example_add_executable(
   gemm_fp16.cpp
 )
 cutlass_example_add_executable(
+  block_gemm_fp16
+  block_gemm_fp16.cpp
+)
+cutlass_example_add_executable(
   gemm_bf16
   gemm_bf16.cpp
 )
