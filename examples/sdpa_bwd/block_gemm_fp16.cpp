@@ -67,6 +67,23 @@ void print_t(T1 m, T2 g) {
     print("\n");
 }
 
+template <class Engine0, class Layout0,
+          class Engine1, class Layout1,
+          class Engine2, class Layout2>
+CUTLASS_DEVICE void
+manual_atomic_add(Tensor <Engine0, Layout0>& m_tile,
+                  Tensor <Engine1, Layout1>& g_tile,
+                  Tensor <Engine2, Layout2>& r_tile) {
+    auto sg = compat::get_nd_item<1>().get_sub_group();
+    const int local_id = sg.get_local_id();
+    CUTLASS_PRAGMA_UNROLL
+    for (int ki = 0; ki < size(g_tile); ++ki) {
+        auto [m, n, l] = g_tile(ki);
+        cutlass::atomicAdd(&m_tile(m, n + local_id, 0), r_tile(ki));
+    }
+}
+
+
 template <class TA, class TB, class TC,
           class Alpha, class Beta>
 void verify_with_cutlass(
@@ -182,14 +199,13 @@ void verify_with_cutlass(
 template <class ProblemShape, class CtaTiler,
           class TA, class TiledCopyA,
           class TB, class TiledCopyB,
-          class TC, class TiledCopyC, class TiledMma,
-          class Alpha, class Beta>
+          class TC, class TiledCopyC,
+          class TiledMma, bool DirectCopy, bool AtomicAdd>
 void
 gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler, int stages,
             TA const* A, TiledCopyA,
             TB const* B, TiledCopyB,
-            TC      * C, TiledCopyC, TiledMma mma,
-            Alpha alpha, Beta beta)
+            TC      * C, TiledCopyC, TiledMma mma)
 {
     auto [M, N, K, L] = shape_MNK;
     auto [bM, bN, bK] = cta_tiler;
@@ -289,11 +305,11 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler, int stages,
     constexpr int barrier_scope = 2;
     int k_tile_count = ceil_div(get<2>(shape_MNK), get<2>(cta_tiler));
 
-    CUTLASS_PRAGMA_UNROLL
-    for (; prefetch_k < stages; prefetch_k++) {
-        prefetch(prefetch_a, pAgA(_, _, _, prefetch_k));
-        prefetch(prefetch_b, pBgB(_, _, _, prefetch_k));
-    }
+    // CUTLASS_PRAGMA_UNROLL
+    // for (; prefetch_k < stages; prefetch_k++) {
+    //     prefetch(prefetch_a, pAgA(_, _, _, prefetch_k));
+    //     prefetch(prefetch_b, pBgB(_, _, _, prefetch_k));
+    // }
 
     CUTLASS_PRAGMA_UNROLL
     for (int k_tile = 0; k_tile < k_tile_count; k_tile++, prefetch_k++) {
@@ -302,37 +318,34 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler, int stages,
         copy(copy_a, tAgA(_,_,_,k_tile), tArA);
         copy(copy_b, tBgB(_,_,_,k_tile), tBrB);
 
-        if (prefetch_k < k_tile_count) {
-            prefetch(prefetch_a, pAgA(_, _, _, prefetch_k));
-            prefetch(prefetch_b, pBgB(_, _, _, prefetch_k));
-        }
+        // if (prefetch_k < k_tile_count) {
+        //     prefetch(prefetch_a, pAgA(_, _, _, prefetch_k));
+        //     prefetch(prefetch_b, pBgB(_, _, _, prefetch_k));
+        // }
 
         cute::gemm(tiled_mma, tCrA, tCrB, tCrC);
         barrier_wait(barrier_scope);
 
     }
-    cutlass::NumericConverter<TC, float> converter;
-    auto tCrCl = make_tensor_like<TC>(tCrC);
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < size(tCrC); ++i) {
-        tCrCl(i) = converter(tCrC(i));
-    }
     //
     // Epilogue
     //
-    copy(copy_c, tCrCl, tCgC);
+    if constexpr(DirectCopy) {
+        copy(copy_c, tCrC, tCgC);
+    } else if constexpr(AtomicAdd) {
+        // static_assert(, "Only DirectCopy or AtomicAdd is supported in this example");
+    } else {
+        manual_atomic_add(mC, tCgC, tCrC);
+    }
 
 }
 
 // Setup params for a NT GEMM
-template <class TA, class TB, class TC,
-          class Alpha, class Beta>
+template <bool DirectCopy, bool AtomicAdd, class TA, class TB, class TC>
 void
 gemm_nt(int m, int n, int k, int l,
-        Alpha alpha,
         TA const* A, int ldA,
         TB const* B, int ldB,
-        Beta beta,
         TC      * C, int ldC)
 {
     using namespace cute;
@@ -360,7 +373,7 @@ gemm_nt(int m, int n, int k, int l,
                                       Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
                                       Layout<Shape<_16,_1>>{});              // Val layout  16x1
     // TiledCopy copyC = make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U32x8x16_ST_N, decltype(dC)>, TC>{},
-    TiledCopy copyC = make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U16x8x16_ST_N, StrideR>, TC>{},
+    TiledCopy copyC = make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U32x8x16_ST_N, StrideR>, TC>{},
                                       Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
                                       Layout<Shape<_8,_1>>{});              // Val layout  8x1
 
@@ -387,27 +400,23 @@ gemm_nt(int m, int n, int k, int l,
         gemm_device<decltype(prob_shape), decltype(cta_tiler),
                     TA, decltype(copyA),
                     TB, decltype(copyB),
-                    TC, decltype(copyC), decltype(mmaC),
-                    Alpha, Beta>>(policy, prob_shape, cta_tiler, bP,
-                                  A, copyA,
-                                  B, copyB,
-                                  C, copyC, mmaC,
-                                  alpha, beta);
+                    TC, decltype(copyC), decltype(mmaC), DirectCopy, AtomicAdd>>(
+                        policy, prob_shape, cta_tiler, bP,
+                        A, copyA,
+                        B, copyB,
+                        C, copyC, mmaC);
 
     EventManager::getInstance().addEvent(event);
 }
 
-template <class TA, class TB, class TC,
-          class Alpha, class Beta>
+template <bool DirectCopy, bool AtomicAdd, class TA, class TB, class TC>
 void
 gemm(char transA, char transB, int m, int n, int k, int l,
-     Alpha alpha,
      TA const* A, int ldA,
      TB const* B, int ldB,
-     Beta beta,
      TC      * C, int ldC)
 {
-    return gemm_nt(m, n, k, l, alpha, A, ldA, B, ldB, beta, C, ldC);
+    return gemm_nt<DirectCopy, AtomicAdd>(m, n, k, l, A, ldA, B, ldB, C, ldC);
 }
 
 
@@ -439,8 +448,8 @@ int main(int argc, char** argv)
 
     using TA = cute::half_t;
     using TB = cute::half_t;
-    using TC = cute::half_t;
-    using TI = cute::half_t;
+    using TC = float;
+    using TI = float;
 
     TI alpha = TI(1.0f);
     TI beta  = TI(0.0f);
@@ -453,7 +462,9 @@ int main(int argc, char** argv)
 
     std::vector<TA> h_A(m * k * l);
     std::vector<TB> h_B(n * k * l);
-    std::vector<TC> test_gemm(m * n * l);
+    std::vector<TC> test_gemm_direct(m * n * l);
+    std::vector<TC> test_gemm_atomic(m * n * l);
+    std::vector<TC> test_gemm_manual(m * n * l);
     std::vector<TC> refe_gemm(m * n * l);
     int seed = 123;
     random_init(seed + 1, h_A.data(), m * k * l);
@@ -472,8 +483,10 @@ int main(int argc, char** argv)
 
     auto d_A = compat::malloc<TA>(m * k * l);
     auto d_B = compat::malloc<TB>(k * n * l);
-    auto d_C = compat::malloc<TC>(m * n * l);
+    auto d_C = compat::malloc<TC>(m * n * l); // direct copy output
     auto d_D = compat::malloc<TC>(m * n * l);
+    auto d_E = compat::malloc<TC>(m * n * l); // atomic add output
+    auto d_F = compat::malloc<TC>(m * n * l); // manual atomic add output
 
     compat::memcpy<TA>(d_A, h_A.data(), m * k * l);
     compat::memcpy<TB>(d_B, h_B.data(), k * n * l);
@@ -498,14 +511,6 @@ int main(int argc, char** argv)
 
     ldC = n;
 
-    // Run once
-    gemm(transA, transB, m, n, k, l,
-         alpha,
-         d_A, ldA,
-         d_B, ldB,
-         beta,
-         d_C, ldC);
-    compat::wait_and_throw();
     verify_with_cutlass(
         d_A,
         d_B,
@@ -519,16 +524,43 @@ int main(int argc, char** argv)
         transA,
         transB
         );
+    // Run once
+    // direct
+    gemm<true, false>(transA, transB, m, n, k, l,
+                      d_A, ldA,
+                      d_B, ldB,
+                      d_C, ldC);
+    compat::wait_and_throw();
+
+    // XE_ATOMIC
+    gemm<false, true>(transA, transB, m, n, k, l,
+                      d_A, ldA,
+                      d_B, ldB,
+                      d_E, ldC);
+    compat::wait_and_throw();
+
+    // manual
+    gemm<false, false>(transA, transB, m, n, k, l,
+                      d_A, ldA,
+                      d_B, ldB,
+                      d_F, ldC);
+    compat::wait_and_throw();
 
     compat::memcpy<TC>(refe_gemm.data(), d_D, m * n * l);
-    compat::memcpy<TC>(test_gemm.data(), d_C, m * n * l);
+    compat::memcpy<TC>(test_gemm_direct.data(), d_C, m * n * l);
+    compat::memcpy<TC>(test_gemm_atomic.data(), d_E, m * n * l);
+    compat::memcpy<TC>(test_gemm_manual.data(), d_F, m * n * l);
     compat::wait_and_throw();
 
     float atol = 1e-3;
     float rtol = 1e-3;
 
-    printf("verify data device with host\n");
-    verify(refe_gemm.data(), test_gemm.data(), l, m, n, atol, rtol);
+    printf("verify direct copy\n");
+    verify(refe_gemm.data(), test_gemm_direct.data(), l, m, n, atol, rtol);
+    // printf("verify atomic add\n");
+    // verify(refe_gemm.data(), test_gemm_atomic.data(), l, m, n, atol, rtol);
+    printf("verify manual atomic add\n");
+    verify(refe_gemm.data(), test_gemm_manual.data(), l, m, n, atol, rtol);
     double tflops = (2.0 * m * n * k * l) * 1e-12;
 
     const int timing_iterations = 100;
