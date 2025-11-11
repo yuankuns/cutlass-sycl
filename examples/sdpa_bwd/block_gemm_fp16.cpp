@@ -191,14 +191,38 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler, int stages,
             TC      * C, CStride dC, TiledCopyC, TiledMma mma,
             Alpha alpha, Beta beta)
 {
-    auto A_shape = select<0,2,3>(shape_MNK);  // 4, 16, 32, 1
-    auto B_shape = select<1,2,3>(shape_MNK);
-    auto C_shape = select<0,1,3>(shape_MNK);
+    auto A_shape = make_shape(get<0>(cta_tiler),
+                              get<2>(shape_MNK),
+                              get<3>(shape_MNK));
+    auto B_shape = make_shape(get<1>(cta_tiler),
+                              get<2>(shape_MNK),
+                              get<3>(shape_MNK));
+    auto C_shape = make_shape(get<0>(cta_tiler),
+                              get<1>(cta_tiler),
+                              get<3>(shape_MNK));
+    auto A_stride = make_stride(get<0>(dA),
+                                get<1>(dA),
+                                _0{});
+    auto B_stride = make_stride(get<0>(dB),
+                                get<1>(dB),
+                                _0{});
+    auto C_stride = make_stride(get<0>(dC),
+                           get<1>(dC),
+                           _0{});
 
-    // Represent the full tensors
-    auto mA = make_tensor(make_gmem_ptr(A), make_layout(A_shape, dA));
-    auto mB = make_tensor(make_gmem_ptr(B), make_layout(B_shape, dB));
-    auto mC = make_tensor(make_gmem_ptr(C), make_layout(C_shape, dC));
+    // Get the appropriate blocks for this thread block
+    int m_coord = BlockIdxX();
+    int n_coord = BlockIdxY();
+    int l_coord = BlockIdxZ();
+
+    // only 1 a block * 1 b block
+    const int A_offset = 0;
+    const int B_offset = 0;
+    const int C_offset = 0;
+
+    auto mA = make_tensor(make_gmem_ptr(A + A_offset), make_layout(A_shape, A_stride));
+    auto mB = make_tensor(make_gmem_ptr(B + B_offset), make_layout(B_shape, B_stride));
+    auto mC = make_tensor(make_gmem_ptr(C + C_offset), make_layout(C_shape, C_stride));
 
     auto copy_a = TiledCopyA{mA};
     auto copy_b = TiledCopyB{mB};
@@ -208,15 +232,9 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler, int stages,
     Tensor mB_coord = cute::get_xe_tensor(B_shape);   //(n,k,l)
     Tensor mC_coord = cute::get_xe_tensor(C_shape);   //(m,n,l)
 
-    // Get the appropriate blocks for this thread block
-    int m_coord = BlockIdxX();
-    int n_coord = BlockIdxY();
-    int l_coord = BlockIdxZ();
-    auto cta_coord = make_coord(m_coord, n_coord, l_coord);  // (m,n,k)
-
-    Tensor gA = local_tile(mA_coord, select<0, 2>(cta_tiler), make_coord(m_coord, _, l_coord));  // (BLK_M,BLK_K,k)
-    Tensor gB = local_tile(mB_coord, select<1, 2>(cta_tiler), make_coord(n_coord, _, l_coord));  // (BLK_N,BLK_K,k)
-    Tensor gC = local_tile(mC_coord, select<0, 1>(cta_tiler), make_coord(m_coord, n_coord, l_coord));  // (BLK_M,BLK_N)
+    Tensor gA = local_tile(mA_coord, select<0, 2>(cta_tiler), make_coord(0, _, 0));  // (BLK_M,BLK_K,k)
+    Tensor gB = local_tile(mB_coord, select<1, 2>(cta_tiler), make_coord(0, _, 0));  // (BLK_N,BLK_K,k)
+    Tensor gC = local_tile(mC_coord, select<0, 1>(cta_tiler), make_coord(0, 0, 0));  // (BLK_M,BLK_N)
 
     //
     // Define A/B partitioning and C accumulators
@@ -267,52 +285,50 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler, int stages,
     auto thr_prefetch_A = prefetch_a.get_slice(thread_idx);
     auto thr_prefetch_B = prefetch_b.get_slice(thread_idx);
 
-    // Partition global tile for prefetch
-    auto pAgA = thr_prefetch_A.partition_S(gA);
-    auto pBgB = thr_prefetch_B.partition_S(gB);
-
-    int prefetch_k = 0;
 
     // Clear the accumulators
     Tensor tCrC = partition_fragment_C(tiled_mma, take<0,2>(cta_tiler));
     clear(tCrC);
+    // clean up C matrix in global memory
+    auto group = compat::get_nd_item<1>().get_group();
+    copy(copy_c, tCrC, tCgC);
+    sycl::group_barrier(group);
 
-    constexpr int barrier_scope = 2;
     int k_tile_count = ceil_div(get<2>(shape_MNK), get<2>(cta_tiler));
-
     CUTLASS_PRAGMA_UNROLL
-    for (; prefetch_k < stages; prefetch_k++) {
-        prefetch(prefetch_a, pAgA(_, _, _, prefetch_k));
-        prefetch(prefetch_b, pBgB(_, _, _, prefetch_k));
-    }
-
-    CUTLASS_PRAGMA_UNROLL
-    for (int k_tile = 0; k_tile < k_tile_count; k_tile++, prefetch_k++) {
+    for (int k_tile = 0; k_tile < k_tile_count; k_tile++) {
+        constexpr int barrier_scope = 2;
         barrier_arrive(barrier_scope);
         // Copy gmem to rmem for the first k_tile
         copy(copy_a, tAgA(_,_,_,k_tile), tArA);
         copy(copy_b, tBgB(_,_,_,k_tile), tBrB);
 
-        if (prefetch_k < k_tile_count) {
-            prefetch(prefetch_a, pAgA(_, _, _, prefetch_k));
-            prefetch(prefetch_b, pBgB(_, _, _, prefetch_k));
-        }
-
         cute::gemm(tiled_mma, tCrA, tCrB, tCrC);
         barrier_wait(barrier_scope);
 
     }
-    cutlass::NumericConverter<TC, float> converter;
-    auto tCrCl = make_tensor_like<TC>(tCrC);
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < size(tCrC); ++i) {
-        tCrCl(i) = converter(tCrC(i));
-    }
     //
     // Epilogue
     //
-    copy(copy_c, tCrCl, tCgC);
-
+    // correct
+    copy(copy_c, tCrC, tCgC);
+    // wrong if go with atomic_add
+    auto thr_layout_atom = Layout<Shape<Int<4>, Int<128>>>{};
+    auto val_layout_atom = Layout<Shape<_32, _1>>{};
+    auto tiled_atom = make_tiled_copy(Copy_Atom<XE_ATOMIC<TC>, TC>{},
+                                      thr_layout_atom,
+                                      val_layout_atom);
+    auto thr_atom_save = tiled_atom.get_thread_slice(ThreadIdxX());
+    Tensor thr_tile_atom_D = thr_atom_save.partition_D(mC);
+    auto tensor_frag = thr_atom_save.retile_S(tCrC);
+    if (cute::thread(0, 0)) {
+        print("tensor_frag: ");
+        print(tensor_frag);
+        print(" thr_tile_atom_D: ");
+        print(thr_tile_atom_D);
+        print("\n");
+    }
+    copy(tiled_atom, tensor_frag, thr_tile_atom_D(_, _, _, 0));
 }
 
 // Setup params for a NT GEMM
@@ -356,7 +372,7 @@ gemm_nt(int m, int n, int k, int l,
                                       Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
                                       Layout<Shape<_16,_1>>{});              // Val layout  16x1
     // TiledCopy copyC = make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U32x8x16_ST_N, decltype(dC)>, TC>{},
-    TiledCopy copyC = make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U16x8x16_ST_N, decltype(dC)>, TC>{},
+    TiledCopy copyC = make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U32x8x16_ST_N, decltype(dC)>, TC>{},
                                       Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
                                       Layout<Shape<_8,_1>>{});              // Val layout  8x1
 
@@ -393,237 +409,6 @@ gemm_nt(int m, int n, int k, int l,
     EventManager::getInstance().addEvent(event);
 }
 
-// Setup params for a NT GEMM
-template <class TA, class TB, class TC,
-          class Alpha, class Beta>
-void
-gemm_tn(int m, int n, int k, int l,
-        Alpha alpha,
-        TA const* A, int ldA,
-        TB const* B, int ldB,
-        Beta beta,
-        TC      * C, int ldC)
-{
-    using namespace cute;
-
-    // Define shapes (dynamic)
-    auto M = int(m);
-    auto N = int(n);
-    auto K = int(k);
-    auto L = int(l);
-    auto prob_shape = make_shape(M, N, K, L);                     // (M, N, K, L)
-
-    // Define TN strides (mixed)
-    auto dA = make_stride(Int<1>{}, M, M * K);                      // (dM, dK)
-    auto dB = make_stride(Int<1>{}, N, N * K);                      // (dN, dK)
-    auto dC = make_stride(N, Int<1>{}, M * N);                      // (dM, dN)
-
-    // Define CTA tile sizes (static)
-    auto bM = Int<256>{};
-    auto bN = Int<256>{};
-    auto bK = Int< 32>{};
-    auto cta_tiler = make_shape(bM, bN, bK);                   // (BLK_M, BLK_N, BLK_K)
-    auto bP = Int<2>{};  // Pipeline
-
-    // Define the thread layouts (static)
-    TiledCopy copyA = make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U16x16x16_LD_T, decltype(dA)>, TA>{},
-                                      Layout<Shape<_1,_16>>{}, // Thr layout 1x16 k-major
-                                      Layout<Shape<_16,_1>>{});              // Val layout  32x2
-    TiledCopy copyB = make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U16x32x32_LD_N, decltype(dB)>, TB>{},
-                                      Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
-                                      Layout<Shape<_32,_2>>{});              // Val layout  16x1
-    // TiledCopy copyC = make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U32x8x16_ST_N, decltype(dC)>, TC>{},
-    TiledCopy copyC = make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U16x8x16_ST_N, decltype(dC)>, TC>{},
-                                      Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
-                                      Layout<Shape<_8,_1>>{});              // Val layout  8x1
-
-    TiledMMA mmaC = TiledMMAHelper<MMA_Atom<XE_8x16x16_F32F16F16F32_TT>, Layout<decltype(cta_tiler)>,
-                                   Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>>::TiledMMA{};  // 256x128x16 TiledMMA
-
-    auto dimBlock = compat::dim3(size(mmaC));
-    auto dimGrid  = compat::dim3(size(ceil_div(M, bM)), size(ceil_div(N, bN)), size(L));
-
-    constexpr int SubgroupSize = 16;
-    constexpr int smem_size = 0;
-    auto kernel_props = [] {
-        return compat::experimental::kernel_properties{
-            sycl::ext::oneapi::experimental::sub_group_size<SubgroupSize>
-        };
-    }();
-    compat::experimental::launch_properties launch_props {
-        sycl::ext::oneapi::experimental::work_group_scratch_size(smem_size),
-    };
-    compat::experimental::launch_policy policy{
-        dimGrid, dimBlock, launch_props, kernel_props
-    };
-    auto event = compat::experimental::launch<
-        gemm_device<decltype(prob_shape), decltype(cta_tiler),
-                    TA, decltype(dA), decltype(copyA),
-                    TB, decltype(dB), decltype(copyB),
-                    TC, decltype(dC), decltype(copyC), decltype(mmaC),
-                    Alpha, Beta>>(policy, prob_shape, cta_tiler, bP,
-                                  A, dA, copyA,
-                                  B, dB, copyB,
-                                  C, dC, copyC, mmaC,
-                                  alpha, beta);
-    EventManager::getInstance().addEvent(event);
-}
-
-template <class TA, class TB, class TC,
-          class Alpha, class Beta>
-void
-gemm_tt(int m, int n, int k, int l,
-        Alpha alpha,
-        TA const* A, int ldA,
-        TB const* B, int ldB,
-        Beta beta,
-        TC      * C, int ldC)
-{
-    using namespace cute;
-
-    // Define shapes (dynamic)
-    auto M = int(m);
-    auto N = int(n);
-    auto K = int(k);
-    auto L = int(l);
-    auto prob_shape = make_shape(M, N, K, L);                     // (M, N, K, L)
-
-    // Define NT strides (mixed)
-    auto dA = make_stride(Int<1>{}, M, M * K);                      // (dM, dK)
-    auto dB = make_stride(K, Int<1>{}, N * K);                      // (dN, dK)
-    auto dC = make_stride(N, Int<1>{}, M * N);                      // (dM, dN)
-
-    // Define CTA tile sizes (static)
-    auto bM = Int<256>{};
-    auto bN = Int<256>{};
-    auto bK = Int< 32>{};
-    auto cta_tiler = make_shape(bM, bN, bK);                   // (BLK_M, BLK_N, BLK_K)
-    auto bP = Int<2>{};  // Pipeline
-
-    // Define the thread layouts (static)
-
-    TiledCopy copyA = make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U16x16x16_LD_T, decltype(dA)>, TA>{},
-                                      Layout<Shape<_1,_16>>{}, // Thr layout 1x16 k-major
-                                      Layout<Shape<_16,_1>>{});              // Val layout  32x2
-    TiledCopy copyB = make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U16x16x16_LD_T, decltype(dB)>, TB>{},
-                                      Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
-                                      Layout<Shape<_16,_1>>{});              // Val layout  32x2
-    // TiledCopy copyC = make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U32x8x16_ST_N, decltype(dC)>, TC>{},
-    TiledCopy copyC = make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U16x8x16_ST_N, decltype(dC)>, TC>{},
-                                      Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
-                                      Layout<Shape<_8,_1>>{});              // Val layout  8x1
-
-    TiledMMA mmaC = TiledMMAHelper<MMA_Atom<XE_8x16x16_F32F16F16F32_TT>, Layout<decltype(cta_tiler)>,
-                                   Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>>::TiledMMA{};
-
-    auto dimBlock = compat::dim3(size(mmaC));
-    auto dimGrid  = compat::dim3(size(ceil_div(M, bM)), size(ceil_div(N, bN)), size(L));
-
-    // Cutlass only support simd_16
-    constexpr int SubgroupSize = 16;
-    constexpr int smem_size = 0;
-    auto kernel_props = [] {
-        return compat::experimental::kernel_properties{
-            sycl::ext::oneapi::experimental::sub_group_size<SubgroupSize>
-        };
-    }();
-    compat::experimental::launch_properties launch_props {
-        sycl::ext::oneapi::experimental::work_group_scratch_size(smem_size),
-    };
-    compat::experimental::launch_policy policy{
-        dimGrid, dimBlock, launch_props, kernel_props
-    };
-    auto event = compat::experimental::launch<
-        gemm_device<decltype(prob_shape), decltype(cta_tiler),
-                    TA, decltype(dA), decltype(copyA),
-                    TB, decltype(dB), decltype(copyB),
-                    TC, decltype(dC), decltype(copyC), decltype(mmaC),
-                    Alpha, Beta>>(policy, prob_shape, cta_tiler, bP,
-                                  A, dA, copyA,
-                                  B, dB, copyB,
-                                  C, dC, copyC, mmaC,
-                                  alpha, beta);
-
-    EventManager::getInstance().addEvent(event);
-}
-
-template <class TA, class TB, class TC,
-          class Alpha, class Beta>
-void
-gemm_nn(int m, int n, int k, int l,
-        Alpha alpha,
-        TA const* A, int ldA,
-        TB const* B, int ldB,
-        Beta beta,
-        TC      * C, int ldC)
-{
-    using namespace cute;
-
-    // Define shapes (dynamic)
-    auto M = int(m);
-    auto N = int(n);
-    auto K = int(k);
-    auto L = int(l);
-    auto prob_shape = make_shape(M, N, K, L);                     // (M, N, K, L)
-
-    // Define NN strides (mixed)
-    auto dA = make_stride(K, Int<1>{}, M * K);                      // (dM, dK)
-    auto dB = make_stride(Int<1>{}, N, N * K);                      // (dN, dK)
-    auto dC = make_stride(N, Int<1>{}, M * N);                      // (dM, dN)
-
-    // Define CTA tile sizes (static)
-    auto bM = Int<256>{};
-    auto bN = Int<256>{};
-    auto bK = Int< 32>{};
-    auto cta_tiler = make_shape(bM, bN, bK);                   // (BLK_M, BLK_N, BLK_K)
-    auto bP = Int<2>{};  // Pipeline
-
-    // Define the thread layouts (static)
-
-    TiledCopy copyA = make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U16x32x32_LD_N, decltype(dA)>, TA>{},
-                                      Layout<Shape<_1,_16>>{}, // Thr layout 1x16 k-major
-                                      Layout<Shape<_32,_2>>{});              // Val layout  32x2
-    TiledCopy copyB = make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U16x32x32_LD_N, decltype(dB)>, TB>{},
-                                      Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
-                                      Layout<Shape<_32,_2>>{});              // Val layout  32x2
-    // TiledCopy copyC = make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U32x8x16_ST_N, decltype(dC)>, TC>{},
-    TiledCopy copyC = make_tiled_copy(Copy_Atom<Copy_Traits<XE_2D_U16x8x16_ST_N, decltype(dC)>, TC>{},
-                                      Layout<Shape<_1,_16>>{}, // Thr layout 1x16 n-major
-                                      Layout<Shape<_8,_1>>{});              // Val layout  8x1
-
-    TiledMMA mmaC = TiledMMAHelper<MMA_Atom<XE_8x16x16_F32F16F16F32_TT>, Layout<decltype(cta_tiler)>,
-                                   Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>>::TiledMMA{};
-
-    auto dimBlock = compat::dim3(size(mmaC));
-    auto dimGrid  = compat::dim3(size(ceil_div(M, bM)), size(ceil_div(N, bN)), size(L));
-
-    // Cutlass only support simd_16
-    constexpr int SubgroupSize = 16;
-    constexpr int smem_size = 0;
-    auto kernel_props = [] {
-        return compat::experimental::kernel_properties{
-            sycl::ext::oneapi::experimental::sub_group_size<SubgroupSize>
-        };
-    }();
-    compat::experimental::launch_properties launch_props {
-        sycl::ext::oneapi::experimental::work_group_scratch_size(smem_size),
-    };
-    compat::experimental::launch_policy policy{
-        dimGrid, dimBlock, launch_props, kernel_props
-    };
-    auto event = compat::experimental::launch<
-        gemm_device<decltype(prob_shape), decltype(cta_tiler),
-                    TA, decltype(dA), decltype(copyA),
-                    TB, decltype(dB), decltype(copyB),
-                    TC, decltype(dC), decltype(copyC), decltype(mmaC),
-                    Alpha, Beta>>(policy, prob_shape, cta_tiler, bP,
-                                  A, dA, copyA,
-                                  B, dB, copyB,
-                                  C, dC, copyC, mmaC,
-                                  alpha, beta);
-
-    EventManager::getInstance().addEvent(event);
-}
 
 template <class TA, class TB, class TC,
           class Alpha, class Beta>
@@ -635,16 +420,7 @@ gemm(char transA, char transB, int m, int n, int k, int l,
      Beta beta,
      TC      * C, int ldC)
 {
-    if (transA == 'N' && transB == 'T') {
-        return gemm_nt(m, n, k, l, alpha, A, ldA, B, ldB, beta, C, ldC);
-    } else if (transA == 'T' && transB == 'N') {
-        return gemm_tn(m, n, k, l, alpha, A, ldA, B, ldB, beta, C, ldC);
-    } else if (transA == 'T' && transB == 'T') {
-        return gemm_tt(m, n, k, l, alpha, A, ldA, B, ldB, beta, C, ldC);
-    } else if (transA == 'N' && transB == 'N') {
-        return gemm_nn(m, n, k, l, alpha, A, ldA, B, ldB, beta, C, ldC);
-    }
-    assert(false && "Not implemented");
+    return gemm_nt(m, n, k, l, alpha, A, ldA, B, ldB, beta, C, ldC);
 }
 
 
@@ -676,8 +452,8 @@ int main(int argc, char** argv)
 
     using TA = cute::half_t;
     using TB = cute::half_t;
-    using TC = cute::half_t;
-    using TI = cute::half_t;
+    using TC = float;
+    using TI = float;
 
     TI alpha = TI(1.0f);
     TI beta  = TI(0.0f);
