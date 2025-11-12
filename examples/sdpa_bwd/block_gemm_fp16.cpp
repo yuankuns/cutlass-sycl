@@ -42,7 +42,6 @@
 #include "cutlass/util/reference/device/gemm_complex.h"
 #include "cutlass/kernel_hardware_info.h"
 #include "cutlass/util/reference/device/tensor_compare.h"
-#include "sdpa_util.hpp"
 
 using namespace cute;
 
@@ -67,6 +66,47 @@ void print_t(T1 m, T2 g) {
     print("\n");
 }
 
+bool isclose(float a, float b, float atol, float rtol) {
+    return std::abs(a - b) <= atol + rtol * std::abs(b);
+}
+
+template<typename T, typename V>
+bool allclose(T *refe, V *test, int L, int M, int N, float atol, float rtol) {
+    size_t err = 0;
+    size_t count = L * M * N;
+    bool flag = true;
+    for (int l = 0; l < L; ++l) {
+        for (int m = 0; m < M; ++m) {
+            for (int n = 0; n < N; ++n) {
+                float expect = (float)refe[l * M * N + m * N + n];
+                float value = (float)test[l * M * N + m * N + n];
+                if (not isclose(expect, value, atol, rtol)) {
+                    printf("(%d, %d, %d) expect: %f value: %f ratio %f\n", l, m, n, expect, value, value / expect);
+                    err++;
+                }
+                if (err > 20)
+                    return false;
+                if (isnan(value) or isinf(value)) {
+                    printf("\x1B[31m %f detected \x1B[0m at (%d, %d, %d)\n", value, l, m, n);
+                    exit(1);
+                }
+            }
+        }
+    }
+    float ratio = static_cast<float>(count - err) / static_cast<float>(count);
+    // printf("c=%f (%ld)\n", ratio, err);
+    // printf("CHECK SUM SUCCESS\n");
+    return ratio > 0.99f;
+}
+
+static constexpr char strSUCCESS[] = "\x1B[32mPASS\x1B[0m";
+static constexpr char strFAILURE[] = "\x1B[31mFAIL\x1B[0m";
+template<typename T, typename V>
+void verify(T *refe, V *test, int l, int m, int n, float atol, float rtol) {
+    bool close = allclose(refe, test, l, m, n, atol, rtol);
+    printf("allclose %s\n", close ? strSUCCESS : strFAILURE);
+}
+
 template <class Engine0, class Layout0,
           class Engine1, class Layout1,
           class Engine2, class Layout2>
@@ -82,7 +122,6 @@ manual_atomic_add(Tensor <Engine0, Layout0>& m_tile,
         cutlass::atomicAdd(&m_tile(m, n + local_id, 0), r_tile(ki));
     }
 }
-
 
 template <class TA, class TB, class TC,
           class Alpha, class Beta>
@@ -209,9 +248,9 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler, int stages,
 {
     auto [M, N, K, L] = shape_MNK;
     auto [bM, bN, bK] = cta_tiler;
-    auto A_shape = make_shape(bM, K, L);
-    auto B_shape = make_shape(bN, K, L);
-    auto C_shape = make_shape(bM, bN, L);
+    auto A_shape = make_shape(bM, K, 1);
+    auto B_shape = make_shape(bN, K, 1);
+    auto C_shape = make_shape(bM, bN, 1);
 
     auto dA = make_stride(K, _1{}, _0{});
     auto dB = make_stride(K, _1{}, _0{});
@@ -333,7 +372,16 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler, int stages,
     if constexpr(DirectCopy) {
         copy(copy_c, tCrC, tCgC);
     } else if constexpr(AtomicAdd) {
-        // static_assert(, "Only DirectCopy or AtomicAdd is supported in this example");
+        auto thr_layout_atom = Layout<Shape<_4, _128>>{};
+        auto val_layout_atom = Layout<Shape<_16, _1>>{};
+        auto tiled_atom = make_tiled_copy(
+            Copy_Atom<XE_ATOMIC<TC>, TC>{},
+            thr_layout_atom,
+            val_layout_atom);
+        auto thr_atom_add = tiled_atom.get_thread_slice(ThreadIdxX());
+        Tensor thr_tile_atom_D = thr_atom_add.partition_D(mC(_, _, 0));
+        auto tensor_frag = thr_atom_add.retile_S(tCrC);
+        copy(tiled_atom, tensor_frag, thr_tile_atom_D);
     } else {
         manual_atomic_add(mC, tCgC, tCrC);
     }
@@ -557,8 +605,8 @@ int main(int argc, char** argv)
 
     printf("verify direct copy\n");
     verify(refe_gemm.data(), test_gemm_direct.data(), l, m, n, atol, rtol);
-    // printf("verify atomic add\n");
-    // verify(refe_gemm.data(), test_gemm_atomic.data(), l, m, n, atol, rtol);
+    printf("verify atomic add\n");
+    verify(refe_gemm.data(), test_gemm_atomic.data(), l, m, n, atol, rtol);
     printf("verify manual atomic add\n");
     verify(refe_gemm.data(), test_gemm_manual.data(), l, m, n, atol, rtol);
     double tflops = (2.0 * m * n * k * l) * 1e-12;
