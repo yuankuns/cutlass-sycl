@@ -235,11 +235,17 @@ void verify_with_cutlass(
 }
 
 
+enum class CopyType {
+    DirectCopy = 0,
+    AtomicAdd = 1,
+    ManualAtomicAdd = 2,
+};
+
 template <class ProblemShape, class CtaTiler,
           class TA, class TiledCopyA,
           class TB, class TiledCopyB,
           class TC, class TiledCopyC,
-          class TiledMma, bool DirectCopy, bool AtomicAdd>
+          class TiledMma, CopyType copy_type>
 void
 gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler, int stages,
             TA const* A, TiledCopyA,
@@ -340,6 +346,14 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler, int stages,
     // Clear the accumulators
     Tensor tCrC = partition_fragment_C(tiled_mma, take<0,2>(cta_tiler));
     clear(tCrC);
+    /*
+      * clear memory beforehand, otherwise
+      * out of boundry writes may occur in atomic add,
+      * ajdacent buffer of manual atomic add will be overwritten here,
+      * might be a bug
+      */
+    copy(copy_c, tCrC, tCgC);
+    sycl::group_barrier(compat::get_nd_item<1>().get_group());
 
     constexpr int barrier_scope = 2;
     int k_tile_count = ceil_div(get<2>(shape_MNK), get<2>(cta_tiler));
@@ -369,10 +383,11 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler, int stages,
     //
     // Epilogue
     //
-    if constexpr(DirectCopy) {
+    if constexpr(copy_type == CopyType::DirectCopy) {
         copy(copy_c, tCrC, tCgC);
-    } else if constexpr(AtomicAdd) {
-        auto thr_layout_atom = Layout<Shape<_4, _128>>{};
+    }
+    if constexpr(copy_type == CopyType::AtomicAdd) {
+        auto thr_layout_atom = Layout<Shape<_8, _64>>{};
         auto val_layout_atom = Layout<Shape<_16, _1>>{};
         auto tiled_atom = make_tiled_copy(
             Copy_Atom<XE_ATOMIC<TC>, TC>{},
@@ -382,14 +397,15 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler, int stages,
         Tensor thr_tile_atom_D = thr_atom_add.partition_D(mC(_, _, 0));
         auto tensor_frag = thr_atom_add.retile_S(tCrC);
         copy(tiled_atom, tensor_frag, thr_tile_atom_D);
-    } else {
+    }
+    if constexpr(copy_type == CopyType::ManualAtomicAdd) {
         manual_atomic_add(mC, tCgC, tCrC);
     }
 
 }
 
 // Setup params for a NT GEMM
-template <bool DirectCopy, bool AtomicAdd, class TA, class TB, class TC>
+template <CopyType copy_type, class TA, class TB, class TC>
 void
 gemm_nt(int m, int n, int k, int l,
         TA const* A, int ldA,
@@ -448,7 +464,7 @@ gemm_nt(int m, int n, int k, int l,
         gemm_device<decltype(prob_shape), decltype(cta_tiler),
                     TA, decltype(copyA),
                     TB, decltype(copyB),
-                    TC, decltype(copyC), decltype(mmaC), DirectCopy, AtomicAdd>>(
+                    TC, decltype(copyC), decltype(mmaC), copy_type>>(
                         policy, prob_shape, cta_tiler, bP,
                         A, copyA,
                         B, copyB,
@@ -457,14 +473,14 @@ gemm_nt(int m, int n, int k, int l,
     EventManager::getInstance().addEvent(event);
 }
 
-template <bool DirectCopy, bool AtomicAdd, class TA, class TB, class TC>
+template <CopyType copy_type, class TA, class TB, class TC>
 void
 gemm(char transA, char transB, int m, int n, int k, int l,
      TA const* A, int ldA,
      TB const* B, int ldB,
      TC      * C, int ldC)
 {
-    return gemm_nt<DirectCopy, AtomicAdd>(m, n, k, l, A, ldA, B, ldB, C, ldC);
+    return gemm_nt<copy_type>(m, n, k, l, A, ldA, B, ldB, C, ldC);
 }
 
 
@@ -574,24 +590,24 @@ int main(int argc, char** argv)
         );
     // Run once
     // direct
-    gemm<true, false>(transA, transB, m, n, k, l,
-                      d_A, ldA,
-                      d_B, ldB,
-                      d_C, ldC);
+    gemm<CopyType::DirectCopy>(transA, transB, m, n, k, l,
+                               d_A, ldA,
+                               d_B, ldB,
+                               d_C, ldC);
     compat::wait_and_throw();
 
     // XE_ATOMIC
-    gemm<false, true>(transA, transB, m, n, k, l,
-                      d_A, ldA,
-                      d_B, ldB,
-                      d_E, ldC);
+    gemm<CopyType::AtomicAdd>(transA, transB, m, n, k, l,
+                              d_A, ldA,
+                              d_B, ldB,
+                              d_E, ldC);
     compat::wait_and_throw();
 
     // manual
-    gemm<false, false>(transA, transB, m, n, k, l,
-                      d_A, ldA,
-                      d_B, ldB,
-                      d_F, ldC);
+    gemm<CopyType::ManualAtomicAdd>(transA, transB, m, n, k, l,
+                                    d_A, ldA,
+                                    d_B, ldB,
+                                    d_F, ldC);
     compat::wait_and_throw();
 
     compat::memcpy<TC>(refe_gemm.data(), d_D, m * n * l);
