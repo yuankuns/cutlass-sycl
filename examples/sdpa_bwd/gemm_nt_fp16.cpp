@@ -8,14 +8,20 @@
 #include "cutlass/util/print_error.hpp"
 #include "cutlass/util/sycl_event_manager.hpp"
 #include "cutlass/util/GPU_Clock.hpp"
-#include "cnpy.h"
-#include "sdpa_util.hpp"
 #include "params.hpp"
 
+template<typename T>
+void
+random_init(int seed, T *dst, size_t N, int a = -1, int b = 1) {
+    std::mt19937 gen(seed);
+    std::uniform_real_distribution<float> dis(a, b);
+    for (int i = 0; i < N; ++i) {
+        dst[i] = static_cast<T>(dis(gen));
+    }
+}
 
-void read_args(int argc, char**argv, int n, int64_t *p) {
-    if (argc >= n + 1)
-        sscanf(argv[n], "%ld", p);
+bool isclose(float a, float b, float atol, float rtol) {
+    return std::abs(a - b) <= atol + rtol * std::abs(b);
 }
 
 void
@@ -25,6 +31,145 @@ debug_info() {
           GridDimX(), GridDimY(), GridDimZ(),
           ThreadIdxX(), ThreadIdxY(), ThreadIdxZ(),
           BlockDimX(), BlockDimY(), BlockDimZ());
+}
+
+template<typename T, typename V>
+bool allclose(T *refe, V *test, int L, int M, int M_PAD, int N, int N_PAD, float atol, float rtol) {
+    size_t err = 0;
+    size_t count = L * M * N;
+    bool flag = true;
+    for (int l = 0; l < L; ++l) {
+        for (int m = 0; m < M; ++m) {
+            for (int n = 0; n < N; ++n) {
+                int i = l * M * N + m * N + n;
+                int j = l * M_PAD * N_PAD + m * N_PAD + n;
+                float expect = (float)refe[i];
+                float value = (float)test[j];
+                if (not isclose(expect, value, atol, rtol)) {
+                    printf("(%d, %d, %d) expect: %f value: %f ratio %f\n", l, m, n, expect, value, value / expect);
+                    err++;
+                }
+                if (isnan(value) or isinf(value)) {
+                    printf("\x1B[31m %f detected \x1B[0m at (%d, %d, %d)\n", value, l, m, n);
+                    exit(1);
+                }
+            }
+        }
+    }
+    float ratio = static_cast<float>(count - err) / static_cast<float>(count);
+    return ratio > 0.99f;
+}
+
+static constexpr char strSUCCESS[] = "\x1B[32mPASS\x1B[0m";
+static constexpr char strFAILURE[] = "\x1B[31mFAIL\x1B[0m";
+template<typename T, typename V>
+void verify(T *refe, V *test, int l, int m, int m_pad, int n, int n_pad, float atol, float rtol) {
+    bool close = allclose(refe, test, l, m, m_pad, n, n_pad, atol, rtol);
+    printf("allclose %s \n", close ? strSUCCESS : strFAILURE);
+}
+
+template <class TA, class TB, class TC,
+          class Alpha, class Beta>
+void verify_with_cutlass(
+    TA const* d_A,
+    TB const* d_B,
+    TC* ref_d_C,
+    int m,
+    int n,
+    int k,
+    int l,
+    Alpha alpha,
+    Beta beta,
+    char transA,
+    char transB
+    ) {
+    cutlass::TensorRef ref_A_T(d_A, cutlass::layout::ColumnMajor::packed({m, k}));
+    cutlass::TensorRef ref_A_N(d_A, cutlass::layout::RowMajor::packed({m, k}));
+
+    cutlass::TensorRef ref_B_T(d_B, cutlass::layout::ColumnMajor::packed({k, n}));
+    cutlass::TensorRef ref_B_N(d_B, cutlass::layout::RowMajor::packed({k, n}));
+
+    cutlass::TensorRef ref_C(ref_d_C, cutlass::layout::RowMajor::packed({m, n}));
+    cutlass::TensorRef ref_D(ref_d_C, cutlass::layout::RowMajor::packed({m, n}));
+
+    if (transA == 'T' && transB == 'N') {
+        cutlass::reference::device::GemmComplex(
+            {m, n, k},
+            alpha,
+            ref_A_T,
+            cutlass::ComplexTransform::kNone,
+            ref_B_N,
+            cutlass::ComplexTransform::kNone,
+            beta,
+            ref_C,
+            ref_D,
+            float(0),  // accumulator
+            l,     // batch_count
+            m * k, // batch_stride_A
+            k * n, // batch_stride_B
+            m * n, // batch_stride_C
+            m * n  // batch_stride_D
+            );
+    } else if (transA == 'T' && transB == 'T') {
+        cutlass::reference::device::GemmComplex(
+            {m, n, k},
+            alpha,
+            ref_A_T,
+            cutlass::ComplexTransform::kNone,
+            ref_B_T,
+            cutlass::ComplexTransform::kNone,
+            beta,
+            ref_C,
+            ref_D,
+            float(0),  // accumulator
+            l,     // batch_count
+            m * k, // batch_stride_A
+            k * n, // batch_stride_B
+            m * n, // batch_stride_C
+            m * n  // batch_stride_D
+            );
+    } else if (transA == 'N' && transB == 'T') {
+        cutlass::reference::device::GemmComplex(
+            {m, n, k},
+            alpha,
+            ref_A_N,
+            cutlass::ComplexTransform::kNone,
+            ref_B_T,
+            cutlass::ComplexTransform::kNone,
+            beta,
+            ref_C,
+            ref_D,
+            float(0),  // accumulator
+            l,     // batch_count
+            m * k, // batch_stride_A
+            k * n, // batch_stride_B
+            m * n, // batch_stride_C
+            m * n  // batch_stride_D
+            );
+    } else if (transA == 'N' && transB == 'N') {
+        cutlass::reference::device::GemmComplex(
+            {m, n, k},
+            alpha,
+            ref_A_N,
+            cutlass::ComplexTransform::kNone,
+            ref_B_N,
+            cutlass::ComplexTransform::kNone,
+            beta,
+            ref_C,
+            ref_D,
+            float(0),  // accumulator
+            l,     // batch_count
+            m * k, // batch_stride_A
+            k * n, // batch_stride_B
+            m * n, // batch_stride_C
+            m * n  // batch_stride_D
+            );
+    } else {
+        assert(false && "Not implemented");
+    }
+
+
+    compat::wait();
 }
 
 template<class T>
@@ -49,85 +194,9 @@ void print_t(T1 m, T2 g) {
     print("\n");
 }
 
-template<class T>
-void print_t_2d(T t) {
-    static_assert(rank(t) == 2, "Only support 2D Tensor");
-    print(t);
-    for (int i = 0; i <  size < 0>(t); ++i) {
-        print("\n(%03d): ", i);
-        for (int j = 0; j < size<1>(t); ++j) {
-            print("%10.7f ", (float)t(i,j));
-        }
-    }
-    print("\n");
-}
-
-template<class T>
-void print_d(T t) {
-    print(t);
-    for (int i = 0; i < size(t); ++i) {
-        if (i % 8 == 0)
-            print("\n(%03d): ", i / 8);
-        print("%10u ", t(i));
-    }
-    print("\n");
-}
-
-template<class T>
-void print_c(T t) {
-    print(t);
-    for (int i = 0; i < size(t); ++i) {
-        if (i % 8 == 0)
-            print("\n(%03d): ", i / 8);
-        print(t(i));
-    }
-    print("\n");
-}
 
 using ProblemShapeRegular = cute::tuple<int, int, int, int, int, int, int>; // batch, num_head_q,num_head_kv,seq_len_qo,seq_len_kv,head_size_qk,head_size_vo
 
-template <typename Layout>
-auto convert_layout_2d_layout(Layout layout) {
-    auto l = make_layout(make_layout(get<0>(layout),
-                                     get<1>(layout)),
-                         get<2>(layout));
-    return l;
-}
-
-constexpr int tid = 17;
-constexpr int bid = 0;
-
-template<typename Tensor0, typename Tensor1, typename Tensor2,
-         typename Tensor3, typename Tensor4,
-         typename Tensor5, typename Tensor6,
-         typename Tensor7, typename Tensor8,
-         typename TiledMma, typename TileMNK,
-         typename TiledCopyA, typename TiledCopyB>
-CUTLASS_DEVICE void
-gemm_ker(Tensor0 &tCrCmn, Tensor1 &tCrA, Tensor2 &tCrB,
-         Tensor3 &tAgAmk, Tensor4 &tArA, Tensor5 &gA,
-         Tensor6 &tBgBnk, Tensor7 &tBrB, Tensor8 &gB,
-         TiledMma &tiled_mma, TileMNK &tile_mnk,
-         TiledCopyA &copy_a, TiledCopyB &copy_b) {
-    constexpr int barrier_scope = 2;
-    CUTLASS_PRAGMA_UNROLL
-    for (int m = 0; m < size<3>(tAgAmk); ++m) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int n = 0; n <  size<3>(tBgBnk); ++n) {
-            auto tCrC = tCrCmn(_, _, _, m, n);
-            auto tAgA = tAgAmk(_, _, _, m, _);
-            auto tBgB = tBgBnk(_, _, _, n, _);
-            CUTLASS_PRAGMA_UNROLL
-            for (int k = 0; k < size<3>(tAgA); ++k) {
-                barrier_arrive(barrier_scope);
-                cute::copy(copy_a, tAgA(_, _, _, k), tArA);
-                cute::copy(copy_b, tBgB(_, _, _, k), tBrB);
-                cute::gemm(tiled_mma, tCrA, tCrB, tCrC);
-                barrier_wait(barrier_scope);
-            }
-        }
-    }
-}
 
 template<typename Tensor0, typename Tensor1, typename Tensor2,
          typename Tensor3, typename Tensor4,
@@ -151,32 +220,6 @@ gemm_ker(Tensor0 &tCrC, Tensor1 &tCrA, Tensor2 &tCrB,
     }
 }
 
-
-template <bool Is_even_MN, class TileCopy,
-          class Engine0, class Layout0,
-          class Engine1, class Layout1>
-CUTLASS_DEVICE void
-mha_save(TileCopy &tile_copy,
-         Tensor<Engine0, Layout0> &src,
-         Tensor<Engine1, Layout1> &dst) {
-    static_assert(Layout0::rank == 5, "Only support Tensor with 5 ranks");
-    static_assert(Layout0::rank == Layout1::rank, "Only support same rank Tensor");
-    if constexpr(Is_even_MN) {
-        copy(tile_copy, src, dst);
-    } else {
-        CUTLASS_PRAGMA_UNROLL
-        for (int m = 0; m < size<3>(dst); ++m) {
-            CUTLASS_PRAGMA_UNROLL
-            for (int n = 0; n < size<4>(dst); ++n) {
-                auto src_block = src(_, _, _, m, n);
-                auto dst_block = dst(_, _, _, m, n);
-                copy(tile_copy, src_block, dst_block);
-            }
-        }
-    }
-}
-
-
 template <class CVT, class T0, class T1>
 CUTLASS_DEVICE auto convert_type(CVT &cvt, T0 &src, T1 &dst) {
     CUTLASS_PRAGMA_UNROLL
@@ -184,15 +227,6 @@ CUTLASS_DEVICE auto convert_type(CVT &cvt, T0 &src, T1 &dst) {
         dst(i) = cvt(src(i));
     }
     return dst;
-}
-
-template <typename To_type, typename Engine, typename Layout>
-CUTLASS_DEVICE auto convert_type(Tensor<Engine, Layout> const &tensor) {
-    using From_type = typename Engine::value_type;
-    constexpr int numel = decltype(size(tensor))::value;
-    cutlass::NumericArrayConverter<To_type, From_type, numel> convert_op;
-    auto frag = convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel> *>(tensor.data()));
-    return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
 }
 
 template<bool Is_even_N, bool Seq_parallel, class Trait>
@@ -342,7 +376,6 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         }
 #endif
         copy(tilesaveS, tSrSl, tPgP);
-        // mha_save<Is_even_N>(tilesaveS, tSrSl, tPgP); // save P to external tensor for verification
 
         mQ.data() = mQ.data() + int(kBlockM * param.q_r_stride);
         mS.data() = mS.data() + int(kBlockM * param.s_r_stride); // debug
@@ -381,7 +414,6 @@ mha_backward_parallel(T trait,
     else
         dq_dk_dv_1colblock<true, true>(trait, param, bidb, bidhq, bidhkv, n_block);
 }
-
 
 template<class...> class mhabwdDeviceName;
 
@@ -486,61 +518,61 @@ int main(int argc, char**argv) {
     // using T = cute::bfloat16_t;
     using T = cute::half_t;
     using V = float;
-    std::string data_file = "mha.npz";
-    // read qkv
-    cnpy::NpyArray q_npy = cnpy::npz_load(data_file, "q");
-    cnpy::NpyArray k_npy = cnpy::npz_load(data_file, "k");
-    cnpy::NpyArray v_npy = cnpy::npz_load(data_file, "v");
+    int seed = 123;
+    int64_t BATCH = 4;
+    int64_t NUM_HEAD_Q = 4;
+    int64_t NUM_HEAD_KV = 4;
+    int64_t SEQ_LEN_QO = 512;
+    int64_t SEQ_LEN_KV = 513;
+    int64_t HEAD_SIZE_QK = 128;
+    int64_t HEAD_SIZE_VO = 128;
+    bool is_causal = false;
+    bool is_bhsd = true;
 
-    // read s and p for debug
-    cnpy::NpyArray s_npy = cnpy::npz_load(data_file, "s");
-    cnpy::NpyArray p_npy = cnpy::npz_load(data_file, "p");
-
-    // read grad output
-    cnpy::NpyArray do_npy = cnpy::npz_load(data_file, "grad");
-    cnpy::NpyArray o_npy = cnpy::npz_load(data_file, "out");
-
-    // read lse
-    cnpy::NpyArray lse_npy = cnpy::npz_load(data_file, "lse");
-    // read odo
-    cnpy::NpyArray odo_npy = cnpy::npz_load(data_file, "odo");
-
-    // read grad reference
-    cnpy::NpyArray dq_npy = cnpy::npz_load(data_file, "q_grad");
-    cnpy::NpyArray dk_npy = cnpy::npz_load(data_file, "k_grad");
-    cnpy::NpyArray dv_npy = cnpy::npz_load(data_file, "v_grad");
-    cnpy::NpyArray dp_npy = cnpy::npz_load(data_file, "p_grad");
-    cnpy::NpyArray ds_npy = cnpy::npz_load(data_file, "s_grad");
-
-    // read shape
-    cnpy::NpyArray shape = cnpy::npz_load(data_file, "shape");
-
-    int64_t BATCH = shape.data<int>()[0];
-    int64_t NUM_HEAD_Q = shape.data<int>()[1];
-    int64_t NUM_HEAD_KV = shape.data<int>()[2];
-    int64_t SEQ_LEN_QO = shape.data<int>()[3];
-    int64_t SEQ_LEN_KV = shape.data<int>()[4];
-    int64_t HEAD_SIZE_QK = shape.data<int>()[5];
-    int64_t HEAD_SIZE_VO = shape.data<int>()[6];
-    bool is_causal = shape.data<int>()[7];
-    bool is_bhsd = shape.data<int>()[8];
-    assert(HEAD_SIZE_QK == HEAD_SIZE_VO && "only support head_size_qk==head_size_vo");
     constexpr int kBlockN = 64;
     constexpr int kBlockM = 64;
     int64_t SEQ_LEN_QO_PAD = ceil_div(SEQ_LEN_QO, kBlockM) * kBlockM;
     int64_t SEQ_LEN_KV_PAD = ceil_div(SEQ_LEN_KV, kBlockN) * kBlockN;
+
+    int64_t q_len = BATCH * NUM_HEAD_Q * SEQ_LEN_QO * HEAD_SIZE_QK;
+    int64_t k_len = BATCH * NUM_HEAD_KV * SEQ_LEN_KV * HEAD_SIZE_QK;
+    int64_t s_pad_len = BATCH * NUM_HEAD_Q * SEQ_LEN_QO_PAD * SEQ_LEN_KV_PAD;
+    int64_t s_len = BATCH * NUM_HEAD_Q * SEQ_LEN_QO * SEQ_LEN_KV;
+
+    T * q_h = compat::malloc_host<T>(q_len);
+    T * k_h = compat::malloc_host<T>(k_len);
+    // read qkv
+    random_init(seed + 1000, q_h, q_len);
+    random_init(seed + 1001, k_h, k_len);
+
+    assert(HEAD_SIZE_QK == HEAD_SIZE_VO && "only support head_size_qk==head_size_vo");
     printf("batch %d nh_q %d nh_k %d sq_q %d(%d) sq_k %d(%d) hd_q %d hd_v %d causal %d bhsd %d\n", BATCH, NUM_HEAD_Q, NUM_HEAD_KV, SEQ_LEN_QO, SEQ_LEN_QO_PAD, SEQ_LEN_KV, SEQ_LEN_KV_PAD, HEAD_SIZE_QK, HEAD_SIZE_VO, is_causal, is_bhsd);
+
     // alloc qkv
-    T *q_d = compat::malloc<T>(q_npy.num_vals);
-    T *k_d = compat::malloc<T>(k_npy.num_vals);
+    T *q_d = compat::malloc<T>(q_len);
+    T *k_d = compat::malloc<T>(k_len);
 
     // alloc ps
-    T *s_d = compat::malloc<T>(BATCH * NUM_HEAD_Q * SEQ_LEN_QO_PAD * SEQ_LEN_KV_PAD);
+    T *s_d = compat::malloc<T>(s_pad_len);
+    T *srefe_d = compat::malloc<T>(s_len);
 
     // copy qk
-    compat::memcpy<T>(q_d, q_npy.data<T>(), q_npy.num_vals);
-    compat::memcpy<T>(k_d, k_npy.data<T>(), k_npy.num_vals);
+    compat::memcpy<T>(q_d, q_h, q_len);
+    compat::memcpy<T>(k_d, k_h, k_len);
 
+
+    verify_with_cutlass(
+        q_d,
+        k_d,
+        srefe_d,
+        SEQ_LEN_QO,
+        SEQ_LEN_KV,
+        HEAD_SIZE_QK,
+        BATCH * NUM_HEAD_Q,
+        1.0,
+        0.0,
+        'N',
+        'T');
 
     auto problem_shape = ProblemShapeRegular(BATCH, NUM_HEAD_Q, NUM_HEAD_KV,
                                              SEQ_LEN_QO, SEQ_LEN_KV, HEAD_SIZE_QK, HEAD_SIZE_VO);
@@ -553,10 +585,12 @@ int main(int argc, char**argv) {
     float atol = 1e-3f;
     float rtol = 1e-3f;
 
-    std::vector<T> s_test(BATCH * NUM_HEAD_Q * SEQ_LEN_QO_PAD * SEQ_LEN_KV_PAD);
+    std::vector<T> s_test(s_pad_len);
+    std::vector<T>  s_refe(s_len);
     compat::memcpy<T>(s_test.data(), s_d, s_test.size());
+    compat::memcpy<T>(s_refe.data(), srefe_d, s_refe.size());
     compat::wait_and_throw();
     printf("S val: ");
-    verify(s_npy.data<T>(), s_test.data(), BATCH * NUM_HEAD_Q, SEQ_LEN_QO, SEQ_LEN_QO_PAD, SEQ_LEN_KV, SEQ_LEN_KV_PAD, atol, rtol);
+    verify(s_refe.data(), s_test.data(), BATCH * NUM_HEAD_Q, SEQ_LEN_QO, SEQ_LEN_QO_PAD, SEQ_LEN_KV, SEQ_LEN_KV_PAD, atol, rtol);
 
 }
