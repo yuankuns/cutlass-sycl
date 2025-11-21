@@ -354,8 +354,8 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         Int <kHeadDim>,
         std::conditional_t<Is_even_N, Int<kBlockN>, int>,
         Int<1>>;
-    Shape shapeQ = make_shape(kBlockM, Int<kHeadDim>{}, _1{});
-    Shape shapedQ = Shape<Int<kBlockM>, Int<kHeadDim>, _1>{};
+    auto shapeQ = make_shape(kBlockM, Int<kHeadDim>{}, _1{});
+    auto shapedQ = Shape<Int<kBlockM>, Int<kHeadDim>, _1>{};
     Shape1 shapeKtV;
     Shape2 shapeK;
     if constexpr(Is_even_N) {
@@ -365,13 +365,13 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         shapeKtV = make_shape(tail_n, Int<kHeadDim>{}, _1{});
         shapeK = make_shape(Int<kHeadDim>{}, tail_n, _1{});
     }
-    Shape shapeO = make_shape(kBlockM, Int<kHeadDim>{}, _1{});
-    Shape shapeQtOt = make_shape(Int<kHeadDim>{}, kBlockM, _1{});
+    auto shapeO = make_shape(kBlockM, Int<kHeadDim>{}, _1{});
+    auto shapeQtOt = make_shape(Int<kHeadDim>{}, kBlockM, _1{});
 
 
-    Shape shapeSP = make_shape(kBlockM, block_n_dim, _1{});
+    auto shapeSP = make_shape(kBlockM, block_n_dim, _1{});
 
-    Shape shapePt = make_shape(block_n_dim, kBlockM, _1{});
+    auto shapePt = make_shape(block_n_dim, kBlockM, _1{});
 
     Tensor mQ = make_tensor(make_gmem_ptr(param.q_ptr + q_offset),
                             make_layout(
@@ -449,9 +449,9 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                                 make_stride(param.s_r_stride, _1{}, _1{})));
 #endif
 
-    Shape tile_sdp = typename Trait::TileShapeSdP{};
-    Shape tile_dkv = typename Trait::TileShapedKV{};
-    Shape tile_dq = typename Trait::TileShapedQ{};
+    auto tile_sdp = typename Trait::TileShapeSdP{};
+    auto tile_dkv = typename Trait::TileShapedKV{};
+    auto tile_dq = typename Trait::TileShapedQ{};
 
     auto tileloadQ = typename Trait::TiledLoadQ{mQ};
     auto tileloadKt = typename Trait::TiledLoadKt{mKt};
@@ -608,6 +608,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
     const int max_m_block = ceil_div(param.seq_len_q, kBlockM);
     const int tail_m = param.seq_len_q % kBlockM;
 
+    cutlass::NumericConverter<T, float> converter;
     // clear accumulator
     clear(tdVrdV);
     clear(tdKrdK);
@@ -678,7 +679,8 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
 
         // P=softmax(S,lse)
         scale_apply_exp2(scores, lse, param.scale_softmax_log2);
-        auto tSrSl = convert_type<T>(tSrS);
+        auto tSrSl = make_tensor_like<T>(tSrS);
+        convert_type(converter, tSrS, tSrSl);
         mha_save<Is_even_N>(tilesaveP, tSrSl, tPgP); // save P to internal buffers
 #ifdef _DEBUG_
         mha_save<Is_even_N>(tilesaveS, tSrSl, tPgP); // save P to external tensor for verification
@@ -690,7 +692,8 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         Tensor dS = make_tensor(tdPrdP.data(), scores.layout());
         // dS=P(dP-sum_row(P))*scale
         softmax_backward(scores, dP_sum, dS, param.scale_softmax);
-        auto tdPrdPl = convert_type<T>(tdPrdP);
+        auto tdPrdPl = make_tensor_like<T>(tdPrdP);
+        convert_type(converter, tdPrdP, tdPrdPl);
 #ifdef _DEBUG_
         mha_save<Is_even_N>(tilesavedPd, tdPrdPl, tPgP); // save dP to external tensor for verification
 #endif
@@ -755,9 +758,11 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         tilesavedPd = typename Trait::TiledSaveS{mdPd}; // debug
 #endif
     }
-    auto tdVrdVl = convert_type<T>(tdVrdV);
+    auto tdVrdVl = make_tensor_like<T>(tdVrdV);
+    convert_type(converter, tdVrdV, tdVrdVl);
     mha_save<Is_even_N>(tilesavedV, tdVrdVl, tdVgdV);
-    auto tdKrdKl = convert_type<T>(tdKrdK);
+    auto tdKrdKl = make_tensor_like<T>(tdKrdK);
+    convert_type(converter, tdKrdK, tdKrdKl);
     mha_save<Is_even_N>(tilesavedK, tdKrdKl, tdKgdK);
 }
 
@@ -797,7 +802,7 @@ compute_o_dot_do(T &trait, Param<typename T::DType> &param,
         O_shape = make_shape(param.tail_m, Int<kHeadDim>{});
         dP_shape = make_shape(param.tail_m);
     }
-    Shape dQ_shape = make_shape(Int<kBlockM>{}, Int<kHeadDim>{});
+    auto dQ_shape = make_shape(Int<kBlockM>{}, Int<kHeadDim>{});
 
     Tensor mdO = make_tensor(make_gmem_ptr(param.do_ptr + o_offset),
                              make_layout(
@@ -1028,7 +1033,7 @@ convert_dq(T &trait, Param<typename T::DType> &param, int m_block, int bidb, int
                                 shapeQ,
                                 make_stride(param.q_r_stride, _1{}, _1{})));
 
-    Shape tile_dq = typename T::TileShapedQ{};
+    auto tile_dq = typename T::TileShapedQ{};
 
     auto tileloaddQ = typename T::TiledLoaddQ{mdQaccum};
     auto tilesavedQ = typename T::TiledSavedV{mdQ};
@@ -1285,12 +1290,12 @@ void launch_mha_backward(ProblemShape problem_shape,
             seq_len_q_pad, seq_len_kv_pad);
     } else if (headdim == 128) {
         constexpr int kBlockM = 64;
-        constexpr int kBlockN = 32;
+        constexpr int kBlockN = 64;
         constexpr int kHeadDim = 128;
         constexpr int kNSGs = 8;
         constexpr int AtomLayoutMSdP = 4;
-        constexpr int AtomLayoutNdKV = 2;
-        constexpr int AtomLayoutMdQ = 2;
+        constexpr int AtomLayoutNdKV = 4;
+        constexpr int AtomLayoutMdQ = 4;
         static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
         static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
         launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN,
