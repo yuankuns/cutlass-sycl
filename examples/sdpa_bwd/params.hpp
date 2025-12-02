@@ -32,19 +32,19 @@ struct FAKernel {
     using SubgroupLayoutdKV = Layout<Shape<Int<AtomLayoutNdKV>, Int<kNSGs / AtomLayoutNdKV>, _1>>;
     using SubgroupLayoutdQ = Layout<Shape<Int<AtomLayoutMdQ>, Int<kNSGs / AtomLayoutMdQ>, _1>>;
 
-    using TileShapeSdP = Tile<Int<16 * AtomLayoutMSdP>, Int<16 * kNSGs / AtomLayoutMSdP>, _16>;
+    using TileShapeSdP = Tile<Int<kBlockM>, Int<kBlockN>, _16>;
     static_assert(size<0>(TileShapeSdP{}) <= kBlockM && "tile size M must be smaller than or equal to kBlockM");
     static_assert(kBlockM % size<0>(TileShapeSdP{}) == 0 && "kBlockM must be dividable by tile size M");
     static_assert(size<1>(TileShapeSdP{}) <= kBlockN && "tile size N must be smaller than or equal to kBlockN");
     static_assert(kBlockN % size<1>(TileShapeSdP{}) == 0 && "kBlockN must be dividable by tile size N ");
 
-    using TileShapedKV = Tile<Int<16 * AtomLayoutNdKV>, Int<16 * kNSGs / AtomLayoutNdKV>, _16>;
+    using TileShapedKV = Tile<Int<kBlockN>, Int<16 * kNSGs / AtomLayoutNdKV>, Int<kBlockN>>;
     static_assert(size<0>(TileShapedKV{}) <= kBlockN && "tile size M must be smaller than or equal to kBlockN");
     static_assert(kBlockN % size<0>(TileShapedKV{}) == 0 && "kBlockN must be dividable by tile size M");
     static_assert(size<1>(TileShapedKV{}) <= kHeadDim && "tile size N must be smaller than or equal to kHeadDim");
     static_assert(kHeadDim % size<1>(TileShapedKV{}) == 0 && "kHeadDim must be dividable by tile size N");
 
-    using TileShapedQ = Tile<Int<16 * AtomLayoutMdQ>, Int<16 * kNSGs / AtomLayoutMdQ>, _16>;
+    using TileShapedQ = Tile<Int<kBlockM>, Int<16 * kNSGs / AtomLayoutMdQ>, Int<kBlockN>>;
     static_assert(size<0>(TileShapedQ{}) <= kBlockM && "tile size M must be smaller than or equal to kBlockM");
     static_assert(kBlockM % size<0>(TileShapedQ{}) == 0 && "kBlockM must dividable by tile size M");
     static_assert(size<1>(TileShapedQ{}) <= kHeadDim && "tile size N must be smaller than or equal to kHeadDim");
