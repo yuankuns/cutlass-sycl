@@ -26,6 +26,14 @@ cutlass_example_add_executable(
   reg_reuse_dq.cpp
   cnpy.cpp
 )
+cutlass_example_add_executable(
+  xe_gemm_test
+  xe_gemm_test.cpp
+)
+
+target_compile_definitions(reg_reuse_dq PRIVATE
+  SYCL_INTEL_TARGET=1
+)
 target_link_options(sdpa_backward PUBLIC "-lz")
 target_link_options(reg_reuse_dq PUBLIC "-lz")
 set_target_properties(sdpa_backward PROPERTIES CXX_COMPILER_LAUNCHER "IGC_VectorAliasBBThreshold=10000" )
