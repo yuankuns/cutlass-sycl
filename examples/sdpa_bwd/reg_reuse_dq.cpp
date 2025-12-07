@@ -1033,10 +1033,12 @@ mha_backward_seq(T trait,
     const int bidhq = BlockIdxY();
     const int n_block = BlockIdxX();
     const int bidhkv = bidhq / param.num_qh_per_kvh;
-    if (param.tail_n > 0 and n_block == param.n_block - 1)
-        dq_dk_dv_1colblock<false, false>(trait, param, bidb, bidhq, bidhkv, param.n_block - 1, param.tail_n);
-    else
-        dq_dk_dv_1colblock<true, false>(trait, param, bidb, bidhq, bidhkv, n_block);
+    for (int n_block = 0; n_block < param.n_block; ++n_block) {
+        if (param.tail_n > 0 and n_block == param.n_block - 1)
+            dq_dk_dv_1colblock<false, false>(trait, param, bidb, bidhq, bidhkv, param.n_block - 1, param.tail_n);
+        else
+            dq_dk_dv_1colblock<true, false>(trait, param, bidb, bidhq, bidhkv, n_block);
+    }
 }
 
 template<class...> class mhaodoDeviceName;
@@ -1097,7 +1099,7 @@ void launch_mha_backward_headdim(ProblemShape problem_shape,
     } else {
         setup_bshd_stride(param);
     }
-    auto dimGrid1 = compat::dim3(size(param.n_block),
+    auto dimGrid1 = compat::dim3(size(1),
                                  size(param.num_head_q), size(param.batch));
     assert((param.num_head_q % param.num_head_kv == 0) && "num_head_q must be dividable by num_head_kv");
     assert((param.num_head_q >= param.num_head_kv) && "num_head_q must be bigger than or equal to num_head_kv");
