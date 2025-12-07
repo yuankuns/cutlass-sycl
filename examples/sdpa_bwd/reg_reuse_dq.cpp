@@ -27,8 +27,8 @@ debug_info() {
           BlockDimX(), BlockDimY(), BlockDimZ());
 }
 
-template<class T>
-void print_t(T r) {
+template<class Engine, class Layout>
+void print_t(Tensor<Engine, Layout> &r) {
     print(r);
     for (int i = 0; i < size(r); ++i) {
         if (i % 8 == 0)
@@ -112,10 +112,12 @@ struct FAKernel {
     using MMA_Atom2 = XE_DPAS_TT<8, VType, DType>;
     using _K = Int<MMA_Atom2::K * 2>;
     using SubgroupLayoutSdP = Layout<Shape<Int<AtomLayoutMSdP>, Int<kNSGs / AtomLayoutMSdP>, _1>>;
-    using SubgroupLayoutSdP2 = Layout<Shape<_8, _1, _1>, Stride<_1, _1, _0>>;
+    using SubgroupLayoutSdP2 = Layout<Shape<_8, _1, _1>,
+                                      Stride<_1, _0, _0>>;
     using SubgroupLayoutdKV = Layout<Shape<Int<AtomLayoutNdKV>, Int<kNSGs / AtomLayoutNdKV>, _1>>;
     using SubgroupLayoutdQ = Layout<Shape<Int<AtomLayoutMdQ>, Int<kNSGs / AtomLayoutMdQ>, _1>>;
-
+    using SubgroupLayoutdQ2 = Layout<Shape<_8, _1, _1>,
+                                     Stride<_1, _0, _0>>;
     using TileShapeSdP = Tile<Int<kBlockM>, Int<kBlockN>, _16>;
     using TileShapeSdP2 = Layout<Shape<Int<kBlockM>, Int<kBlockN>, _K>>;
     static_assert(size<0>(TileShapeSdP{}) <= kBlockM && "tile size M must be smaller than or equal to kBlockM");
@@ -130,6 +132,7 @@ struct FAKernel {
     static_assert(kHeadDim % size<1>(TileShapedKV{}) == 0 && "kHeadDim must be dividable by tile size N");
 
     using TileShapedQ = Tile<Int<kBlockM>, Int<16 * kNSGs / AtomLayoutMdQ>, Int<kBlockN>>;
+    using TileShapedQ2 = Layout<Shape<Int<kBlockM>, Int<kHeadDim>, _K>>;
     static_assert(size<0>(TileShapedQ{}) <= kBlockM && "tile size M must be smaller than or equal to kBlockM");
     static_assert(kBlockM % size<0>(TileShapedQ{}) == 0 && "kBlockM must dividable by tile size M");
     static_assert(size<1>(TileShapedQ{}) <= kHeadDim && "tile size N must be smaller than or equal to kHeadDim");
@@ -148,6 +151,9 @@ struct FAKernel {
     using TiledMmadQ = typename TiledMMAHelper<MMA_Atom_ARCH,
                                                Layout<TileShapedQ>,
                                                SubgroupLayoutdQ>::TiledMMA;
+    using TiledMmadQ2 = typename TiledMMAHelper<MMA_Atom<MMA_Atom2>,
+                                                TileShapedQ2,
+                                                SubgroupLayoutdQ2>::TiledMMA;
     static constexpr auto bP = Int<2>{}; // Pipeline
 
     using StrideR = cute::tuple<long, cute::C<1>>;
@@ -492,138 +498,6 @@ struct OPS_tobf16{
 constexpr int tid = 0;
 constexpr int bid = 0;
 
-template<class Trait,
-         class Engine0, class Layout0,
-         class Engine1, class Layout1,
-         class Engine2, class Layout2,
-         class TiledMma, class TileMNK,
-         class TiledCopyA, class TiledCopyB>
-CUTLASS_DEVICE void
-gemm_SdP(Trait &trait,
-         Tensor<Engine0, Layout0> &acc,
-         Tensor<Engine1, Layout1> &gA,
-         Tensor< Engine2, Layout2> &gB,
-         TiledMma &tiled_mma, TileMNK &tile_mnk,
-         TiledCopyA &copy_a, TiledCopyB &copy_b) {
-    using T = typename Trait::DType;
-    using V = typename Trait::VType;
-    constexpr int SubgroupSize = Trait::SubgroupSize;
-    auto sg = compat::get_nd_item<1>().get_sub_group();
-    auto first_thread_in_sg_idx = sg.get_group_linear_id() * SubgroupSize;
-    auto thr_mma = tiled_mma.get_slice(first_thread_in_sg_idx);
-
-    Tensor tCgA = thr_mma.partition_A(gA);
-    Tensor tCgB = thr_mma.partition_B(gB);
-
-    Tensor tCrA = make_tensor<T>(make_fragment_layout(copy_a, tCgA(_,_,_,0).shape()));
-    Tensor tCrB = make_tensor<T>(make_fragment_layout(copy_b, tCgB(_,_,_,0).shape()));
-
-    ThrCopy thr_copy_a = copy_a.get_slice(compat::local_id::x());
-    ThrCopy thr_copy_b = copy_b.get_slice(compat::local_id::x());
-
-    Tensor tArA = thr_copy_a.retile_D(tCrA);
-    Tensor tBrB = thr_copy_b.retile_D(tCrB);
-
-    Tensor tAgA = thr_copy_a.retile_S(tCgA);
-    Tensor tBgB = thr_copy_b.retile_S(tCgB);
-
-    constexpr int barrier_scope = 2;
-    for (int k = 0; k < size<3>(tAgA); ++k) {
-        barrier_arrive(barrier_scope);
-        cute::copy(copy_a, tAgA(_,_,_,k), tArA);
-        cute::copy(copy_b, tBgB(_,_,_,k), tBrB);
-        cute::gemm(tiled_mma, tCrA, tCrB, acc);
-        barrier_wait(barrier_scope);
-    }
-}
-
-template<class Trait,
-         class Engine0, class Layout0,
-         class Engine1, class Layout1,
-         class Engine2, class Layout2,
-         class TiledMma, class TileMNK,
-         class TiledCopyA, class TiledCopyB>
-CUTLASS_DEVICE void
-gemm_SdP2(Trait &trait,
-          Tensor<Engine0, Layout0> &acc,
-          Tensor<Engine1, Layout1> &gA,
-          Tensor< Engine2, Layout2> &gB,
-          TiledMma &tiled_mma, TileMNK &tile_mnk,
-          TiledCopyA &copy_a, TiledCopyB &copy_b) {
-    using T = typename Trait::DType;
-    using V = typename Trait::VType;
-    auto item = compat::get_nd_item<2>();
-    auto local_id = item.get_local_id(0);
-    auto thr_mma = tiled_mma.get_slice(local_id);
-    auto thr_copy_a = copy_a.get_slice(local_id);
-    auto thr_copy_b = copy_b.get_slice(local_id);
-
-    Tensor tCrA = thr_mma.partition_sg_fragment_A(gA(_,_,0));
-    Tensor tCrB = thr_mma.partition_sg_fragment_B(gB(_,_,0));
-
-    Tensor tArA = thr_copy_a.partition_sg_fragment_D(gA(_,_,0));
-    Tensor tBrB = thr_copy_b.partition_sg_fragment_D(gB(_,_,0));
-
-    Tensor tAgA = thr_copy_a.partition_S(gA);
-    Tensor tBgB = thr_copy_b.partition_S(gB);
-
-    constexpr int barrier_scope = 2;
-    for (int k = 0; k < size<3>(tAgA); ++k) {
-        barrier_arrive(barrier_scope);
-        cute::copy(copy_a, tAgA(_,_,_,k), tArA);
-        cute::copy(copy_b, tBgB(_,_,_,k), tBrB);
-        reorder(tArA, tCrA);
-        reorder(tBrB, tCrB);
-        cute::gemm(tiled_mma, tCrA, tCrB, acc);
-        barrier_wait(barrier_scope);
-    }
-}
-
-template<class Trait,
-         class Engine0, class Layout0,
-         class Engine1, class Layout1,
-         class Engine2, class Layout2,
-         class TiledMma, class TileMNK,
-         class TiledCopyA, class TiledCopyB>
-CUTLASS_DEVICE void
-gemm_dQ(Trait &trait,
-        Tensor<Engine0, Layout0> &acc,
-        Tensor<Engine1, Layout1> &gA,
-        Tensor< Engine2, Layout2> &gB,
-        TiledMma &tiled_mma, TileMNK &tile_mnk,
-        TiledCopyA &copy_a, TiledCopyB &copy_b) {
-    using T = typename Trait::DType;
-    using V = typename Trait::VType;
-    constexpr int SubgroupSize = Trait::SubgroupSize;
-    auto sg = compat::get_nd_item<1>().get_sub_group();
-    auto first_thread_in_sg_idx = sg.get_group_linear_id() * SubgroupSize;
-    auto thr_mma = tiled_mma.get_slice(first_thread_in_sg_idx);
-
-    Tensor tCgA = thr_mma.partition_A(gA);
-    Tensor tCgB = thr_mma.partition_B(gB);
-
-    Tensor tCrA = make_tensor<T>(make_fragment_layout(copy_a, tCgA(_,_,_,0).shape()));
-    Tensor tCrB = make_tensor<T>(make_fragment_layout(copy_b, tCgB(_,_,_,0,0).shape()));
-
-    ThrCopy thr_copy_a = copy_a.get_slice(compat::local_id::x());
-    ThrCopy thr_copy_b = copy_b.get_slice(compat::local_id::x());
-
-    Tensor tArA = thr_copy_a.retile_D(tCrA);
-    Tensor tBrB = thr_copy_b.retile_D(tCrB);
-
-    Tensor tAgA = thr_copy_a.retile_S(tCgA);
-    Tensor tBgB = thr_copy_b.retile_S(tCgB);
-    constexpr int barrier_scope = 2;
-    for (int n = 0; n < size<3>(tBgB); ++n) {
-        for (int k = 0; k < size<3>(tAgA); ++k) {
-            barrier_arrive(barrier_scope);
-            cute::copy(copy_a, tAgA(_,_,_,k), tArA);
-            cute::copy(copy_b, tBgB(_,_,_,n,k), tBrB);
-            cute::gemm(tiled_mma, tCrA, tCrB, acc(_,_,_,n));
-            barrier_wait(barrier_scope);
-        }
-    }
-}
 
 template <class Engine0, class Layout0,
           class Engine1, class Layout1,
@@ -652,6 +526,424 @@ CUTLASS_DEVICE auto convert_type(CVT &cvt, T0 &src, T1 &dst) {
         dst(i) = cvt(src(i));
     }
     return dst;
+}
+
+template <class ATensor, class BTensor, class CTensor,
+          class DTensor, class TiledMMA>
+void
+gemm_SdP(ATensor   const& A,         // (M,K)
+         BTensor   const& B,         // (N,K)
+         CTensor        & C,         // (M,N)
+         DTensor        & D,         // (M,N)
+         TiledMMA const & mma,
+         int wg_m,
+         int wg_n)
+{
+  // -----
+  // Setup
+  // -----
+
+  /* Get workgroup and local IDs */
+  auto sg = compat::get_nd_item<1>().get_sub_group();
+  auto first_thread_in_sg_idx = sg.get_group_linear_id() * 16;
+
+  /* Create proxy coordinate tensors for each global tensor */
+  Tensor cA = make_identity_tensor(A.shape());   // (M,K)
+  Tensor cB = make_identity_tensor(B.shape());   // (N,K)
+  Tensor cC = make_identity_tensor(C.shape());   // (M,N)
+
+  /* Split GEMM into workgroup tiles, and identify our workgroup's tile (wg_coord) */
+  auto wg_tile = mma.tile_mnk();
+  auto wg_coord = make_coord(wg_m, wg_n, 0);
+
+  Tensor gA = local_tile(cA, select<0,2>(wg_tile), make_coord(wg_m,_));  // (BLK_M,BLK_K,k)
+  Tensor gB = local_tile(cB, select<1,2>(wg_tile), make_coord(wg_n,_));  // (BLK_N,BLK_K,k)
+  Tensor gC = local_tile(cC, wg_tile, wg_coord, Step<_1,_1, X>{});       // (BLK_M,BLK_N)
+  Tensor gD = local_tile(cC, wg_tile, wg_coord, Step<_1,_1, X>{});       // (BLK_M,BLK_N)
+
+  /* Create block 2D TiledCopies */
+  auto copy_a = make_block_2d_copy_A(mma, A);
+  auto copy_b = make_block_2d_copy_B(mma, B);
+  auto copy_c = make_block_2d_copy_D(mma, C);
+  auto copy_d = make_block_2d_copy_D(mma, D);
+
+  /* Slice TiledCopy/TiledMMA operations to thread (work-item) level */
+  auto thr_mma    =    mma.get_slice(first_thread_in_sg_idx);
+  auto thr_copy_a = copy_a.get_slice(first_thread_in_sg_idx);
+  auto thr_copy_b = copy_b.get_slice(first_thread_in_sg_idx);
+  auto thr_copy_c = copy_c.get_slice(first_thread_in_sg_idx);
+  auto thr_copy_d = copy_d.get_slice(first_thread_in_sg_idx);
+
+  /* Register fragments for MMA */
+  auto tCrA = thr_mma.partition_sg_fragment_A(gA(_,_,0));
+  auto tCrB = thr_mma.partition_sg_fragment_B(gB(_,_,0));
+
+  /* Register fragments for copies */
+  auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_,_,0));
+  auto tBrB = thr_copy_b.partition_sg_fragment_D(gB(_,_,0));
+
+  /* Partition global tensor (proxies) for copies */
+  Tensor tAgA = thr_copy_a.partition_S(gA);
+  Tensor tBgB = thr_copy_b.partition_S(gB);
+
+  /* Partition C */
+  // Tensor tCrC = partition_fragment_C(mma, select<0,1>(wg_tile));
+  auto tCrC = thr_mma.partition_sg_fragment_C(make_identity_tensor(select<0,1>(wg_tile))); // allocate C fragment storage
+  Tensor tCgC = thr_copy_c.partition_D(gC);    /* also matches copy_c's source layout */
+  Tensor tCgC2 = thr_copy_d.partition_D(gD);    /* also matches copy_d's source layout */
+
+  /* Create prefetch TiledCopy instances */
+  auto prefetch_a = make_block_2d_prefetch(copy_a);
+  auto prefetch_b = make_block_2d_prefetch(copy_b);
+
+  auto thr_prefetch_A = prefetch_a.get_slice(first_thread_in_sg_idx);
+  auto thr_prefetch_B = prefetch_b.get_slice(first_thread_in_sg_idx);
+
+  /* Partition global tensor (proxies) for prefetch */
+  auto pAgA = thr_prefetch_A.partition_S(gA);
+  auto pBgB = thr_prefetch_B.partition_S(gB);
+
+  /* Prefetch distance, in units of k tiles */
+  const int prefetch_dist = 3;
+
+  // ------
+  // Kernel
+  // ------
+
+  constexpr int barrier_scope = 2;
+
+  int k_tile_count = ceil_div(shape<1>(A), get<2>(wg_tile));
+  int k_tile_prefetch = 0;
+  /* Clear the accumulators */
+  clear(tCrC);
+
+  /* Warm up loops with prefetch to L1 */
+  CUTE_UNROLL
+  for (; k_tile_prefetch < prefetch_dist; k_tile_prefetch++) {
+    prefetch(prefetch_a, pAgA(_,_,_,k_tile_prefetch));
+    prefetch(prefetch_b, pBgB(_,_,_,k_tile_prefetch));
+  }
+
+  /* Main loop */
+  for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
+    /* Split barrier keeping threads loosely together */
+    barrier_arrive(barrier_scope);
+
+    /* Copy A/B from global memory (ideally L1 cache) to registers */
+    copy(copy_a, tAgA(_,_,_,k_tile), tArA);
+    copy(copy_b, tBgB(_,_,_,k_tile), tBrB);
+
+    /* Prefetch A/B tiles to L1 */
+    prefetch(prefetch_a, pAgA(_,_,_,k_tile_prefetch));
+    prefetch(prefetch_b, pBgB(_,_,_,k_tile_prefetch));
+
+    /* Shuffle data from copy fragments to MMA fragments */
+    reorder(tArA, tCrA);
+    reorder(tBrB, tCrB);
+
+    /* Accumulate C += A * B */
+    gemm(mma, tCrA, tCrB, tCrC);
+
+    /* Other half of split barrier */
+    barrier_wait(barrier_scope);
+  }
+  /* Write C to global memory */
+  auto tCrC16bit = thr_copy_c.partition_sg_fragment_S(gC);
+  reorder(tCrC, tCrC16bit);
+  copy(copy_c, tCrC16bit, tCgC);
+  copy(copy_d, tCrC16bit, tCgC);
+}
+
+template <class ATensor, class BTensor, class CTensor,
+          class TiledMMA>
+void
+gemm_kernel(ATensor   const& A,         // (M,K)
+            BTensor   const& B,         // (N,K)
+            CTensor        & C,         // (M,N)
+            TiledMMA const & mma,
+            int wg_m,
+            int wg_n,
+            bool debug)
+{
+  // -----
+  // Setup
+  // -----
+
+  /* Get workgroup and local IDs */
+  auto sg = compat::get_nd_item<1>().get_sub_group();
+  auto first_thread_in_sg_idx = sg.get_group_linear_id() * 16;
+
+  /* Create proxy coordinate tensors for each global tensor */
+  Tensor cA = make_identity_tensor(A.shape());   // (M,K)
+  Tensor cB = make_identity_tensor(B.shape());   // (N,K)
+  Tensor cC = make_identity_tensor(C.shape());   // (M,N)
+
+  /* Split GEMM into workgroup tiles, and identify our workgroup's tile (wg_coord) */
+  auto wg_tile = mma.tile_mnk();
+  auto wg_coord = make_coord(wg_m, wg_n, 0);
+
+  Tensor gA = local_tile(cA, select<0,2>(wg_tile), make_coord(wg_m,_));  // (BLK_M,BLK_K,k)
+  Tensor gB = local_tile(cB, select<1,2>(wg_tile), make_coord(wg_n,_));  // (BLK_N,BLK_K,k)
+  Tensor gC = local_tile(cC, wg_tile, wg_coord, Step<_1,_1, X>{});       // (BLK_M,BLK_N)
+
+  /* Create block 2D TiledCopies */
+  auto copy_a = make_block_2d_copy_A(mma, A);
+  auto copy_b = make_block_2d_copy_B(mma, B);
+  auto copy_c = make_block_2d_copy_D(mma, C);
+
+  /* Slice TiledCopy/TiledMMA operations to thread (work-item) level */
+  auto thr_mma    =    mma.get_slice(first_thread_in_sg_idx);
+  auto thr_copy_a = copy_a.get_slice(first_thread_in_sg_idx);
+  auto thr_copy_b = copy_b.get_slice(first_thread_in_sg_idx);
+  auto thr_copy_c = copy_c.get_slice(first_thread_in_sg_idx);
+
+  /* Register fragments for MMA */
+  auto tCrA = thr_mma.partition_sg_fragment_A(gA(_,_,0));
+  auto tCrB = thr_mma.partition_sg_fragment_B(gB(_,_,0));
+
+  /* Register fragments for copies */
+  auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_,_,0));
+  auto tBrB = thr_copy_b.partition_sg_fragment_D(gB(_,_,0));
+
+  /* Partition global tensor (proxies) for copies */
+  Tensor tAgA = thr_copy_a.partition_S(gA);
+  Tensor tBgB = thr_copy_b.partition_S(gB);
+
+  /* Partition C */
+  // Tensor tCrC = partition_fragment_C(mma, select<0,1>(wg_tile));
+  auto tCrC = thr_mma.partition_sg_fragment_C(make_identity_tensor(select<0,1>(wg_tile))); // allocate C fragment storage
+  Tensor tCgC = thr_copy_c.partition_D(gC);    /* also matches copy_c's source layout */
+
+  /* Create prefetch TiledCopy instances */
+  auto prefetch_a = make_block_2d_prefetch(copy_a);
+  auto prefetch_b = make_block_2d_prefetch(copy_b);
+
+  auto thr_prefetch_A = prefetch_a.get_slice(first_thread_in_sg_idx);
+  auto thr_prefetch_B = prefetch_b.get_slice(first_thread_in_sg_idx);
+
+  /* Partition global tensor (proxies) for prefetch */
+  auto pAgA = thr_prefetch_A.partition_S(gA);
+  auto pBgB = thr_prefetch_B.partition_S(gB);
+
+  /* Prefetch distance, in units of k tiles */
+  const int prefetch_dist = 3;
+
+  // ------
+  // Kernel
+  // ------
+
+  constexpr int barrier_scope = 2;
+
+  int k_tile_count = ceil_div(shape<1>(A), get<2>(wg_tile));
+  int k_tile_prefetch = 0;
+  /* Clear the accumulators */
+  clear(tCrC);
+
+  /* Warm up loops with prefetch to L1 */
+  CUTE_UNROLL
+  for (; k_tile_prefetch < prefetch_dist; k_tile_prefetch++) {
+    prefetch(prefetch_a, pAgA(_,_,_,k_tile_prefetch));
+    prefetch(prefetch_b, pBgB(_,_,_,k_tile_prefetch));
+  }
+
+  /* Main loop */
+  for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
+    /* Split barrier keeping threads loosely together */
+    barrier_arrive(barrier_scope);
+
+    /* Copy A/B from global memory (ideally L1 cache) to registers */
+    copy(copy_a, tAgA(_,_,_,k_tile), tArA);
+    copy(copy_b, tBgB(_,_,_,k_tile), tBrB);
+
+    /* Prefetch A/B tiles to L1 */
+    prefetch(prefetch_a, pAgA(_,_,_,k_tile_prefetch));
+    prefetch(prefetch_b, pBgB(_,_,_,k_tile_prefetch));
+
+    /* Shuffle data from copy fragments to MMA fragments */
+    reorder(tArA, tCrA);
+    reorder(tBrB, tCrB);
+
+    /* Accumulate C += A * B */
+    gemm(mma, tCrA, tCrB, tCrC);
+
+    /* Other half of split barrier */
+    barrier_wait(barrier_scope);
+  }
+  /* Write C to global memory */
+  auto tCrC16bit = thr_copy_c.partition_sg_fragment_S(gC);
+  reorder(tCrC, tCrC16bit);
+  copy(copy_c, tCrC16bit, tCgC);
+}
+
+template <class ATensor, class BTensor, class CTensor,
+          class TiledMMA>
+void
+gemm_dQ2(ATensor   const& A,         // (M,K)
+         BTensor   const& B,         // (N,K)
+         CTensor        & C,         // (M,N)
+         TiledMMA const & mma,
+         int wg_m,
+         int wg_n,
+         bool debug = false)
+{
+  // -----
+  // Setup
+  // -----
+
+  /* Get workgroup and local IDs */
+  auto sg = compat::get_nd_item<1>().get_sub_group();
+  auto first_thread_in_sg_idx = sg.get_group_linear_id() * 16;
+
+  /* Create proxy coordinate tensors for each global tensor */
+  Tensor cA = make_identity_tensor(A.shape());   // (M,K)
+  Tensor cB = make_identity_tensor(B.shape());   // (N,K)
+  Tensor cC = make_identity_tensor(C.shape());   // (M,N)
+
+  /* Split GEMM into workgroup tiles, and identify our workgroup's tile (wg_coord) */
+  auto wg_tile = mma.tile_mnk();
+  auto wg_coord = make_coord(wg_m, wg_n, 0);
+
+  Tensor gA = local_tile(cA, select<0,2>(wg_tile), make_coord(wg_m,_));  // (BLK_M,BLK_K,k)
+  Tensor gB = local_tile(cB, select<1,2>(wg_tile), make_coord(wg_n,_));  // (BLK_N,BLK_K,k)
+  Tensor gC = local_tile(cC, wg_tile, wg_coord, Step<_1,_1, X>{});       // (BLK_M,BLK_N)
+
+  /* Create block 2D TiledCopies */
+  auto copy_a = make_block_2d_copy_A(mma, A);
+  auto copy_b = make_block_2d_copy_B(mma, B);
+  auto load_c = make_block_2d_copy_C(mma, C);
+  auto save_c = make_block_2d_copy_D(mma, C);
+
+  /* Slice TiledCopy/TiledMMA operations to thread (work-item) level */
+  auto thr_mma    =    mma.get_slice(first_thread_in_sg_idx);
+  auto thr_copy_a = copy_a.get_slice(first_thread_in_sg_idx);
+  auto thr_copy_b = copy_b.get_slice(first_thread_in_sg_idx);
+  auto thr_save_c = save_c.get_slice(first_thread_in_sg_idx);
+
+  /* Register fragments for MMA */
+  auto tCrA = thr_mma.partition_sg_fragment_A(gA(_,_,0));
+  auto tCrB = thr_mma.partition_sg_fragment_B(gB(_,_,0));
+
+  /* Register fragments for copies */
+  auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_,_,0));
+  auto tBrB = thr_copy_b.partition_sg_fragment_D(gB(_,_,0));
+
+  /* Partition global tensor (proxies) for copies */
+  Tensor tAgA = thr_copy_a.partition_S(gA);
+  Tensor tBgB = thr_copy_b.partition_S(gB);
+
+  /* Partition C */
+  // Tensor tCrC = partition_fragment_C(mma, select<0,1>(wg_tile));
+  auto tCrC = thr_mma.partition_sg_fragment_C(make_identity_tensor(select<0,1>(wg_tile))); // allocate C fragment storage
+  Tensor tCgC = thr_mma.partition_C(gC);    /* also matches save_c's source layout */
+
+  /* Create prefetch TiledCopy instances */
+  auto prefetch_a = make_block_2d_prefetch(copy_a);
+  auto prefetch_b = make_block_2d_prefetch(copy_b);
+
+  auto thr_prefetch_A = prefetch_a.get_slice(first_thread_in_sg_idx);
+  auto thr_prefetch_B = prefetch_b.get_slice(first_thread_in_sg_idx);
+
+  /* Partition global tensor (proxies) for prefetch */
+  auto pAgA = thr_prefetch_A.partition_S(gA);
+  auto pBgB = thr_prefetch_B.partition_S(gB);
+
+  /* Prefetch distance, in units of k tiles */
+  const int prefetch_dist = 3;
+
+  // ------
+  // Kernel
+  // ------
+
+  constexpr int barrier_scope = 2;
+
+  int k_tile_count = ceil_div(shape<1>(A), get<2>(wg_tile));
+  int k_tile_prefetch = 0;
+  /* Clear the accumulators */
+  clear(tCrC);
+  /* Warm up loops with prefetch to L1 */
+  CUTE_UNROLL
+  for (; k_tile_prefetch < prefetch_dist; k_tile_prefetch++) {
+    prefetch(prefetch_a, pAgA(_,_,_,k_tile_prefetch));
+    prefetch(prefetch_b, pBgB(_,_,_,k_tile_prefetch));
+  }
+  /* Main loop */
+  for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
+    /* Split barrier keeping threads loosely together */
+    barrier_arrive(barrier_scope);
+
+    /* Copy A/B from global memory (ideally L1 cache) to registers */
+    copy(copy_a, tAgA(_,_,_,k_tile), tArA);
+    copy(copy_b, tBgB(_,_,_,k_tile), tBrB);
+
+    /* Prefetch A/B tiles to L1 */
+    prefetch(prefetch_a, pAgA(_,_,_,k_tile_prefetch));
+    prefetch(prefetch_b, pBgB(_,_,_,k_tile_prefetch));
+
+    /* Shuffle data from copy fragments to MMA fragments */
+    reorder(tArA, tCrA);
+    reorder(tBrB, tCrB);
+
+    /* Accumulate C += A * B */
+    gemm(mma, tCrA, tCrB, tCrC);
+
+    /* Other half of split barrier */
+    barrier_wait(barrier_scope);
+  }
+  /* Write C to global memory */
+    // copy(save_c, tCrC, tCgC);
+  int local_id = sg.get_local_id();
+  CUTLASS_PRAGMA_UNROLL
+  for (int ki = 0; ki < size(tCgC); ++ki) {
+      auto [m, n] = tCgC(ki);
+      cutlass::atomicAdd(&C(m, n + local_id), tCrC(ki));
+  }
+}
+
+template<class Trait,
+         class Engine0, class Layout0,
+         class Engine1, class Layout1,
+         class Engine2, class Layout2,
+         class TiledMma, class TileMNK,
+         class TiledCopyA, class TiledCopyB>
+CUTLASS_DEVICE void
+gemm_dQ(Trait &trait,
+        Tensor<Engine0, Layout0> &acc,
+        Tensor<Engine1, Layout1> &gA,
+        Tensor< Engine2, Layout2> &gB,
+        TiledMma &tiled_mma, TileMNK &tile_mnk,
+        TiledCopyA &copy_a, TiledCopyB &copy_b, bool debug = false) {
+    using T = typename Trait::DType;
+    using V = typename Trait::VType;
+    constexpr int SubgroupSize = Trait::SubgroupSize;
+    auto sg = compat::get_nd_item<1>().get_sub_group();
+    auto first_thread_in_sg_idx = sg.get_group_linear_id() * SubgroupSize;
+    auto thr_mma = tiled_mma.get_slice(first_thread_in_sg_idx);
+
+    Tensor tCgA = thr_mma.partition_A(gA);
+    Tensor tCgB = thr_mma.partition_B(gB);
+
+    Tensor tCrA = make_tensor<T>(make_fragment_layout(copy_a, tCgA(_,_,_,0).shape()));
+    Tensor tCrB = make_tensor<T>(make_fragment_layout(copy_b, tCgB(_,_,_,0,0).shape()));
+
+    ThrCopy thr_copy_a = copy_a.get_slice(compat::local_id::x());
+    ThrCopy thr_copy_b = copy_b.get_slice(compat::local_id::x());
+
+    Tensor tArA = thr_copy_a.retile_D(tCrA);
+    Tensor tBrB = thr_copy_b.retile_D(tCrB);
+
+    Tensor tAgA = thr_copy_a.retile_S(tCgA);
+    Tensor tBgB = thr_copy_b.retile_S(tCgB);
+    constexpr int barrier_scope = 2;
+    for (int n = 0; n < size<3>(tBgB); ++n) {
+        for (int k = 0; k < size<3>(tAgA); ++k) {
+            barrier_arrive(barrier_scope);
+            cute::copy(copy_a, tAgA(_,_,_,k), tArA);
+            cute::copy(copy_b, tBgB(_,_,_,n,k), tBrB);
+            cute::gemm(tiled_mma, tCrA, tCrB, acc(_,_,_,n));
+            cute::gemm(tiled_mma, tCrA, tCrB, acc(_,_,_,n));
+            barrier_wait(barrier_scope);
+        }
+    }
 }
 
 template <typename To_type, typename Engine, typename Layout>
@@ -712,17 +1004,21 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         Int <kHeadDim>,
         std::conditional_t<Is_even_N, Int<kBlockN>, int>>;
     auto shapedQ = Shape<Int<kBlockM>, Int<kHeadDim>, _1>{};
+    auto shapedQ2 = Shape<Int<kBlockM>, Int<kHeadDim>>{};
     Shape1 shapeKtV;
     Shape12 shapeKtV2;
     Shape2 shapeK;
+    Shape22 shapeK2;
     if constexpr(Is_even_N) {
         shapeKtV = make_shape(Int<kBlockN>{}, Int<kHeadDim>{}, _1{});
         shapeKtV2 = make_shape(Int<kBlockN>{}, Int<kHeadDim>{});
         shapeK = make_shape(Int<kHeadDim>{}, Int<kBlockN>{}, _1{});
+        shapeK2 = make_shape(Int<kHeadDim>{}, Int<kBlockN>{});
     } else {
         shapeKtV = make_shape(tail_n, Int<kHeadDim>{}, _1{});
         shapeKtV2 = make_shape(tail_n, Int<kHeadDim>{});
         shapeK = make_shape(Int<kHeadDim>{}, tail_n, _1{});
+        shapeK2 = make_shape(Int<kHeadDim>{}, tail_n);
     }
     auto shapeO = make_shape(kBlockM, Int<kHeadDim>{}, _1{});
     auto shapeSP = make_shape(kBlockM, block_n_dim, _1{});
@@ -737,19 +1033,22 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                              make_layout(
                                  shapeO,
                                  make_stride(param.o_r_stride, _1{}, _1{})));
+    Tensor mdO2 = make_tensor(make_gmem_ptr(param.do_ptr + o_offset),
+                              make_layout(
+                                  shapeO2,
+                                  make_stride(param.o_r_stride, _1{})));
     Tensor mV2 = make_tensor(make_gmem_ptr(param.v_ptr + v_offset),
                              make_layout(
                                  shapeKtV2,
                                  make_stride(param.v_r_stride, _1{})));
-    Tensor mdO2 = make_tensor(make_gmem_ptr(param.do_ptr + o_offset),
-                             make_layout(
-                                 shapeO2,
-                                 make_stride(param.o_r_stride, _1{})));
     Tensor mK = make_tensor(make_gmem_ptr(param.k_ptr + k_offset),
                             make_layout(
                                 shapeK,
                                 make_stride(_1{}, param.k_r_stride, _1{})));
-
+    Tensor mK2 = make_tensor(make_gmem_ptr(param.k_ptr + k_offset),
+                            make_layout(
+                                shapeK2,
+                                make_stride(_1{}, param.k_r_stride)));
     Tensor mdP = make_tensor(make_gmem_ptr(param.pb_ptr + dsb_offset),
                              make_layout(
                                  shapeSP,
@@ -762,6 +1061,10 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                                   make_layout(
                                       shapedQ,
                                       make_stride(param.dq_r_stride, _1{}, _1{})));
+    Tensor mdQaccum2 = make_tensor(make_gmem_ptr(param.dqaccum_ptr + dq_offset),
+                                  make_layout(
+                                      shapedQ2,
+                                      make_stride(param.dq_r_stride, _1{})));
 #ifdef _DEBUG_
     Tensor mdPd = make_tensor(make_gmem_ptr(param.dp_ptr + s_offset), make_layout(
                                 shapeSP,
@@ -792,32 +1095,16 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
 
     Tensor mSP_coord = cute::get_xe_tensor(shapeSP);
 
-    Tensor mdO_coord2 = make_identity_tensor(shapeO2);
-    Tensor mKtV_coord2 = make_identity_tensor(shapeKtV2);
-    Tensor mSP_coord2 = make_identity_tensor(shapeSP2);
-
     typename Trait::TiledMmaSdP tiled_mma_sdp;
-    typename Trait::TiledMmadQ tiled_mma_dq;
-
     typename Trait::TiledMmaSdP2 tiled_mma_sdp2;
-
-    auto tile_sdp2 = tiled_mma_sdp2.tile_mnk();
-
-    auto tileloaddO2 = make_block_2d_copy_A(tiled_mma_sdp2, mdO2);
-    auto tileloadV2 = make_block_2d_copy_B(tiled_mma_sdp2, mV2);
-
-    auto tilesavedP2 = make_block_2d_copy_C(tiled_mma_sdp2, mdP2); // need to change to make_block_2d_copy_D
-    auto tilesavedPd2 = make_block_2d_copy_C(tiled_mma_sdp2, mdPd2); // debug
+    typename Trait::TiledMmadQ tiled_mma_dq;
+    typename Trait::TiledMmadQ2 tiled_mma_dq2;
 
     auto thr_mma_sdp = tiled_mma_sdp.get_slice(first_thread_in_sg_idx);
-    auto thr_mma_sdp2 = tiled_mma_sdp2.get_slice(local_id);
     auto thr_mma_dq = tiled_mma_dq.get_slice(first_thread_in_sg_idx);
 
     Tensor gdO = local_tile(mdO_coord, select<0, 2>(tile_sdp), make_coord(0,_,0));
     Tensor gKtV = local_tile(mKtV_coord, select<1, 2>(tile_sdp), make_coord(0,_,0));
-
-    Tensor gdO2 = local_tile(mdO_coord2, select<0, 2>(tile_sdp2), make_coord(0,_));
-    Tensor gKtV2 = local_tile(mKtV_coord2, select<1,2>(tile_sdp2), make_coord(0,_));
 
     Tensor gdPa = local_tile(mSP_coord, select<0, 2>(tile_dq), make_coord(0,_,0)); // operand A dQ
     Tensor gK = local_tile(mK_coord, select<1, 2>(tile_dq), make_coord(_,_,0)); // operand B dQ
@@ -825,17 +1112,12 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
     Tensor gSP = local_tile(mSP_coord, select<0, 1>(tile_sdp), make_coord(0,0,0)); // dump P
     Tensor gdQ = local_tile(mdQ_coord, select<0, 1>(tile_dq), make_coord(0,_,0)); // dump dQ
 
-    Tensor gSP2 = local_tile(mSP_coord2, select<0, 1>(tile_sdp2), make_coord(0,0)); // dump P for sdp2
-
     Tensor tPgP = thr_mma_sdp.partition_C(gSP); // save P to internal buffer
-    Tensor tPgP2 = thr_mma_sdp2.partition_C(gSP2); // save P to internal buffer for sdp2
 
     Tensor tdQgdQ = thr_mma_dq.partition_C(gdQ); // save to dq
 
     Tensor tdPrdP = partition_fragment_C(tiled_mma_sdp,
                                          Shape<Int<kBlockM>, Int<kBlockN>>{});
-    Tensor tdPrdP2 = partition_fragment_C(tiled_mma_sdp2,
-                                          select<0, 1>(tile_sdp2));
     Tensor tdQrdQ = partition_fragment_C(tiled_mma_dq,
                                          make_shape(get<0>(tile_dq),
                                                     get<1>(tile_dq),
@@ -861,6 +1143,10 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                                    make_layout(
                                        shapedQ,
                                        make_stride(param.dq_r_stride, _1{}, _1{})));
+            mdQaccum2 = make_tensor(make_gmem_ptr(mdQaccum.data()),
+                                      make_layout(
+                                          shapedQ2,
+                                          make_stride(param.dq_r_stride, _1{})));
 #ifdef _DEBUG_
             mdPd = make_tensor(make_gmem_ptr(mdPd.data()),
                                make_layout(
@@ -874,47 +1160,45 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
             tileloaddO = typename Trait::TiledLoaddO{mdO};
             tileloaddQ = typename Trait::TiledLoaddQ{mdQaccum};
             tilesavedQ = typename Trait::TiledSavedQ{mdQaccum};
-            tileloaddO2 = make_block_2d_copy_A(tiled_mma_sdp2, mdO2);
 #ifdef _DEBUG_
             tilesavedPd = typename Trait::TiledSavedP{mdPd};
-            tilesavedPd2 = make_block_2d_copy_C(tiled_mma_sdp2, mdPd2); // debug
 #endif
         }
         clear(tdPrdP);
+        gemm_SdP(mdO2, mV2, mdPd2, mdP2, tiled_mma_sdp2, 0, 0);
         // dP=dO*Vt
-        gemm_SdP(trait, tdPrdP, gdO, gKtV,  tiled_mma_sdp, tile_sdp, tileloaddO, tileloadV);
+        // gemm_SdP(trait, tdPrdP, gdO, gKtV,  tiled_mma_sdp, tile_sdp, tileloaddO, tileloadV);
         // mm_SdP2(trait, tdPrdP2, gdO2, gKtV2, tiled_mma_sdp2, tile_sdp2, tileloaddO2, tileloadV2);
-        auto tdPrdPl = make_tensor_like<T>(tdPrdP);
-        convert_type(converter, tdPrdP, tdPrdPl);
-        auto tdPrdPl2 = make_tensor_like<T>(tdPrdP2);
-        convert_type(converter, tdPrdP2, tdPrdPl2);
-        copy(tilesavedP, tdPrdPl, tPgP);
+        // auto tdPrdPl = make_tensor_like<T>(tdPrdP);
+        // convert_type(converter, tdPrdP, tdPrdPl);
+        // auto tdPrdPl2 = make_tensor_like<T>(tdPrdP2);
+        // convert_type(converter, tdPrdP2, tdPrdPl2);
+        // copy(tilesavedP, tdPrdPl, tPgP);
         // copy(tilesavedP2, tdPrdPl2, tPgP2);
 #ifdef _DEBUG_
-        copy(tilesavedPd, tdPrdPl, tPgP);
+        // copy(tilesavedPd, tdPrdPl, tPgP);
         // copy(tilesavedPd2, tdPrdPl2, tPgP2); // debug
 #endif
         clear(tdQrdQ);
-        copy(tileloaddQ, tdQgdQ, tdQrdQ); // load dq_accum
+        // copy(tileloaddQ, tdQgdQ, tdQrdQ); // load dq_accum
         // dQ=dP*K
-        gemm_dQ(trait, tdQrdQ, gdPa, gK,  tiled_mma_dq, tile_dq, tileloaddP, tileloadK);
-        copy(tilesavedQ, tdQrdQ, tdQgdQ);
+        gemm_dQ2(mdP2, mK2, mdQaccum2, tiled_mma_dq2, 0, 0, m_block == 0 and n_block == 0);
+        // copy(tilesavedQ, tdQrdQ, tdQgdQ);
 
         // update ptr/atom copy
         mdO.data() = mdO.data() + int(kBlockM * param.o_r_stride);
         mdO2.data() = mdO2.data() + int(kBlockM * param.o_r_stride);
         mdQaccum.data() = mdQaccum.data() + int(kBlockM * param.dq_r_stride);
+        mdQaccum2.data() = mdQaccum2.data() + int(kBlockM * param.dq_r_stride);
 #ifdef _DEBUG_
         mdPd.data() = mdPd.data() + int(kBlockM * param.s_r_stride); // debug
         mdPd2.data() = mdPd2.data() + int(kBlockM * param.s_r_stride); // debug
 #endif
         tileloaddO = typename Trait::TiledLoaddO{mdO};
-        tileloaddO2 = make_block_2d_copy_A(tiled_mma_sdp2, mdO2);
         tileloaddQ = typename Trait::TiledLoaddQ{mdQaccum};
         tilesavedQ = typename Trait::TiledSavedQ{mdQaccum};
 #ifdef _DEBUG_
         tilesavedPd = typename Trait::TiledSaveS{mdPd}; // debug
-        tilesavedPd2 = make_block_2d_copy_C(tiled_mma_sdp2, mdPd2); // debug
 #endif
     }
 }
@@ -925,13 +1209,12 @@ mha_backward_seq(T trait,
                  Param<typename T::DType> param) {
     const int bidb = BlockIdxZ();
     const int bidhq = BlockIdxY();
+    const int n_block = BlockIdxX();
     const int bidhkv = bidhq / param.num_qh_per_kvh;
-    // const int max_n_block = ceil_div(param.seq_len_kv, trait.kBlockN);
-    for (int n_block = 0; n_block < param.n_block; ++n_block)
-        if (param.tail_n > 0 and n_block == param.n_block - 1)
-            dq_dk_dv_1colblock<false, false>(trait, param, bidb, bidhq, bidhkv, param.n_block - 1, param.tail_n);
-        else
-            dq_dk_dv_1colblock<true, false>(trait, param, bidb, bidhq, bidhkv, n_block);
+    if (param.tail_n > 0 and n_block == param.n_block - 1)
+        dq_dk_dv_1colblock<false, false>(trait, param, bidb, bidhq, bidhkv, param.n_block - 1, param.tail_n);
+    else
+        dq_dk_dv_1colblock<true, false>(trait, param, bidb, bidhq, bidhkv, n_block);
 }
 
 template<class...> class mhaodoDeviceName;
@@ -992,7 +1275,7 @@ void launch_mha_backward_headdim(ProblemShape problem_shape,
     } else {
         setup_bshd_stride(param);
     }
-    auto dimGrid1 = compat::dim3(size(1),
+    auto dimGrid1 = compat::dim3(size(param.n_block),
                                  size(param.num_head_q), size(param.batch));
     assert((param.num_head_q % param.num_head_kv == 0) && "num_head_q must be dividable by num_head_kv");
     assert((param.num_head_q >= param.num_head_kv) && "num_head_q must be bigger than or equal to num_head_kv");
