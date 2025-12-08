@@ -27,6 +27,21 @@ cutlass_example_add_executable(
   cnpy.cpp
 )
 cutlass_example_add_executable(
+  reg_reuse_dk
+  reg_reuse_dk.cpp
+  cnpy.cpp
+)
+cutlass_example_add_executable(
+  reg_reuse_dv
+  reg_reuse_dv.cpp
+  cnpy.cpp
+)
+cutlass_example_add_executable(
+  last_block_bug
+  last_block_bug.cpp
+  cnpy.cpp
+)
+cutlass_example_add_executable(
   xe_gemm_test
   xe_gemm_test.cpp
 )
@@ -36,5 +51,8 @@ target_compile_definitions(reg_reuse_dq PRIVATE
 )
 target_link_options(sdpa_backward PUBLIC "-lz")
 target_link_options(reg_reuse_dq PUBLIC "-lz")
+target_link_options(reg_reuse_dk PUBLIC "-lz")
+target_link_options(reg_reuse_dv PUBLIC "-lz")
+target_link_options(last_block_bug PUBLIC "-lz")
 set_target_properties(sdpa_backward PROPERTIES CXX_COMPILER_LAUNCHER "IGC_VectorAliasBBThreshold=10000" )
 set_target_properties(sdpa_backward PROPERTIES CXX_LINKER_LAUNCHER "IGC_VectorAliasBBThreshold=10000" )

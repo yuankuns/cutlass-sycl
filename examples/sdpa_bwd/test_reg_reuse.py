@@ -37,7 +37,7 @@ def test_reg_reuse(dtype,
     p = torch.matmul(q, k.transpose(-1, -2))
     dp = torch.matmul(do, v.transpose(-1, -2))
     dk = torch.matmul(dp.transpose(-1, -2), q)
-    dv = torch.matmul(torch.transpose(do, -1, -2), p)
+    dv = torch.matmul(p.transpose(-1, -2), do)
     dq = torch.matmul(dp, k)
     dump_dict = {}
     print(f"seed {seed} bsz {batch} nh_q {num_heads_q} nh_kv {num_heads_kv} sl_qo {seq_len_qo} sl_kv {seq_len_kv} hs_qk {head_size_qk} hs_vo {head_size_vo} is_causal {is_causal} is_bhsd {is_bhsd}")
