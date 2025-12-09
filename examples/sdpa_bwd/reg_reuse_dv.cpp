@@ -895,9 +895,9 @@ gemm_dkv(ATensor   const& A,         // (M,K)
     prefetch(prefetch_b, pBgB(_,_,_,k_tile_prefetch));
 
     /* Shuffle data from copy fragments to MMA fragments */
-    // reorder(tArA, tCrA);
+    reorder(tArA, tCrA);
     reorder(tBrB, tCrB);
-    reorder(rSdP, tCrA);
+    // reorder(rSdP, tCrA); //transpose fail here
 
     /* Accumulate C += A * B */
     gemm(mma, tCrA, tCrB, acc);
