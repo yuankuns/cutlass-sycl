@@ -112,8 +112,8 @@ struct FAKernel {
     using MMA_Atom2 = XE_DPAS_TT<8, VType, DType>;
     using _K = Int<MMA_Atom2::K * 2>;
     using SubgroupLayoutSdP = Layout<Shape<Int<AtomLayoutMSdP>, Int<kNSGs / AtomLayoutMSdP>, _1>>;
-    using SubgroupLayoutSdP2 = Layout<Shape<_8, _1, _1>,
-                                      Stride<_1, _0, _0>>;
+    using SubgroupLayoutSdP2 = Layout<Shape<_1, _8, _1>,
+                                      Stride<_8, _1, _0>>;
     using SubgroupLayoutdKV = Layout<Shape<Int<AtomLayoutNdKV>, Int<kNSGs / AtomLayoutNdKV>, _1>>;
     using SubgroupLayoutdKV2 = Layout<Shape<_8, _1, _1>,
                                      Stride<_1, _1, _0>>;
@@ -132,7 +132,7 @@ struct FAKernel {
     static_assert(kBlockN % size<0>(TileShapedKV{}) == 0 && "kBlockN must be dividable by tile size M");
     static_assert(size<1>(TileShapedKV{}) <= kHeadDim && "tile size N must be smaller than or equal to kHeadDim");
     static_assert(kHeadDim % size<1>(TileShapedKV{}) == 0 && "kHeadDim must be dividable by tile size N");
-    using TileShapedKV2 = Layout<Shape<Int<kBlockN>, Int<kHeadDim>, _K>>;
+    using TileShapedKV2 = Layout<Shape<Int<kBlockN>, Int<kHeadDim>, Int<kBlockM>>>;
     using TileShapedQ = Tile<Int<kBlockM>, Int<16 * kNSGs / AtomLayoutMdQ>, Int<kBlockN>>;
     using TileShapedQ2 = Layout<Shape<Int<kBlockM>, Int<kHeadDim>, _K>>;
     static_assert(size<0>(TileShapedQ{}) <= kBlockM && "tile size M must be smaller than or equal to kBlockM");
@@ -143,16 +143,9 @@ struct FAKernel {
     using TiledMmaSdP = typename TiledMMAHelper<MMA_Atom<MMA_Atom2>,
                                                 TileShapeSdP2,
                                                 SubgroupLayoutSdP2>::TiledMMA;
-    using TiledMmadKV = typename TiledMMAHelper<MMA_Atom_ARCH,
-                                                Layout<TileShapedKV>,
-                                                SubgroupLayoutdKV>::TiledMMA;
-    using TiledMmadKV2 = typename TiledMMAHelper<MMA_Atom<MMA_Atom2>,
+    using TiledMmadKV = typename TiledMMAHelper<MMA_Atom<MMA_Atom2>,
                                                 TileShapedKV2,
                                                 SubgroupLayoutdKV2>::TiledMMA;
-
-
-
-
     using TiledMmadQ = typename TiledMMAHelper<MMA_Atom<MMA_Atom2>,
                                                TileShapedQ2,
                                                SubgroupLayoutdQ2>::TiledMMA;
@@ -534,16 +527,32 @@ CUTLASS_DEVICE auto convert_type(CVT &cvt, T0 &src, T1 &dst) {
     return dst;
 }
 
+template<class Engine, class Layout, class TiledMMA>
+auto
+create_regreuse(Tensor<Engine, Layout> &C,
+                TiledMMA const &mma) {
+    auto sg = compat::get_nd_item<1>().get_sub_group();
+    auto first_thread_in_sg_idx = sg.get_group_linear_id() * 16;
+    Tensor cC = make_identity_tensor(C.shape());   // (M,N)
+    auto wg_tile = mma.tile_mnk();
+    Tensor gC = local_tile(cC, select<0, 1>(wg_tile), make_coord(0, 0));       // (BLK_M,BLK_N)
+    auto copy_c = make_block_2d_copy_D(mma, C);
+    auto thr_copy_c = copy_c.get_slice(first_thread_in_sg_idx);
+    auto r16 = thr_copy_c.partition_sg_fragment_S(gC);
+    return r16;
+}
+
 template <class ATensor, class BTensor, class CTensor,
-          class DTensor, class TiledMMA>
+          class DTensor, class ETensor, class TiledMMA>
 void
 gemm_SdP(ATensor   const& A,         // (M,K)
          BTensor   const& B,         // (N,K)
          CTensor        & C,         // (M,N)
          DTensor        & D,         // (M,N)
+         ETensor        & rSdP,         // (M,N)
          TiledMMA const & mma,
          int wg_m,
-         int wg_n, bool debug = false)
+         int wg_n)
 {
   // -----
   // Setup
@@ -565,7 +574,6 @@ gemm_SdP(ATensor   const& A,         // (M,K)
   Tensor gA = local_tile(cA, select<0,2>(wg_tile), make_coord(wg_m,_));  // (BLK_M,BLK_K,k)
   Tensor gB = local_tile(cB, select<1,2>(wg_tile), make_coord(wg_n,_));  // (BLK_N,BLK_K,k)
   Tensor gC = local_tile(cC, wg_tile, wg_coord, Step<_1,_1, X>{});       // (BLK_M,BLK_N)
-  Tensor gD = local_tile(cC, wg_tile, wg_coord, Step<_1,_1, X>{});       // (BLK_M,BLK_N)
 
   /* Create block 2D TiledCopies */
   auto copy_a = make_block_2d_copy_A(mma, A);
@@ -578,7 +586,6 @@ gemm_SdP(ATensor   const& A,         // (M,K)
   auto thr_copy_a = copy_a.get_slice(first_thread_in_sg_idx);
   auto thr_copy_b = copy_b.get_slice(first_thread_in_sg_idx);
   auto thr_copy_c = copy_c.get_slice(first_thread_in_sg_idx);
-  auto thr_copy_d = copy_d.get_slice(first_thread_in_sg_idx);
 
   /* Register fragments for MMA */
   auto tCrA = thr_mma.partition_sg_fragment_A(gA(_,_,0));
@@ -596,7 +603,6 @@ gemm_SdP(ATensor   const& A,         // (M,K)
   // Tensor tCrC = partition_fragment_C(mma, select<0,1>(wg_tile));
   auto tCrC = thr_mma.partition_sg_fragment_C(make_identity_tensor(select<0,1>(wg_tile))); // allocate C fragment storage
   Tensor tCgC = thr_copy_c.partition_D(gC);    /* also matches copy_c's source layout */
-  Tensor tCgC2 = thr_copy_d.partition_D(gD);    /* also matches copy_d's source layout */
 
   /* Create prefetch TiledCopy instances */
   auto prefetch_a = make_block_2d_prefetch(copy_a);
@@ -629,7 +635,6 @@ gemm_SdP(ATensor   const& A,         // (M,K)
     prefetch(prefetch_a, pAgA(_,_,_,k_tile_prefetch));
     prefetch(prefetch_b, pBgB(_,_,_,k_tile_prefetch));
   }
-
   /* Main loop */
   for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
     /* Split barrier keeping threads loosely together */
@@ -653,10 +658,9 @@ gemm_SdP(ATensor   const& A,         // (M,K)
     barrier_wait(barrier_scope);
   }
   /* Write C to global memory */
-  auto tCrC16bit = thr_copy_c.partition_sg_fragment_S(gC);
-  reorder(tCrC, tCrC16bit);
-  copy(copy_c, tCrC16bit, tCgC);
-  copy(copy_d, tCrC16bit, tCgC);
+  reorder(tCrC, rSdP);
+  copy(copy_c, rSdP, tCgC);
+  copy(copy_d, rSdP, tCgC);
 }
 
 template <class ATensor, class BTensor, class CTensor,
@@ -780,15 +784,17 @@ gemm_kernel(ATensor   const& A,         // (M,K)
   copy(copy_c, tCrC16bit, tCgC);
 }
 
-template <class ATensor, class BTensor, class CTensor,
+template <class ATensor, class BTensor,
+          class CTensor, class DTensor,
           class TiledMMA>
 void
 gemm_dkv(ATensor   const& A,         // (M,K)
          BTensor   const& B,         // (N,K)
-         CTensor        & acc,         // (M,N)
+         CTensor        & rSdP,         // (M,N)
+         DTensor        & acc,         // (M,N)
          TiledMMA const & mma,
          int wg_m,
-         int wg_n)
+         int wg_n, bool debug = false)
 {
   // -----
   // Setup
@@ -870,7 +876,11 @@ gemm_dkv(ATensor   const& A,         // (M,K)
     prefetch(prefetch_a, pAgA(_,_,_,k_tile_prefetch));
     prefetch(prefetch_b, pBgB(_,_,_,k_tile_prefetch));
   }
-
+  // if (debug and is_cur_thread()) {
+  //     print("k_tile: ");
+  //     print(k_tile_count);
+  //     print("\n");
+  // }
   /* Main loop */
   for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
     /* Split barrier keeping threads loosely together */
@@ -885,19 +895,18 @@ gemm_dkv(ATensor   const& A,         // (M,K)
     prefetch(prefetch_b, pBgB(_,_,_,k_tile_prefetch));
 
     /* Shuffle data from copy fragments to MMA fragments */
-    reorder(tArA, tCrA);
+    // reorder(tArA, tCrA);
     reorder(tBrB, tCrB);
+    reorder(rSdP, tCrA);
 
     /* Accumulate C += A * B */
     gemm(mma, tCrA, tCrB, acc);
+    // gemm(mma, tCrA, tCrB, acc);
 
     /* Other half of split barrier */
     barrier_wait(barrier_scope);
   }
   /* Write C to global memory */
-    // auto tCrC16bit = thr_copy_c.partition_sg_fragment_S(gC);
-    // reorder(tCrC, tCrC16bit);
-    // copy(copy_c, tCrC16bit, tCgC);
 }
 
 template <typename To_type, typename Engine, typename Layout>
@@ -999,7 +1008,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
 #endif
 
     typename Trait::TiledMmaSdP tiled_mma_sdp;
-    typename Trait::TiledMmadKV2 tiled_mma_dkv;
+    typename Trait::TiledMmadKV tiled_mma_dkv;
 
 
     auto tile_dkv = tiled_mma_dkv.tile_mnk();
@@ -1043,28 +1052,17 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
 #endif
         }
         // P=Q*Kt
-        gemm_SdP(mQ, mKt, mS, mP, tiled_mma_sdp, 0, 0, m_block == 0 and n_block == 0);
+        auto rSdP = create_regreuse(mP, tiled_mma_sdp);
+        gemm_SdP(mQ, mKt, mS, mP, rSdP, tiled_mma_sdp, 0, 0);
         sycl::group_barrier(group);
         // dV=Pt*dO
-        gemm_dkv(mPt, mdOt, tdVrdV, tiled_mma_dkv, 0, 0);
-        // if (is_cur_thread() and n_block == 0) {
-        //     print("tdKrdK(%d):\n", m_block);
-        //     print_t(tdKrdK);
-        //     print("\n");
-        // }
+        gemm_dkv(mPt, mdOt, rSdP, tdVrdV, tiled_mma_dkv, 0, 0);
         // update ptr/atom copy
         mQ.data() = mQ.data() + int(kBlockM * param.q_r_stride);
         mdOt.data() = mdOt.data() + int(kBlockM * param.o_r_stride);
 #ifdef _DEBUG_
         mS.data() = mS.data() + int(kBlockM * param.s_r_stride); // debug
 #endif
-    }
-    if (cute::thread(0, 0) and n_block == 0) {
-        print("tdVrdV:\n");
-        print_t(tdVrdV);
-        print("\ntdVgdV:\n");
-        print(tdVgdV);
-        print("\n");
     }
     auto tdVrdV16bit = thr_copy_dv.partition_sg_fragment_S(gdV);
     reorder(tdVrdV, tdVrdV16bit);
