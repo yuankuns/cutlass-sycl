@@ -121,7 +121,8 @@ struct FAKernel {
     using SubgroupLayoutdQ2 = Layout<Shape<_8, _1, _1>,
                                      Stride<_1, _0, _0>>;
     using TileShapeSdP = Tile<Int<kBlockM>, Int<kBlockN>, _16>;
-    using TileShapeSdP2 = Layout<Shape<Int<kBlockM>, Int<kBlockN>, _K>>;
+    using TileShapeSdP2 = Layout<Shape<Int<kBlockM>, Int<kBlockN>, _64>>;
+
     static_assert(size<0>(TileShapeSdP{}) <= kBlockM && "tile size M must be smaller than or equal to kBlockM");
     static_assert(kBlockM % size<0>(TileShapeSdP{}) == 0 && "kBlockM must be dividable by tile size M");
     static_assert(size<1>(TileShapeSdP{}) <= kBlockN && "tile size N must be smaller than or equal to kBlockN");
@@ -876,11 +877,6 @@ gemm_dkv(ATensor   const& A,         // (M,K)
     prefetch(prefetch_a, pAgA(_,_,_,k_tile_prefetch));
     prefetch(prefetch_b, pBgB(_,_,_,k_tile_prefetch));
   }
-  // if (debug and is_cur_thread()) {
-  //     print("k_tile: ");
-  //     print(k_tile_count);
-  //     print("\n");
-  // }
   /* Main loop */
   for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
     /* Split barrier keeping threads loosely together */
@@ -1184,14 +1180,14 @@ void launch_mha_backward(ProblemShape problem_shape,
     const int headdim = get<5>(problem_shape);
     if (headdim == 128) {
         constexpr int kBlockM = 64;
-        constexpr int kBlockN = 64;
+        constexpr int kBlockN = 128;
         constexpr int kHeadDim = 128;
         constexpr int kNSGs = 8;
         constexpr int AtomLayoutMSdP = 2;
         constexpr int AtomLayoutNdKV = 4;
         constexpr int AtomLayoutMdQ = 4;
         static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
-        static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
+        // static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
         launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN,
                                     kHeadDim, kNSGs,
                                     AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
