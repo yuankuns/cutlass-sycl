@@ -870,7 +870,13 @@ gemm_dkv(ATensor   const& A,         // (M,K)
   int k_tile_prefetch = 0;
   /* Clear the accumulators */
   // clear(tCrC);
-
+  if (is_cur_thread() and debug) {
+      print("tCrA:\n");
+      print(tCrA);
+      print("\nrSdP:\n");
+      print(rSdP);
+      print("\n");
+  }
   /* Warm up loops with prefetch to L1 */
   CUTE_UNROLL
   for (; k_tile_prefetch < prefetch_dist; k_tile_prefetch++) {
@@ -891,9 +897,9 @@ gemm_dkv(ATensor   const& A,         // (M,K)
     prefetch(prefetch_b, pBgB(_,_,_,k_tile_prefetch));
 
     /* Shuffle data from copy fragments to MMA fragments */
-    reorder(tArA, tCrA);
+    // reorder(tArA, tCrA);
     reorder(tBrB, tCrB);
-    // reorder(rSdP, tCrA); //transpose fail here
+    reorder(rSdP, tCrA); //transpose fail here
 
     /* Accumulate C += A * B */
     gemm(mma, tCrA, tCrB, acc);
@@ -1052,7 +1058,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         gemm_SdP(mQ, mKt, mS, mP, rSdP, tiled_mma_sdp, 0, 0);
         sycl::group_barrier(group);
         // dV=Pt*dO
-        gemm_dkv(mPt, mdOt, rSdP, tdVrdV, tiled_mma_dkv, 0, 0);
+        gemm_dkv(mPt, mdOt, rSdP, tdVrdV, tiled_mma_dkv, 0, 0, m_block == 0 and n_block == 0);
         // update ptr/atom copy
         mQ.data() = mQ.data() + int(kBlockM * param.q_r_stride);
         mdOt.data() = mdOt.data() + int(kBlockM * param.o_r_stride);
@@ -1179,14 +1185,14 @@ void launch_mha_backward(ProblemShape problem_shape,
                          const int seq_len_kv_pad) {
     const int headdim = get<5>(problem_shape);
     if (headdim == 128) {
-        constexpr int kBlockM = 64;
+        constexpr int kBlockM = 128;
         constexpr int kBlockN = 128;
         constexpr int kHeadDim = 128;
         constexpr int kNSGs = 8;
         constexpr int AtomLayoutMSdP = 2;
         constexpr int AtomLayoutNdKV = 4;
         constexpr int AtomLayoutMdQ = 4;
-        static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
+        // static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
         // static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
         launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN,
                                     kHeadDim, kNSGs,
