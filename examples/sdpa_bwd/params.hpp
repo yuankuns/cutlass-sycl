@@ -28,23 +28,27 @@ struct FAKernel {
     static constexpr int AtomLayoutNdKV = AtomLayoutNdKV_;
     static constexpr int AtomLayoutMdQ = AtomLayoutMdQ_;
     static constexpr bool is_causal = is_causal_;
+    using MMA_Atom_ARCH2 = XE_DPAS_TT<8, VType, DType>;
+    using _K = Int<MMA_Atom_ARCH2::K * 2>;
     using SubgroupLayoutSdP = Layout<Shape<Int<AtomLayoutMSdP>, Int<kNSGs / AtomLayoutMSdP>, _1>>;
     using SubgroupLayoutdKV = Layout<Shape<Int<AtomLayoutNdKV>, Int<kNSGs / AtomLayoutNdKV>, _1>>;
     using SubgroupLayoutdQ = Layout<Shape<Int<AtomLayoutMdQ>, Int<kNSGs / AtomLayoutMdQ>, _1>>;
-
     using TileShapeSdP = Tile<Int<kBlockM>, Int<kBlockN>, _16>;
+    using TileShapeSdP2 = Layout<Shape<Int<kBlockM>, Int<kBlockN>, _K>>;
     static_assert(size<0>(TileShapeSdP{}) <= kBlockM && "tile size M must be smaller than or equal to kBlockM");
     static_assert(kBlockM % size<0>(TileShapeSdP{}) == 0 && "kBlockM must be dividable by tile size M");
     static_assert(size<1>(TileShapeSdP{}) <= kBlockN && "tile size N must be smaller than or equal to kBlockN");
     static_assert(kBlockN % size<1>(TileShapeSdP{}) == 0 && "kBlockN must be dividable by tile size N ");
 
     using TileShapedKV = Tile<Int<kBlockN>, Int<16 * kNSGs / AtomLayoutNdKV>, Int<kBlockN>>;
+    using TileShapedKV2 = Layout<Shape<Int<kBlockN>, Int<kHeadDim>, _K>>;
     static_assert(size<0>(TileShapedKV{}) <= kBlockN && "tile size M must be smaller than or equal to kBlockN");
     static_assert(kBlockN % size<0>(TileShapedKV{}) == 0 && "kBlockN must be dividable by tile size M");
     static_assert(size<1>(TileShapedKV{}) <= kHeadDim && "tile size N must be smaller than or equal to kHeadDim");
     static_assert(kHeadDim % size<1>(TileShapedKV{}) == 0 && "kHeadDim must be dividable by tile size N");
 
     using TileShapedQ = Tile<Int<kBlockM>, Int<16 * kNSGs / AtomLayoutMdQ>, Int<kBlockN>>;
+    using TileShapedQ2 = Layout<Shape<Int<kBlockM>, Int<kHeadDim>, Int<kBlockN>>>;
     static_assert(size<0>(TileShapedQ{}) <= kBlockM && "tile size M must be smaller than or equal to kBlockM");
     static_assert(kBlockM % size<0>(TileShapedQ{}) == 0 && "kBlockM must dividable by tile size M");
     static_assert(size<1>(TileShapedQ{}) <= kHeadDim && "tile size N must be smaller than or equal to kHeadDim");
@@ -61,6 +65,18 @@ struct FAKernel {
     using TiledMmadQ = typename TiledMMAHelper<MMA_Atom_ARCH,
                                                Layout<TileShapedQ>,
                                                SubgroupLayoutdQ>::TiledMMA;
+
+    using TiledMmaSdP2 = typename TiledMMAHelper<MMA_Atom<MMA_Atom_ARCH2>,
+                                                 TileShapeSdP2,
+                                                 SubgroupLayoutSdP>::TiledMMA;
+
+    using TiledMmadKV2 = typename TiledMMAHelper<MMA_Atom<MMA_Atom_ARCH2>,
+                                                 TileShapedKV2,
+                                                 SubgroupLayoutdKV>::TiledMMA;
+
+    using TiledMmadQ2 = typename TiledMMAHelper<MMA_Atom<MMA_Atom_ARCH2>,
+                                                TileShapedQ2,
+                                                SubgroupLayoutdQ>::TiledMMA;
     static constexpr auto bP = Int<2>{}; // Pipeline
 
     using StrideR = cute::tuple<long, cute::C<1>>;
