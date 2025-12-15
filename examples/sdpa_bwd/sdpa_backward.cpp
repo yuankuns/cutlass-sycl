@@ -491,6 +491,36 @@ gemm_dQ(Trait &trait,
     }
 }
 
+template<class Trait,
+         class Engine0, class Layout0,
+         class Engine1, class Layout1,
+         class Engine2, class Layout2,
+         class TiledMMA>
+void
+gemm_dQ2(Trait &trait,
+        Tensor<Engine0, Layout0> const& A,         // (M,K)
+        Tensor<Engine1, Layout1> const& B,         // (N,K)
+        Tensor<Engine2, Layout2> const& C,         // (M,N)
+        TiledMMA const & mma,
+        const int m_block,
+        const int n_block) {
+    auto sg = compat::get_nd_item<1>().get_sub_group();
+    auto first_thread_in_sg_idx = sg.get_group_linear_id() * trait.SubgroupSize;
+    auto tile_mnk = mma.tile_mnk();
+    Tensor cC = make_identity_tensor(C.shape());   // (M,N)
+    Tensor gC = local_tile(cC, select<0, 1>(tile_mnk), make_coord(m_block, n_block));  // (BLK_M,BLK_N)
+    auto thr_mma = mma.get_slice(first_thread_in_sg_idx);
+    auto tCrC = thr_mma.partition_sg_fragment_C(make_identity_tensor(select<0,1>(tile_mnk))); // allocate C fragment storage
+    Tensor tCgC = thr_mma.partition_C(gC);
+    gemm_kernel<true>(trait, A, B, tCrC, mma, m_block, n_block);
+    int local_id = sg.get_local_id();
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i <  size(tCgC); ++i) {
+        auto [m, n] = tCgC(i);
+        cutlass::atomicAdd(&C(m, n + local_id), tCrC(i));
+    }
+}
+
 template <bool Is_even_MN, class TileCopy,
           class Engine0, class Layout0,
           class Engine1, class Layout1>
@@ -750,6 +780,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         Int <kHeadDim>,
         std::conditional_t<Is_even_N, Int<kBlockN>, int>>;
     auto shapeQ2 = make_shape(kBlockM, Int<kHeadDim>{});
+    auto shapedQ2 = Shape<Int<kBlockM>, Int<kHeadDim>>{};
     Shape12 shapeKtV2;
     Shape22 shapeK2;
     if constexpr(Is_even_N) {
@@ -821,6 +852,10 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                             make_layout(
                                 shapeK,
                                 make_stride(_1{}, param.k_r_stride, _1{})));
+    Tensor mK2 = make_tensor(make_gmem_ptr(param.k_ptr + k_offset),
+                            make_layout(
+                                shapeK2,
+                                make_stride(_1{}, param.k_r_stride)));
     Tensor mdPt = make_tensor(make_gmem_ptr(param.pb_ptr + dsb_offset),
                               make_layout(
                                   shapePt,
@@ -867,6 +902,10 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                                   make_layout(
                                       shapedQ,
                                       make_stride(param.dq_r_stride, _1{}, _1{})));
+    Tensor mdQaccum2 = make_tensor(make_gmem_ptr(param.dqaccum_ptr + dq_offset),
+                                  make_layout(
+                                      shapedQ2,
+                                      make_stride(param.dq_r_stride, _1{})));
     Tensor mdK = make_tensor(make_gmem_ptr(param.dk_ptr + dk_offset),
                              make_layout(
                                  shapeKtV,
@@ -1037,6 +1076,10 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                                    make_layout(
                                        shapedQ,
                                        make_stride(param.dq_r_stride, _1{}, _1{})));
+            mdQaccum2 = make_tensor(make_gmem_ptr(mdQaccum2.data()),
+                                   make_layout(
+                                       shapedQ2,
+                                       make_stride(param.dq_r_stride, _1{})));
             mQt = make_tensor(make_gmem_ptr(mQt.data()),
                               make_layout(
                                   make_shape(Int<kHeadDim>{}, tail_m, _1{}),
@@ -1154,7 +1197,9 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         clear(tdQrdQ);
         // dQ=dP*K
         gemm_dQ(trait, tdQrdQ, gdPa, gK,  tiled_mma_dq, tile_dq, tileloaddP, tileloadK, m_block == 0 and n_block == 0);
-        mha_atomic_add(mdQaccum, tdQgdQ, tdQrdQ, local_id);
+        gemm_dQ2(trait, mdP2, mK2, mdQaccum2,
+                 tiled_mma_dq2, 0, 0);
+        // mha_atomic_add(mdQaccum, tdQgdQ, tdQrdQ, local_id);
 
         // dK=dPt*Q
         gemm_dKV(trait, tdKrdK, gdPt, gQtdOt, tiled_mma_dkv, tile_dkv, tileloaddPt, tileloadQt);
@@ -1167,6 +1212,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         mdOt.data() = mdOt.data() + int(kBlockM * param.o_r_stride);
         mdOt2.data() = mdOt2.data() + int(kBlockM * param.o_r_stride);
         mdQaccum.data() = mdQaccum.data() + int(kBlockM * param.dq_r_stride);
+        mdQaccum2.data() = mdQaccum2.data() + int(kBlockM * param.dq_r_stride);
         mQt.data() = mQt.data() + int(kBlockM * param.q_r_stride);
         mQt2.data() = mQt2.data() + int(kBlockM * param.q_r_stride);
 #ifdef _DEBUG_
