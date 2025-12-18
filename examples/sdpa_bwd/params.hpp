@@ -29,7 +29,7 @@ struct FAKernel {
     static constexpr int AtomLayoutMdQ = AtomLayoutMdQ_;
     static constexpr bool is_causal = is_causal_;
     using MMA_Atom_ARCH2 = XE_DPAS_TT<8, VType, DType>;
-    using _K = Int<MMA_Atom_ARCH2::K * 2>;
+    using _K = Int<MMA_Atom_ARCH2::K>;
     using SubgroupLayoutSdP = Layout<Shape<Int<AtomLayoutMSdP>, Int<kNSGs / AtomLayoutMSdP>, _1>>;
     using SubgroupLayoutdKV = Layout<Shape<Int<AtomLayoutNdKV>, Int<kNSGs / AtomLayoutNdKV>, _1>>;
     using SubgroupLayoutdQ = Layout<Shape<Int<AtomLayoutMdQ>, Int<kNSGs / AtomLayoutMdQ>, _1>>;
@@ -48,7 +48,7 @@ struct FAKernel {
     static_assert(kHeadDim % size<1>(TileShapedKV{}) == 0 && "kHeadDim must be dividable by tile size N");
 
     using TileShapedQ = Tile<Int<kBlockM>, Int<16 * kNSGs / AtomLayoutMdQ>, Int<kBlockN>>;
-    using TileShapedQ2 = Layout<Shape<Int<kBlockM>, Int<kHeadDim>, Int<kBlockN>>>;
+    using TileShapedQ2 = Layout<Shape<Int<kBlockM>, Int<kHeadDim>, _K>>;
     static_assert(size<0>(TileShapedQ{}) <= kBlockM && "tile size M must be smaller than or equal to kBlockM");
     static_assert(kBlockM % size<0>(TileShapedQ{}) == 0 && "kBlockM must dividable by tile size M");
     static_assert(size<1>(TileShapedQ{}) <= kHeadDim && "tile size N must be smaller than or equal to kHeadDim");
