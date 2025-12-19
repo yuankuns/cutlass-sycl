@@ -403,51 +403,6 @@ mha_reorder_copy(Trait & trait, TiledMma &tiled_mma,
     mha_copy(trait, tiled_mma, r16, m);
 }
 
-template <bool Is_even_MN, class TileCopy,
-          class Engine0, class Layout0,
-          class Engine1, class Layout1>
-CUTLASS_DEVICE void
-mha_save(TileCopy &tile_copy,
-         Tensor<Engine0, Layout0> &src,
-         Tensor<Engine1, Layout1> &dst) {
-    static_assert(Layout0::rank == 5, "Only support Tensor with 5 ranks");
-    static_assert(Layout0::rank == Layout1::rank, "Only support same rank Tensor");
-    if constexpr(Is_even_MN) {
-        copy(tile_copy, src, dst);
-    } else {
-        CUTLASS_PRAGMA_UNROLL
-        for (int m = 0; m < size<3>(dst); ++m) {
-            CUTLASS_PRAGMA_UNROLL
-            for (int n = 0; n < size<4>(dst); ++n) {
-                auto src_block = src(_, _, _, m, n);
-                auto dst_block = dst(_, _, _, m, n);
-                copy(tile_copy, src_block, dst_block);
-            }
-        }
-    }
-}
-
-template <bool Is_even_MN, class TileCopy,
-          class Engine0, class Layout0,
-          class Engine1, class Layout1>
-CUTLASS_DEVICE void
-mha_load(TileCopy &tile_copy,
-         Tensor<Engine0, Layout0> &src,
-         Tensor<Engine1, Layout1> &dst) {
-    static_assert(Layout0::rank == 5, "Only support Tensor with 5 ranks");
-    static_assert(Layout0::rank == Layout1::rank, "Only support same rank Tensor");
-    if constexpr(Is_even_MN) {
-        copy(tile_copy, src, dst);
-    } else {
-        CUTLASS_PRAGMA_UNROLL
-        for (int m = 0; m < size<3>(src); ++m) {
-            auto src_block = src(_, _, _, m, _);
-            auto dst_block = dst(_, _, _, m, _);
-            copy(tile_copy, src_block, dst_block);
-        }
-    }
-}
-
 template <class Engine0, class Layout0,
           class Engine1, class Layout1,
           class Engine2, class Layout2>
@@ -662,9 +617,9 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                                    make_stride(param.s_r_stride, _1{})));
 #endif
 
-    typename Trait::TiledMmaSdP2 tiled_mma_sdp;
-    typename Trait::TiledMmadKV2 tiled_mma_dkv;
-    typename Trait::TiledMmadQ2 tiled_mma_dq;
+    typename Trait::TiledMmaSdP tiled_mma_sdp;
+    typename Trait::TiledMmadKV tiled_mma_dkv;
+    typename Trait::TiledMmadQ tiled_mma_dq;
 
     auto thr_mma_sdp = tiled_mma_sdp.get_slice(first_thread_in_sg_idx);
 
@@ -1048,57 +1003,46 @@ convert_dq(T &trait, Param<typename T::DType> &param, int m_block, int bidb, int
     const index_t q_offset = bofst.q_offset(bidb, bidh, m_block * kBlockM);
     using ShapeQ = Shape<
         std::conditional_t<Is_even_M, Int<kBlockM>, int>,
-        Int<kHeadDim>, _1>;
+        Int<kHeadDim>>;
     ShapeQ shapeQ;
     if constexpr (Is_even_M) {
-        shapeQ = make_shape(Int<kBlockM>{}, Int<kHeadDim>{}, _1{});
+        shapeQ = make_shape(Int<kBlockM>{}, Int<kHeadDim>{});
     } else {
-        shapeQ = make_shape(param.tail_m, Int<kHeadDim>{}, _1{});
+        shapeQ = make_shape(param.tail_m, Int<kHeadDim>{});
     }
 
     Tensor mdQaccum = make_tensor(make_gmem_ptr(param.dqaccum_ptr + dq_offset),
                                   make_layout(
                                       Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                                      make_stride(param.dq_r_stride, _1{}, _1{})));
+                                      make_stride(param.dq_r_stride, _1{})));
     Tensor mdQ = make_tensor(make_gmem_ptr(param.dq_ptr + q_offset),
                             make_layout(
                                 shapeQ,
-                                make_stride(param.q_r_stride, _1{}, _1{})));
-
-    auto tile_dq = typename T::TileShapedQ{};
-
-    auto tileloaddQ = typename T::TiledLoaddQ{mdQaccum};
-    auto tilesavedQ = typename T::TiledSavedV{mdQ};
-
+                                make_stride(param.q_r_stride, _1{})));
 
     typename T::TiledMmadQ tiled_mma_dq;
     auto thr_mma_dq = tiled_mma_dq.get_slice(first_thread_in_sg_idx);
 
-    Tensor mQ_coord = cute::get_xe_tensor(shapeQ);
-    Tensor gdQ = local_tile(mQ_coord, select<0, 1>(tile_dq), make_coord(_, _, 0)); // dump dQ
+    auto tile_dq = tiled_mma_dq.tile_mnk();
 
-    Tensor tdQgdQ = thr_mma_dq.partition_C(gdQ); // save to dq
-    Tensor tdQrdQaccum = partition_fragment_C(tiled_mma_dq,
-                                              make_shape(get<0>(tile_dq),
-                                                         get<1>(tile_dq),
-                                                         ceil_div(Int<kBlockM>{}, get<0>(tile_dq)),
-                                                         ceil_div(Int<kHeadDim>{}, get<1>(tile_dq))));
+    auto tileloaddQ = make_block_2d_copy_C(tiled_mma_dq, mdQaccum);
+    auto tilesavedQ = make_block_2d_copy_D(tiled_mma_dq, mdQ);
 
-    Tensor tdQrdQ = make_fragment_like<DType>(tdQrdQaccum);
-    if constexpr(Is_even_M) {
-        mha_load<true>(tileloaddQ, tdQgdQ, tdQrdQaccum);
-    } else {
-        mha_load<false>(tileloaddQ, tdQgdQ, tdQrdQaccum);
-    }
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < size(tdQrdQ); ++i) {
-        tdQrdQ(i) = static_cast<DType>(tdQrdQaccum(i));
-    }
-    if constexpr(Is_even_M) {
-        mha_save<true>(tilesavedQ, tdQrdQ, tdQgdQ);
-    } else {
-        mha_save<false>(tilesavedQ, tdQrdQ, tdQgdQ);
-    }
+    auto thr_load_dQ = tileloaddQ.get_slice(first_thread_in_sg_idx);
+    auto thr_save_dQ = tilesavedQ.get_slice(first_thread_in_sg_idx);
+
+    Tensor gdQaccum = local_tile(make_identity_tensor(mdQaccum.shape()),
+                                 select<0, 1>(tile_dq), make_coord(0,0)); // read dQaccum
+    Tensor gdQ = local_tile(make_identity_tensor(mdQ.shape()),
+                            select<0, 1>(tile_dq), make_coord(0,0)); // dump dQ
+    Tensor tdQgdQaccum = thr_load_dQ.partition_S(gdQaccum); // load from dqaccum
+    auto tdQrdQaccum = thr_load_dQ.partition_sg_fragment_D(gdQaccum); // register for dqaccum
+    auto tdQrdQ = thr_save_dQ.partition_sg_fragment_S(gdQ); // register for dq
+    Tensor tdQgdQ = thr_save_dQ.partition_D(gdQ); // save to dq
+
+    copy(tileloaddQ, tdQgdQaccum, tdQrdQaccum);
+    reorder(tdQrdQaccum, tdQrdQ);
+    copy(tilesavedQ, tdQrdQ, tdQgdQ);
 }
 
 template<class T>
