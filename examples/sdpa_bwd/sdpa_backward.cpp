@@ -134,8 +134,8 @@ apply_mask_causal(Tensor<Engine0, Layout0> &tensor,
     for (int n = 0; n < size<1>(tensor); ++n) {
         CUTLASS_PRAGMA_UNROLL
         for (int m = 0; m < size<0>(tensor); ++m) {
-            int x = n_offset + get<1>(rC_2d(m, n)) + sg_local_id + diagonal_offset;
-            int y = m_offset + get<0>(rC_2d(m, n));
+            int x = n_offset + get<1>(rC_2d(m, n)) + sg_local_id;
+            int y = m_offset + get<0>(rC_2d(m, n)) + diagonal_offset;
             if (x > y) {
                 tensor(m, n) = -INFINITY;
             }
@@ -689,7 +689,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                  tiled_mma_sdp);
         Tensor scores = make_tensor(rS.data(), convert_layout_acc_layout(rS.layout()));
         if constexpr(is_causal) {
-            apply_mask_causal(scores, taccScS_rc, m_block * kBlockM, n_block * kBlockN, param.seq_len_q - param.seq_len_kv);
+            apply_mask_causal(scores, taccScS_rc, m_block * kBlockM, n_block * kBlockN, param.seq_len_kv - param.seq_len_q);
         }
 
         if (Is_even_M) {
