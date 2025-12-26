@@ -30,6 +30,7 @@ struct FAKernel {
     using SubgroupLayoutdKV = Layout<Shape<Int<AtomLayoutNdKV>, Int<kNSGs / AtomLayoutNdKV>, _1>>;
     using SubgroupLayoutdQ = Layout<Shape<Int<AtomLayoutMdQ>, Int<kNSGs / AtomLayoutMdQ>, _1>>;
     using TileShapeSdP = Layout<Shape<Int<kBlockM>, Int<kBlockN>, _K>>;
+    using TileShapeSdPt = Layout<Shape<Int<kBlockN>, Int<kBlockM>, _K>>;
     static_assert(size<0>(TileShapeSdP{}) <= kBlockM && "tile size M must be smaller than or equal to kBlockM");
     static_assert(kBlockM % size<0>(TileShapeSdP{}) == 0 && "kBlockM must be dividable by tile size M");
     static_assert(size<1>(TileShapeSdP{}) <= kBlockN && "tile size N must be smaller than or equal to kBlockN");
@@ -50,7 +51,9 @@ struct FAKernel {
     using TiledMmaSdP = typename TiledMMAHelper<MMA_Atom<MMA_Atom_ARCH>,
                                                 TileShapeSdP,
                                                 SubgroupLayoutSdP>::TiledMMA;
-
+    using TiledMmaSdPt = typename TiledMMAHelper<MMA_Atom<MMA_Atom_ARCH>,
+                                                 TileShapeSdPt,
+                                                 SubgroupLayoutSdP>::TiledMMA;
     using TiledMmadKV = typename TiledMMAHelper<MMA_Atom<MMA_Atom_ARCH>,
                                                 TileShapedKV,
                                                 SubgroupLayoutdKV>::TiledMMA;
