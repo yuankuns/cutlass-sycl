@@ -120,7 +120,7 @@ auto convert_layout_2d_layout(Layout layout) {
     return l;
 }
 
-constexpr int tid = 48;
+constexpr int tid = 0;
 constexpr int bid = 0;
 
 const bool
@@ -172,8 +172,8 @@ apply_mask_causalt(Tensor<Engine0, Layout0> &tensor,
     for (int n = 0; n < size<1>(tensor); ++n) {
         CUTLASS_PRAGMA_UNROLL
         for (int m = 0; m < size<0>(tensor); ++m) {
-            int y = n_offset + get<1>(rC_2d(m, n)) + sg_local_id;
-            int x = m_offset + get<0>(rC_2d(m, n)) + diagonal_offset;
+            int y = m_offset + get<1>(rC_2d(m, n)) + sg_local_id + diagonal_offset;
+            int x = n_offset + get<0>(rC_2d(m, n));
             if (x > y) {
                 tensor(m, n) = -INFINITY;
             }
@@ -611,9 +611,8 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
     const auto block_n_dim = tail_n == 0 ? Int<kBlockN>{} : ((tail_n + 1) & ~1);
     auto shapeO = make_shape(kBlockM, Int<kHeadDim>{});
     auto shapeQtOt = make_shape(Int<kHeadDim>{}, kBlockM);
-    auto shapeSP = make_shape(kBlockM, block_n_dim);
     auto shapeSPt = make_shape(block_n_dim, Int<kBlockM>{});
-    auto shapeSP2 = make_shape(Int<kBlockM>{}, block_n_dim);
+    auto shapeSP = make_shape(Int<kBlockM>{}, block_n_dim);
     auto shapePt = make_shape(block_n_dim, kBlockM);
 
     using Shape1 = Shape<
@@ -650,15 +649,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                                  shapeKtVt,
                                  make_stride(param.v_r_stride, _1{})));
    // intermediate buffer
-    Tensor mP = make_tensor(make_gmem_ptr(param.pb_ptr + pb_offset),
-                            make_layout(
-                                shapeSP,
-                                make_stride(block_n_dim, _1{})));
     Tensor mPt = make_tensor(make_gmem_ptr(param.pb_ptr + pb_offset),
-                             make_layout(
-                                 shapePt,
-                                 make_stride(_1{}, block_n_dim)));
-    Tensor mPt2 = make_tensor(make_gmem_ptr(param.pb_ptr + pb_offset),
                              make_layout(
                                  shapeSPt,
                                  make_stride(Int<kBlockM>{}, _1{})));
@@ -672,12 +663,8 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                                 make_stride(_1{}, param.k_r_stride)));
     Tensor mdPt = make_tensor(make_gmem_ptr(param.pb_ptr + dsb_offset),
                               make_layout(
-                                  shapePt,
-                                  make_stride(_1{}, block_n_dim)));
-    Tensor mdPt2 = make_tensor(make_gmem_ptr(param.pb_ptr + dsb_offset),
-                               make_layout(
-                                   shapeSPt,
-                                   make_stride(Int<kBlockM>{}, _1{})));
+                                  shapeSPt,
+                                  make_stride(Int<kBlockM>{}, _1{})));
     Tensor mQt = make_tensor(make_gmem_ptr(param.q_ptr + q_offset),
                               make_layout(
                                   shapeQtOt,
@@ -697,13 +684,9 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                                  shapeKtVt,
                                  make_stride(param.dv_r_stride, _1{})));
     Tensor mdP = make_tensor(make_gmem_ptr(param.pb_ptr + dsb_offset),
-                              make_layout(
-                                  shapeSP,
-                                  make_stride(block_n_dim, _1{})));
-    Tensor mdP2 = make_tensor(make_gmem_ptr(param.pb_ptr + dsb_offset),
-                              make_layout(
-                                  shapeSP2,
-                                  make_stride(_1{}, Int<kBlockM>{})));
+                             make_layout(
+                                 shapeSP,
+                                 make_stride(_1{}, Int<kBlockM>{})));
     Tensor mdQaccum = make_tensor(make_gmem_ptr(param.dqaccum_ptr + dq_offset),
                                   make_layout(
                                       shapedQ,
@@ -713,36 +696,26 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                                   shapeKtVt,
                                   make_stride(param.dk_r_stride, _1{})));
 #ifdef _DEBUG_
-    Tensor mS = make_tensor(make_gmem_ptr(param.s_ptr + s_offset),
-                             make_layout(
-                                 shapeSP,
-                                 make_stride(param.s_r_stride, _1{})));
-    Tensor mdPd = make_tensor(make_gmem_ptr(param.dp_ptr + s_offset),
-                               make_layout(
-                                   shapeSP,
-                                   make_stride(param.s_r_stride, _1{})));
 #endif
 
-    typename Trait::TiledMmaSdP tiled_mma_sdp;
     typename Trait::TiledMmaSdPt tiled_mma_sdpt;
     typename Trait::TiledMmadKV tiled_mma_dkv;
     typename Trait::TiledMmadQ tiled_mma_dq;
 
-    auto thr_mma_sdp = tiled_mma_sdp.get_slice(first_thread_in_sg_idx);
     auto thr_mma_sdpt = tiled_mma_sdpt.get_slice(first_thread_in_sg_idx);
 
     // for lse read
-    Tensor caccS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{}); // same buffer as accS
-    Tensor taccScS = thr_mma_sdp.partition_C(caccS);
-    static_assert(decltype(size<0>(taccScS))::value == 8);
-    Tensor taccScS_rc = logical_divide(taccScS, Shape<_1>{});
-    Tensor taccScS_row = logical_divide(taccScS, Shape<_1>{})(make_coord(0, _), _, 0);
-    Tensor lse = make_tensor<V>(Shape<Int<decltype(size(taccScS_row))::value>>{});
+    // Tensor caccS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{}); // same buffer as accS
+    // Tensor taccScS = thr_mma_sdp.partition_C(caccS);
+    // static_assert(decltype(size<0>(taccScS))::value == 8);
+    // Tensor taccScS_rc = logical_divide(taccScS, Shape<_1>{});
+    // Tensor taccScS_row = logical_divide(taccScS, Shape<_1>{})(make_coord(0, _), _, 0);
+    // Tensor lse = make_tensor<V>(Shape<Int<decltype(size(taccScS_row))::value>>{});
     Tensor caccSt = make_identity_tensor(Shape<Int<kBlockN>, Int<kBlockM>>{}); // same buffer as accSt
     Tensor taccScSt = thr_mma_sdpt.partition_C(caccSt);
     Tensor taccScS_rt = logical_divide(taccScSt, Shape<_1>{});
-    Tensor taccScS_col = logical_divide(taccScSt, Shape<_1>{})(make_coord(_, 0), 0, _);
-    Tensor lse_t = make_tensor<V>(Shape<Int<decltype(size(taccScS_col))::value>>{});
+    // Tensor taccScS_col = logical_divide(taccScSt, Shape<_1>{})(make_coord(_, 0), 0, _);
+    // Tensor lse_t = make_tensor<V>(Shape<Int<decltype(size(taccScS_col))::value>>{});
     // static_assert(size<0>(tSrS) * size<1>(tSrS) == size<0>(lse) && "row of acc and lse not match");
     // misc
 
@@ -782,19 +755,11 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                                   make_shape(Int<kHeadDim>{}, tail_m),
                                   make_stride(_1{}, param.q_r_stride)));
 #ifdef _DEBUG_
-            mS = make_tensor(make_gmem_ptr(mS.data()),
-                             make_layout(
-                                 make_shape(tail_m, block_n_dim),
-                                 make_stride(param.s_r_stride, _1{})));
-            mdPd = make_tensor(make_gmem_ptr(mdPd.data()),
-                                 make_layout(
-                                     make_shape(tail_m, block_n_dim),
-                                     make_stride(param.s_r_stride, _1{})));
 #endif
         }
         {
         auto rSt = create_reg<V>(trait,
-                                 mPt2,
+                                 mPt,
                                  tiled_mma_sdpt);
         clear(rSt);
         // S=QKt
@@ -802,36 +767,49 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                  tiled_mma_sdpt);
         Tensor scorest = make_tensor(rSt.data(), convert_layout_acc_layout(rSt.layout()));
         if constexpr(is_causal) {
-            apply_mask_causalt(scorest, taccScS_rt, n_block * kBlockN, m_block * kBlockM, param.seq_len_kv - param.seq_len_q);
+            // if (is_cur_thread() and n_block == 0) {
+            //     Tensor rt_2d = make_tensor(
+            //         taccScS_rt.data(),
+            //         convert_layout_2d_layout(taccScS_rt.layout()));
+            //     print("pos(%d,%d)\n", get<0>(rt_2d(0,0)), get<1>(rt_2d(0,0)));
+            //     print("rSt(%d):\n", m_block);
+            //     print_t(rSt);
+            //     print("\n");
+            // }
+            apply_mask_causalt(scorest, taccScS_rt, m_block * kBlockM, n_block * kBlockN, param.seq_len_kv - param.seq_len_q);
         }
 
-        if (Is_even_M) {
-            load_1colvec<true>(lse, mLSE, taccScS_row);
-        } else {
-            load_1colvec<false>(lse, mLSE, taccScS_row, tail_m);
-        }
-        if (Is_even_M) {
-            load_1colvec<true>(lse_t, mLSE, taccScS_col);
-        } else {
-            load_1colvec<false>(lse_t, mLSE, taccScS_col, tail_m);
-        }
+        // if (Is_even_M) {
+        //     load_1colvec<true>(lse, mLSE, taccScS_row);
+        // } else {
+        //     load_1colvec<false>(lse, mLSE, taccScS_row, tail_m);
+        // }
+        // if (Is_even_M) {
+        //     load_1colvec<true>(lse_t, mLSE, taccScS_col);
+        // } else {
+        //     load_1colvec<false>(lse_t, mLSE, taccScS_col, tail_m);
+        // }
 
-        Tensor dP_sum = make_fragment_like(lse);
+        // Tensor dP_sum = make_fragment_like(lse);
 
-        if (Is_even_M)
-            load_1colvec<true>(dP_sum, mdPsum, taccScS_row);
-        else
-            load_1colvec<false>(dP_sum, mdPsum, taccScS_row, tail_m);
+        // if (Is_even_M)
+        //     load_1colvec<true>(dP_sum, mdPsum, taccScS_row);
+        // else
+        //     load_1colvec<false>(dP_sum, mdPsum, taccScS_row, tail_m);
         // P=softmax(S,lse)
         scale_apply_exp2t(scorest, mLSE, taccScS_rt,
                           param.scale_softmax_log2);
 
-        mha_reorder_copy(trait, tiled_mma_sdpt, rSt, mPt2);
+        // if (is_cur_thread() and n_block == 0) {
+        //     print("rPt(%d):\n", m_block);
+        //     print_t(rSt);
+        //     print("\n");
+        // }
+        mha_reorder_copy(trait, tiled_mma_sdpt, rSt, mPt);
 #ifdef _DEBUG_
-        mha_reorder_copy(trait, tiled_mma_sdp, rS, mS); // debug
 #endif
         auto rdPt = create_reg<V>(trait,
-                                  mdPt2,
+                                  mdPt,
                                   tiled_mma_sdpt);
         clear(rdPt);
         // dP=dO*Vt
@@ -842,19 +820,23 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         // dS=P(dP-sum_row(P))*scale
         softmax_backwardt(scorest, mdPsum, dSt, taccScS_rt,
                           param.scale_softmax);
-        mha_reorder_copy(trait, tiled_mma_sdpt, rdPt, mdPt2); // copy dP to internal buff
+        mha_reorder_copy(trait, tiled_mma_sdpt, rdPt, mdPt); // copy dP to internal buff
 #ifdef _DEBUG_
-        mha_reorder_copy(trait, tiled_mma_sdp, rdP, mdPd); // debug
 #endif
         }
         // dV=Pt*dO
-        gemm_dKV(trait, mPt2, mdOt, rdV,
+        gemm_dKV(trait, mPt, mdOt, rdV,
                  tiled_mma_dkv);
+        // if (is_cur_thread() and n_block == 0) {
+        //     print("after dV(%d):\n", m_block);
+        //     print_t(rdV);
+        //     print("\n");
+        // }
         // dQ=dP*K
-        gemm_dQ(trait, mdP2, mK, mdQaccum,
+        gemm_dQ(trait, mdP, mK, mdQaccum,
                 tiled_mma_dq);
         // dK=dPt*Q
-        gemm_dKV(trait, mdPt2, mQt, rdK,
+        gemm_dKV(trait, mdPt, mQt, rdK,
                  tiled_mma_dkv);
         // update ptr/atom copy
         mQ.data() = mQ.data() + int(kBlockM * param.q_r_stride);
@@ -863,8 +845,6 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         mdQaccum.data() = mdQaccum.data() + int(kBlockM * param.dq_r_stride);
         mQt.data() = mQt.data() + int(kBlockM * param.q_r_stride);
 #ifdef _DEBUG_
-        mS.data() = mS.data() + int(kBlockM * param.s_r_stride); // debug
-        mdPd.data() = mdPd.data() + int(kBlockM * param.s_r_stride); // debug
 #endif
         mLSE.data() = mLSE.data() + int(kBlockM);
         mdPsum.data() = mdPsum.data() + int(kBlockM);
