@@ -97,21 +97,6 @@ void print_c(T t) {
 
 using ProblemShapeRegular = cute::tuple<int, int, int, int, int, int, int>; // batch, num_head_q,num_head_kv,seq_len_qo,seq_len_kv,head_size_qk,head_size_vo
 
-template <typename T>
-struct OPS_tobf16{
-    template <class Tensor>
-    auto operator()(Tensor &src){
-        cutlass::NumericConverter<
-            T, float, cutlass::FloatRoundStyle::round_toward_zero> converter;
-        auto dst = make_tensor_like<T>(src);
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < size(src); ++i) {
-            dst(i) = converter(src(i));
-        }
-        return dst;
-    }
-};
-
 template <typename Layout>
 auto convert_layout_2d_layout(Layout layout) {
     auto l = make_layout(make_layout(get<0>(layout),
@@ -132,35 +117,8 @@ template <typename Engine0, typename Layout0,
           typename Engine1, typename Layout1>
 CUTLASS_DEVICE void
 apply_mask_causal(Tensor<Engine0, Layout0> &tensor,
-                   Tensor<Engine1, Layout1> &rC,
-                   int m_offset, int n_offset, int diagonal_offset = 0) {
-    auto sg = compat::get_nd_item<1>().get_sub_group();
-    auto group = compat::get_nd_item<1>().get_group();
-    int sg_local_id = sg.get_local_id();
-    int sg_group_id = sg.get_group_id();
-    Tensor rC_2d = make_tensor(
-        rC.data(),
-        convert_layout_2d_layout(rC.layout()));
-    CUTLASS_PRAGMA_UNROLL
-    for (int n = 0; n < size<1>(tensor); ++n) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int m = 0; m < size<0>(tensor); ++m) {
-            int x = n_offset + get<1>(rC_2d(m, n)) + sg_local_id;
-            int y = m_offset + get<0>(rC_2d(m, n)) + diagonal_offset;
-            if (x > y) {
-                tensor(m, n) = -INFINITY;
-            }
-        }
-    }
-    return;
-}
-
-template <typename Engine0, typename Layout0,
-          typename Engine1, typename Layout1>
-CUTLASS_DEVICE void
-apply_mask_causalt(Tensor<Engine0, Layout0> &tensor,
-                   Tensor<Engine1, Layout1> &rC,
-                   int m_offset, int n_offset, int diagonal_offset = 0) {
+                  Tensor<Engine1, Layout1> &rC,
+                  int m_offset, int n_offset, int diagonal_offset = 0) {
     auto sg = compat::get_nd_item<1>().get_sub_group();
     auto group = compat::get_nd_item<1>().get_group();
     int sg_local_id = sg.get_local_id();
@@ -441,44 +399,6 @@ mha_reorder_copy(Trait & trait, TiledMma &tiled_mma,
     mha_copy(trait, tiled_mma, r16, m);
 }
 
-template <class Engine0, class Layout0,
-          class Engine1, class Layout1,
-          class Engine2, class Layout2>
-CUTLASS_DEVICE void
-mha_atomic_add(Tensor<Engine0, Layout0>& m_tile,
-               Tensor<Engine1, Layout1>& g_tile,
-               Tensor<Engine2, Layout2>& r_tile,
-               const int local_id) {
-    CUTLASS_PRAGMA_UNROLL
-    for (int ni = 0; ni < size<3>(g_tile); ++ni) {
-        auto g = g_tile(_, _, _, ni);
-        auto r = r_tile(_, _, _, ni);
-        CUTLASS_PRAGMA_UNROLL
-        for (int ki = 0; ki < size(g); ++ki) {
-            auto [m, n, l] = g(ki);
-            cutlass::atomicAdd(&m_tile(m, n + local_id, 0), r(ki));
-        }
-    }
-}
-template<bool Is_even_M, class Tensor0, class Tensor1, class Tensor2>
-CUTLASS_DEVICE void
-load_1colvec(Tensor0 &reg, Tensor1 &mT, Tensor2 &coord_row,
-             int tail_m = 0) {
-    if constexpr(Is_even_M) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int mi = 0; mi < size(reg); ++mi) {
-            reg(mi) = mT(get<0>(coord_row(mi)));
-        }
-    } else {
-        for (int mi = 0; mi < size(reg); ++mi) {
-            int row = get<0>(coord_row(mi));
-            if (row < tail_m) {
-                reg(mi) = mT(row);
-            }
-        }
-    }
-}
-
 template<typename Layout>
 CUTLASS_DEVICE auto convert_layout_acc_layout(Layout acc_layout) {
     static_assert(decltype(size<0>(acc_layout))::value == 8);
@@ -726,7 +646,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                  tiled_mma_sdp);
         Tensor scores = make_tensor(rS.data(), convert_layout_acc_layout(rS.layout()));
         if constexpr(is_causal) {
-            apply_mask_causalt(scores, taccScS_rt, m_block * kBlockM, n_block * kBlockN, param.seq_len_kv - param.seq_len_q);
+            apply_mask_causal(scores, taccScS_rt, m_block * kBlockM, n_block * kBlockN, param.seq_len_kv - param.seq_len_q);
         }
         scale_apply_exp2(scores, mLSE, taccScS_rt,
                           param.scale_softmax_log2);
