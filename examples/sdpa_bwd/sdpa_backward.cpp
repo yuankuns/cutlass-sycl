@@ -28,7 +28,7 @@ debug_info() {
 }
 
 template<class Engine, class Layout>
-void print_t(Tensor<Engine, Layout> &r) {
+void print_t(const Tensor<Engine, Layout> &r) {
     print(r);
     for (int i = 0; i < size(r); ++i) {
         if (i % 8 == 0)
@@ -39,7 +39,7 @@ void print_t(Tensor<Engine, Layout> &r) {
 }
 
 template<class Engine, class Layout, class TVLayout>
-void print_t(SubgroupTensor<Engine, Layout, TVLayout> &r) {
+void print_t(const SubgroupTensor<Engine, Layout, TVLayout> &r) {
     print(r);
     for (int i = 0; i < size(r.tensor()); ++i) {
         if (i % 8 == 0)
@@ -105,7 +105,7 @@ auto convert_layout_2d_layout(Layout layout) {
     return l;
 }
 
-constexpr int tid = 16;
+constexpr int tid = 32;
 constexpr int bid = 0;
 
 const bool
@@ -208,13 +208,12 @@ gemm_kernel(Trait &trait,
             Tensor<Engine0, Layout0> const& A,         // (M,K)
             Tensor<Engine1, Layout1> const& B,         // (N,K)
             SubgroupTensor<Engine2, Layout2, TVLayout2> & acc,
-            TiledMMA const & mma,
-            const int m_block = 0,
-            const int n_block = 0) {
+            TiledMMA const & mma) {
     // -----
     // Setup
     // -----
-
+    constexpr int m_block = 0;
+    constexpr int n_block = 0;
     /* Get workgroup and local IDs */
     auto sg = compat::get_nd_item<1>().get_sub_group();
     auto first_thread_in_sg_idx = sg.get_group_linear_id() * Trait::SubgroupSize;
@@ -325,17 +324,91 @@ gemm_SdP(Trait &trait,
 }
 
 template<class Trait,
-         class Engine0, class Layout0,
+         class Engine0, class Layout0, class TVLayout0,
          class Engine1, class Layout1,
          class Engine2, class Layout2,
          class TVLayout2, class TiledMMA>
 void
 gemm_dKV(Trait &trait,
-         Tensor<Engine0, Layout0> const& A,         // (M,K)
-         Tensor<Engine1, Layout1> const& B,         // (N,K)
+         SubgroupTensor<Engine0, Layout0, TVLayout0> const& rSdP, // (M,K)
+         Tensor<Engine1, Layout1> const& B,                       // (N,K)
          SubgroupTensor<Engine2, Layout2, TVLayout2> & rdKV,
          TiledMMA const & mma) {
-    gemm_kernel<false>(trait, A, B, rdKV, mma);
+    // -----
+    // Setup
+    // -----
+    /* Get workgroup and local IDs */
+    auto sg = compat::get_nd_item<1>().get_sub_group();
+    auto first_thread_in_sg_idx = sg.get_group_linear_id() * Trait::SubgroupSize;
+
+    /* Create proxy coordinate tensors for each global tensor */
+    Tensor cB = make_identity_tensor(B.shape());   // (N,K)
+
+    auto tile_mnk = mma.tile_mnk();
+
+    Tensor gB = local_tile(cB, select<1,2>(tile_mnk), make_coord(0,_));  // (BLK_N,BLK_K,k)
+
+    /* Create block 2D TiledCopies */
+    auto copy_b = make_block_2d_copy_B(mma, B);
+
+    /* Slice TiledCopy/TiledMMA operations to thread (work-item) level */
+    auto thr_mma    =    mma.get_slice(first_thread_in_sg_idx);
+    auto thr_copy_b = copy_b.get_slice(first_thread_in_sg_idx);
+
+    /* Register fragments for MMA */
+    auto tCrB = thr_mma.partition_sg_fragment_B(gB(_,_,0));
+
+    /* Register fragments for copies */
+    auto tBrB = thr_copy_b.partition_sg_fragment_D(gB(_,_,0));
+
+    /* Partition global tensor (proxies) for copies */
+    Tensor tBgB = thr_copy_b.partition_S(gB);
+
+    /* Create prefetch TiledCopy instances */
+    auto prefetch_b = make_block_2d_prefetch(copy_b);
+
+    auto thr_prefetch_B = prefetch_b.get_slice(first_thread_in_sg_idx);
+
+    /* Partition global tensor (proxies) for prefetch */
+    auto pBgB = thr_prefetch_B.partition_S(gB);
+
+    /* Prefetch distance, in units of k tiles */
+    const int prefetch_dist = 3;
+
+    // ------
+    // Kernel
+    // ------
+
+    constexpr int barrier_scope = 2;
+
+    int k_tile_count = ceil_div(shape<1>(B), get<2>(tile_mnk));
+    int k_tile_prefetch = 0;
+
+    /* Warm up loops with prefetch to L1 */
+    CUTE_UNROLL
+    for (; k_tile_prefetch < prefetch_dist; k_tile_prefetch++) {
+        prefetch(prefetch_b, pBgB(_,_,_,k_tile_prefetch));
+    }
+    /* Main loop */
+    for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
+        /* Split barrier keeping threads loosely together */
+        barrier_arrive(barrier_scope);
+
+        /* Copy A/B from global memory (ideally L1 cache) to registers */
+        copy(copy_b, tBgB(_,_,_,k_tile), tBrB);
+
+        /* Prefetch A/B tiles to L1 */
+        prefetch(prefetch_b, pBgB(_,_,_,k_tile_prefetch));
+
+        auto rA = rSdP(make_coord(_, k_tile), _, _);
+        reorder(tBrB, tCrB);
+
+        /* Accumulate C += A * B */
+        gemm(mma, rA, tCrB, rdKV);
+
+        /* Other half of split barrier */
+        barrier_wait(barrier_scope);
+    }
 }
 
 template<class Trait,
@@ -359,7 +432,7 @@ gemm_dQ(Trait &trait,
     auto thr_mma = mma.get_slice(first_thread_in_sg_idx);
     auto tCrC = thr_mma.partition_sg_fragment_C(make_identity_tensor(select<0,1>(tile_mnk))); // allocate C fragment storage
     Tensor tCgC = thr_mma.partition_C(gC);
-    gemm_kernel<true>(trait, A, B, tCrC, mma, m_block, n_block);
+    gemm_kernel<true>(trait, A, B, tCrC, mma);
     int local_id = sg.get_local_id();
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i <  size(tCgC); ++i) {
@@ -636,7 +709,6 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
 #ifdef _DEBUG_
 #endif
         }
-        {
         auto rS = create_reg<V>(trait,
                                 mPt,
                                 tiled_mma_sdp);
@@ -669,15 +741,22 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         mha_reorder_copy(trait, tiled_mma_sdp, rdP, mdPt); // copy dP to internal buff
 #ifdef _DEBUG_
 #endif
-        }
+        auto rS2 = create_reg<T>(trait,
+                                 mPt,
+                                 tiled_mma_sdp);
+        reorder(rS, rS2);
+        auto rdP2 = create_reg<T>(trait,
+                                  mdPt,
+                                  tiled_mma_sdp);
+        reorder(rdP, rdP2);
         // dV=Pt*dO
-        gemm_dKV(trait, mPt, mdOt, rdV,
+        gemm_dKV(trait, rS2, mdOt, rdV,
                  tiled_mma_dkv);
         // dQ=dP*K
         gemm_dQ(trait, mdP, mK, mdQaccum,
                 tiled_mma_dq);
         // dK=dPt*Q
-        gemm_dKV(trait, mdPt, mQt, rdK,
+        gemm_dKV(trait, rdP2, mQt, rdK,
                  tiled_mma_dkv);
         // update ptr/atom copy
         mQ.data() = mQ.data() + int(kBlockM * param.q_r_stride);
@@ -822,7 +901,6 @@ compute_o_dot_do(T &trait, Param<typename T::DType> &param,
         }
         stensor(mi, sg_group_id, sg_local_id) = accum;
     }
-    // sycl::group_barrier(group);
     if (sg_local_id == 0) {
         float accum = 0.0f;
         CUTLASS_PRAGMA_UNROLL
@@ -1203,8 +1281,8 @@ void launch_mha_backward(ProblemShape problem_shape,
         constexpr int kBlockN = 64;
         constexpr int kHeadDim = 64;
         constexpr int kNSGs = 8;
-        constexpr int AtomLayoutMSdP = 4;
-        constexpr int AtomLayoutNdKV = 2;
+        constexpr int AtomLayoutMSdP = 8;
+        constexpr int AtomLayoutNdKV = 8;
         constexpr int AtomLayoutMdQ = 2;
         static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
         static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
@@ -1223,8 +1301,8 @@ void launch_mha_backward(ProblemShape problem_shape,
         constexpr int kBlockN = 64;
         constexpr int kHeadDim = 96;
         constexpr int kNSGs = 8;
-        constexpr int AtomLayoutMSdP = 2;
-        constexpr int AtomLayoutNdKV = 4;
+        constexpr int AtomLayoutMSdP = 8;
+        constexpr int AtomLayoutNdKV = 8;
         constexpr int AtomLayoutMdQ = 4;
         static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
         static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
@@ -1243,8 +1321,8 @@ void launch_mha_backward(ProblemShape problem_shape,
         constexpr int kBlockN = 64;
         constexpr int kHeadDim = 128;
         constexpr int kNSGs = 8;
-        constexpr int AtomLayoutMSdP = 2;
-        constexpr int AtomLayoutNdKV = 4;
+        constexpr int AtomLayoutMSdP = 8;
+        constexpr int AtomLayoutNdKV = 8;
         constexpr int AtomLayoutMdQ = 4;
         static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
         static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
@@ -1263,8 +1341,8 @@ void launch_mha_backward(ProblemShape problem_shape,
         constexpr int kBlockN = 32;
         constexpr int kHeadDim = 192;
         constexpr int kNSGs = 8;
-        constexpr int AtomLayoutMSdP = 4;
-        constexpr int AtomLayoutNdKV = 2;
+        constexpr int AtomLayoutMSdP = 8;
+        constexpr int AtomLayoutNdKV = 8;
         constexpr int AtomLayoutMdQ = 2;
         static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
         static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
@@ -1283,8 +1361,8 @@ void launch_mha_backward(ProblemShape problem_shape,
         constexpr int kBlockN = 32;
         constexpr int kHeadDim = 256;
         constexpr int kNSGs = 8;
-        constexpr int AtomLayoutMSdP = 4;
-        constexpr int AtomLayoutNdKV = 2;
+        constexpr int AtomLayoutMSdP = 8;
+        constexpr int AtomLayoutNdKV = 8;
         constexpr int AtomLayoutMdQ = 2;
         static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
         static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
