@@ -105,7 +105,7 @@ auto convert_layout_2d_layout(Layout layout) {
     return l;
 }
 
-constexpr int tid = 32;
+constexpr int tid = 0;
 constexpr int bid = 0;
 
 const bool
@@ -312,15 +312,19 @@ gemm_kernel(Trait &trait,
 template<class Trait,
          class Engine0, class Layout0,
          class Engine1, class Layout1,
-         class Engine2, class Layout2,
-         class TVLayout2, class TiledMMA>
-void
+         class TiledMMA>
+auto
 gemm_SdP(Trait &trait,
          Tensor<Engine0, Layout0> const& A,         // (M,K)
          Tensor<Engine1, Layout1> const& B,         // (N,K)
-         SubgroupTensor<Engine2, Layout2, TVLayout2> & rSdP,
          TiledMMA const & mma) {
+    using T = typename Trait::DType;
+    using V = typename Trait::VType;
+    auto rSdP = create_reg<V>(trait, A, mma);
     gemm_kernel<true>(trait, A, B, rSdP, mma);
+    auto rSdP_16b = create_reg<T>(trait, A, mma);
+    reorder(rSdP, rSdP_16b);
+    return rSdP_16b;
 }
 
 template<class Trait,
@@ -421,14 +425,12 @@ gemm_dQ(Trait &trait,
         Tensor<Engine0, Layout0> const& A,         // (M,K)
         Tensor<Engine1, Layout1> const& B,         // (N,K)
         Tensor<Engine2, Layout2> const& C,         // (M,N)
-        TiledMMA const & mma,
-        const int m_block = 0,
-        const int n_block = 0) {
+        TiledMMA const & mma) {
     auto sg = compat::get_nd_item<1>().get_sub_group();
     auto first_thread_in_sg_idx = sg.get_group_linear_id() * trait.SubgroupSize;
     auto tile_mnk = mma.tile_mnk();
     Tensor cC = make_identity_tensor(C.shape());   // (M,N)
-    Tensor gC = local_tile(cC, select<0, 1>(tile_mnk), make_coord(m_block, n_block));  // (BLK_M,BLK_N)
+    Tensor gC = local_tile(cC, select<0, 1>(tile_mnk), make_coord(0, 0));  // (BLK_M,BLK_N)
     auto thr_mma = mma.get_slice(first_thread_in_sg_idx);
     auto tCrC = thr_mma.partition_sg_fragment_C(make_identity_tensor(select<0,1>(tile_mnk))); // allocate C fragment storage
     Tensor tCgC = thr_mma.partition_C(gC);
@@ -479,6 +481,15 @@ CUTLASS_DEVICE auto convert_layout_acc_layout(Layout acc_layout) {
     auto l = logical_divide(acc_layout, Shape<_1>{});  // ((2, 2), MMA_M, MMA_N, Tile_M, M, N)
     auto l2 = make_layout(make_layout(get<0, 1>(l), get<1>(l)),
                           make_layout(get<2>(l)));
+    return l2;
+}
+
+template<typename Layout>
+CUTLASS_DEVICE auto
+convert_layout_acc_layout2(Layout l) {
+    static_assert(decltype(rank(l))::value == 3);
+    auto l2 = make_layout(make_layout(get<0>(get<0>(l)), get<1>(l), get<2>(l)),
+                          get<1>(get<0>(l)));
     return l2;
 }
 
@@ -709,55 +720,42 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
 #ifdef _DEBUG_
 #endif
         }
-        auto rS = create_reg<V>(trait,
-                                mPt,
-                                tiled_mma_sdp);
-        clear(rS);
+
         // S=QKt
-        gemm_SdP(trait, mKt, mQ, rS,
-                 tiled_mma_sdp);
-        Tensor scores = make_tensor(rS.data(), convert_layout_acc_layout(rS.layout()));
+        {
+        auto rS = gemm_SdP(trait, mKt, mQ,
+                           tiled_mma_sdp);
+
+        Tensor scores = make_tensor(rS.data(), convert_layout_acc_layout2(rS.layout()));
         if constexpr(is_causal) {
             apply_mask_causal(scores, taccScS_rt, m_block * kBlockM, n_block * kBlockN, param.seq_len_kv - param.seq_len_q);
         }
         scale_apply_exp2(scores, mLSE, taccScS_rt,
                           param.scale_softmax_log2);
-
-        mha_reorder_copy(trait, tiled_mma_sdp, rS, mPt);
-#ifdef _DEBUG_
-#endif
-        auto rdP = create_reg<V>(trait,
-                                  mdPt,
-                                  tiled_mma_sdp);
-        clear(rdP);
-        // dP=dO*Vt
-        gemm_SdP(trait, mVt, mdO, rdP,
-                 tiled_mma_sdp);
-
-        Tensor dS = make_tensor(rdP.data(), scores.layout());
-        // dS=P(dP-sum_row(P))*scale
-        softmax_backward(scores, mdPsum, dS, taccScS_rt,
-                         param.scale_softmax);
-        mha_reorder_copy(trait, tiled_mma_sdp, rdP, mdPt); // copy dP to internal buff
-#ifdef _DEBUG_
-#endif
-        auto rS2 = create_reg<T>(trait,
-                                 mPt,
-                                 tiled_mma_sdp);
-        reorder(rS, rS2);
-        auto rdP2 = create_reg<T>(trait,
-                                  mdPt,
-                                  tiled_mma_sdp);
-        reorder(rdP, rdP2);
         // dV=Pt*dO
-        gemm_dKV(trait, rS2, mdOt, rdV,
+        gemm_dKV(trait, rS, mdOt, rdV,
                  tiled_mma_dkv);
+
+#ifdef _DEBUG_
+#endif
+        // dP=dO*Vt
+        auto rdP = gemm_SdP(trait, mVt, mdO,
+                            tiled_mma_sdp);
+
+        Tensor rdS = make_tensor(rdP.data(), scores.layout());
+        // dS=P(dP-sum_row(P))*scale
+        softmax_backward(scores, mdPsum, rdS, taccScS_rt,
+                         param.scale_softmax);
+        mha_copy(trait, tiled_mma_sdp, rdP, mdPt); // copy dP to internal buff
+#ifdef _DEBUG_
+#endif
+        // dK=dPt*Q
+        gemm_dKV(trait, rdP, mQt, rdK,
+                 tiled_mma_dkv);
+        }
         // dQ=dP*K
         gemm_dQ(trait, mdP, mK, mdQaccum,
                 tiled_mma_dq);
-        // dK=dPt*Q
-        gemm_dKV(trait, rdP2, mQt, rdK,
-                 tiled_mma_dkv);
         // update ptr/atom copy
         mQ.data() = mQ.data() + int(kBlockM * param.q_r_stride);
         mdO.data() = mdO.data() + int(kBlockM * param.o_r_stride);
