@@ -26,8 +26,10 @@ struct FAKernel {
     static constexpr bool is_causal = is_causal_;
     using MMA_Atom_ARCH = XE_DPAS_TT<8, VType, DType>;
     using _K = Int<MMA_Atom_ARCH::K>;
-    using SubgroupLayoutSdP = Layout<Shape<Int<AtomLayoutMSdP>, Int<kNSGs / AtomLayoutMSdP>, _1>>;
-    using SubgroupLayoutdKV = Layout<Shape<Int<AtomLayoutNdKV>, Int<kNSGs / AtomLayoutNdKV>, _1>>;
+    using SubgroupLayoutSdP = Layout<Shape<Int<AtomLayoutMSdP>, Int<kNSGs / AtomLayoutMSdP>, _1>,
+                                     Stride<Int<kNSGs / AtomLayoutMSdP>, _1, _0>>;
+    using SubgroupLayoutdKV = Layout<Shape<Int<AtomLayoutNdKV>, Int<kNSGs / AtomLayoutNdKV>, _1>,
+                                     Stride<Int<kNSGs / AtomLayoutNdKV> , _1, _0>>;
     using SubgroupLayoutdQ = Layout<Shape<Int<AtomLayoutMdQ>, Int<kNSGs / AtomLayoutMdQ>, _1>>;
     using TileShapeSdP = Layout<Shape<Int<kBlockN>, Int<kBlockM>, _K>>;
     using TileShapedKV = Layout<Shape<Int<kBlockN>, Int<kHeadDim>, _K>>;
