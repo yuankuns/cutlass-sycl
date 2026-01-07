@@ -275,9 +275,21 @@ gemm_SdP(Trait &trait,
     using V = typename Trait::VType;
     auto rSdP = create_reg<V>(trait, A, mma);
     gemm_kernel<true>(trait, A, B, rSdP, mma);
-    auto rSdP_16b = create_reg<T>(trait, A, mma);
-    reorder(rSdP, rSdP_16b);
-    return rSdP_16b;
+    return rSdP;
+}
+
+template<class Trait,
+         class Engine0, class Layout0,
+         class Engine1, class Layout1,
+         class Engine2, class Layout2,
+         class TVLayout2, class TiledMMA>
+void
+gemm_dKV(Trait &trait,
+         Tensor<Engine0, Layout0> const& A,         // (M,K)
+         Tensor<Engine1, Layout1> const& B,         // (N,K)
+         SubgroupTensor<Engine2, Layout2, TVLayout2> & rdKV,
+         TiledMMA const & mma) {
+    gemm_kernel<false>(trait, A, B, rdKV, mma);
 }
 
 template<class Trait,
@@ -748,7 +760,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         // S=QKt
         auto rS = gemm_SdP(trait, mKt, mQ,
                            tiled_mma_sdp);
-        Tensor scores = make_tensor(rS.data(), convert_layout_acc_layout2(rS.layout()));
+        Tensor scores = make_tensor(rS.data(), convert_layout_acc_layout(rS.layout()));
         if constexpr(is_causal) {
             apply_mask_causal(scores, taccScS_rt, m_block * kBlockM, n_block * kBlockN, param.seq_len_kv - param.seq_len_q);
         }
@@ -756,23 +768,24 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         // P=softmax(S,lse)
         scale_apply_exp2(scores, mLSE, taccScS_rt,
                          param.scale_softmax_log2);
-        // dV=Pt*dO
-        gemm_dKV(trait, rS, mdOt, rdV,
-                 tiled_mma_dkv);
+        mha_reorder_copy(trait, tiled_mma_sdp, rS, mPt); // copy P to internal buff
         // dP=dO*Vt
         auto rdP = gemm_SdP(trait, mVt, mdO,
                             tiled_mma_sdp);
         Tensor rdS = make_tensor(rdP.data(), scores.layout());
         // dS=P(dP-sum_row(P))*scale
         softmax_backward(scores, mdPsum, rdS, taccScS_rt, param.scale_softmax);
-        mha_copy(trait, tiled_mma_sdp, rdP, mdPt); // copy dP to internal buff
-        // dK=dPt*Q
-        gemm_dKV(trait, rdP, mQt, rdK,
-                 tiled_mma_dkv);
+        mha_reorder_copy(trait, tiled_mma_sdp, rdP, mdPt); // copy dP to internal buff
         }
+        // dV=Pt*dO
+        gemm_dKV(trait, mPt, mdOt, rdV,
+                 tiled_mma_dkv);
         // dQ=dP*K
         gemm_dQ(trait, mdP, mK, mdQaccum,
                 tiled_mma_dq);
+        // dK=dPt*Q
+        gemm_dKV(trait, mdPt, mQt, rdK,
+                 tiled_mma_dkv);
         // update ptr/atom copy
         mQ.data() = mQ.data() + int(kBlockM * param.q_r_stride);
         mdO.data() = mdO.data() + int(kBlockM * param.o_r_stride);
@@ -1171,7 +1184,6 @@ void launch_mha_backward_headdim(ProblemShape problem_shape,
     } else {
         setup_bshd_stride(param);
     }
-
     auto dimGrid0 = compat::dim3(size(M_BLOCK), size(param.num_head_q), size(param.batch));
     auto dimBlock0 = compat::dim3(size(kNSGs * trait.SubgroupSize), size(1), size(1));
     compat::experimental::launch_properties launch_props0{
@@ -1247,8 +1259,8 @@ void launch_mha_backward(ProblemShape problem_shape,
         constexpr int kBlockN = 32;
         constexpr int kHeadDim = 64;
         constexpr int kNSGs = 8;
-        constexpr int AtomLayoutMSdP = 8;
-        constexpr int AtomLayoutNdKV = 8;
+        constexpr int AtomLayoutMSdP = 4;
+        constexpr int AtomLayoutNdKV = 4;
         constexpr int AtomLayoutMdQ = 2;
         static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
         static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
@@ -1266,8 +1278,8 @@ void launch_mha_backward(ProblemShape problem_shape,
         constexpr int kBlockN = 64;
         constexpr int kHeadDim = 96;
         constexpr int kNSGs = 8;
-        constexpr int AtomLayoutMSdP = 8;
-        constexpr int AtomLayoutNdKV = 8;
+        constexpr int AtomLayoutMSdP = 4;
+        constexpr int AtomLayoutNdKV = 4;
         constexpr int AtomLayoutMdQ = 4;
         static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
         static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
@@ -1285,8 +1297,8 @@ void launch_mha_backward(ProblemShape problem_shape,
         constexpr int kBlockN = 64;
         constexpr int kHeadDim = 128;
         constexpr int kNSGs = 8;
-        constexpr int AtomLayoutMSdP = 8;
-        constexpr int AtomLayoutNdKV = 8;
+        constexpr int AtomLayoutMSdP = 4;
+        constexpr int AtomLayoutNdKV = 4;
         constexpr int AtomLayoutMdQ = 2;
         static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
         static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
@@ -1304,8 +1316,8 @@ void launch_mha_backward(ProblemShape problem_shape,
         constexpr int kBlockN = 32;
         constexpr int kHeadDim = 192;
         constexpr int kNSGs = 8;
-        constexpr int AtomLayoutMSdP = 8;
-        constexpr int AtomLayoutNdKV = 8;
+        constexpr int AtomLayoutMSdP = 4;
+        constexpr int AtomLayoutNdKV = 4;
         constexpr int AtomLayoutMdQ = 2;
         static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
         static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
@@ -1323,8 +1335,8 @@ void launch_mha_backward(ProblemShape problem_shape,
         constexpr int kBlockN = 32;
         constexpr int kHeadDim = 256;
         constexpr int kNSGs = 8;
-        constexpr int AtomLayoutMSdP = 8;
-        constexpr int AtomLayoutNdKV = 8;
+        constexpr int AtomLayoutMSdP = 4;
+        constexpr int AtomLayoutNdKV = 4;
         constexpr int AtomLayoutMdQ = 2;
         static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
         static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
