@@ -61,6 +61,14 @@ if (CUTLASS_ENABLE_SYCL)
       cute_tutorial_xe_gemm
       xe_gemm.cpp
     )
+    cutlass_example_add_executable(
+      xe_gemm_64
+      xe_gemm_64.cpp
+    )
+    cutlass_example_add_executable(
+      xe_gemm_128
+      xe_gemm_128.cpp
+    )
   endif()
 
   if (SYCL_NVIDIA_TARGET)
