@@ -387,9 +387,9 @@ int main(int argc, char** argv)
 
   (void) shift();
 
-  auto m = parse_size();
-  auto n = parse_size();
-  auto k = parse_size();
+  auto m = 516;//parse_size();
+  auto n = 516;//parse_size();
+  auto k = 128;//parse_size();
 
   sycl::queue Q = compat::get_default_queue();
 
