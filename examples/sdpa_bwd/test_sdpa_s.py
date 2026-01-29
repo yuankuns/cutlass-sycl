@@ -7,9 +7,9 @@ def is_close(refe: torch.Tensor,
              test: torch.Tensor):
     test = test.to(torch.float32)
     refe = refe.to(torch.float32)
-    cosfactor = F.cosine_similarity(test.reshape(-1), refe.reshape(-1), dim=0) > 0.99
+    cosfactor = (F.cosine_similarity(test.reshape(-1), refe.reshape(-1), dim=0) > 0.99).item()
     allclose = torch.allclose(test, refe, atol=3e-3, rtol=3e-3)
-    return cosfactor and allclose
+    return allclose and cosfactor, allclose, cosfactor
 
 def num_head_bcast(query: torch.Tensor,
                    key: torch.Tensor,
@@ -231,12 +231,19 @@ class ptSDPA(nn.Module):
             seq_len_q, seq_len_k = q.size(-2), k.size(-2)
             diagonal_offset = seq_len_k - seq_len_q
             temp_mask = torch.ones(seq_len_q, seq_len_k, dtype=torch.bool).tril(diagonal=diagonal_offset)
-        with sdpa_kernel(backends=[SDPBackend.MATH]):
-            return F.scaled_dot_product_attention(q, k, v,
-                                                  dropout_p=dropout_p,
-                                                  scale=scale,
-                                                  attn_mask=temp_mask,
-                                                  enable_gqa=True)
+            with sdpa_kernel(backends=[SDPBackend.MATH]):
+                return F.scaled_dot_product_attention(q, k, v,
+                                                      dropout_p=dropout_p,
+                                                      scale=scale,
+                                                      attn_mask=temp_mask,
+                                                      enable_gqa=True)
+        else:
+            seq_len_q, seq_len_k = q.size(-2), k.size(-2)
+            with sdpa_kernel(backends=[SDPBackend.MATH]):
+                return F.scaled_dot_product_attention(q, k, v,
+                                                      dropout_p=dropout_p,
+                                                      scale=scale,
+                                                      enable_gqa=True)
 
 def set_dict(dump_dict, name, value):
     if value.dtype == torch.bfloat16 or value.dtype == torch.float16:
@@ -262,6 +269,9 @@ def test_sdpa(dtype,
     q = torch.randn(batch, num_heads_q, seq_len_qo, head_size_qk, requires_grad=True).to(dtype)
     k = torch.randn(batch, num_heads_kv, seq_len_kv, head_size_qk, requires_grad=True).to(dtype)
     v = torch.randn(batch, num_heads_kv, seq_len_kv, head_size_vo, requires_grad=True).to(dtype)
+    q.uniform_(-1, 1)
+    k.uniform_(-1, 1)
+    v.uniform_(-1, 1)
     q2 = q.clone()
     k2 = k.clone()
     v2 = v.clone()
@@ -289,26 +299,28 @@ def test_sdpa(dtype,
     print(f"seed {seed} bsz {batch} nh_q {num_heads_q} nh_kv {num_heads_kv} sl_qo {seq_len_qo} sl_kv {seq_len_kv} hs_qk {head_size_qk} hs_vo {head_size_vo} dp {dropout_p} is_causal {is_causal} is_bhsd {is_bhsd}")
     print('attn_out ', is_close(attn_out, attn_out_pt))
     print('p_grad ', is_close(GRAD_DICT['p_grad'], p_grad))
-    # print('s2_grad ', is_close(GRAD_DICT['s2_grad'], s2_grad))
+    # # print('s2_grad ', is_close(GRAD_DICT['s2_grad'], s2_grad))
     print('s_grad ', is_close(GRAD_DICT['s_grad'], s_grad))
     print('k_grad ', is_close(k_grad, k2.grad))
     print('q_grad ', is_close(q_grad, q2.grad))
     print('v_grad ', is_close(v_grad, v2.grad))
+    if test_model.lse[0, 0, 1, 0] - test_model.lse[0, 0, 0, 0] < -10:
+        print("seed", seed, test_model.lse[0, 0, 1, 0], test_model.lse[0, 0, 0, 0])
     if is_bhsd:
         set_dict(dump_dict, 'out', attn_out)
         set_dict(dump_dict, 'grad', grad)
-        set_dict(dump_dict, 'v_grad', v_grad)
-        set_dict(dump_dict, 'k_grad', k_grad)
-        set_dict(dump_dict, 'q_grad', q_grad)
+        set_dict(dump_dict, 'v_grad', v2.grad)
+        set_dict(dump_dict, 'k_grad', k2.grad)
+        set_dict(dump_dict, 'q_grad', q2.grad)
         set_dict(dump_dict, 'q', q)
         set_dict(dump_dict, 'k', k)
         set_dict(dump_dict, 'v', v)
     else:
         set_dict(dump_dict, 'out', attn_out.transpose(1, 2).contiguous())
         set_dict(dump_dict, 'grad', grad.transpose(1, 2).contiguous())
-        set_dict(dump_dict, 'v_grad', v_grad.transpose(1, 2).contiguous())
-        set_dict(dump_dict, 'k_grad', k_grad.transpose(1, 2).contiguous())
-        set_dict(dump_dict, 'q_grad', q_grad.transpose(1, 2).contiguous())
+        set_dict(dump_dict, 'v_grad', v2.grad.transpose(1, 2).contiguous())
+        set_dict(dump_dict, 'k_grad', k2.grad.transpose(1, 2).contiguous())
+        set_dict(dump_dict, 'q_grad', q2.grad.transpose(1, 2).contiguous())
         set_dict(dump_dict, 'q', q.transpose(1, 2).contiguous())
         set_dict(dump_dict, 'k', k.transpose(1, 2).contiguous())
         set_dict(dump_dict, 'v', v.transpose(1, 2).contiguous())
@@ -320,8 +332,6 @@ def test_sdpa(dtype,
     set_dict(dump_dict, 's_grad', s_grad)
     shape = np.array([batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, head_size_qk, head_size_vo, is_causal, is_bhsd], dtype=np.int32)
     dump_dict['shape'] = shape
-    # print('test', v_grad[0,0:4,0,0:16])
-    # print('upstream', v2.grad[0,0:4,0,0:16])
     np.savez(f'mha-{batch}-{num_heads_q}-{num_heads_kv}-{seq_len_qo}-{seq_len_kv}-{head_size_qk}-{head_size_vo}-{dropout_p}-{int(is_causal)}-{int(is_bhsd)}.npz', **dump_dict)
 
 def loop_run():
@@ -341,8 +351,13 @@ def loop_run():
                     GRAD_DICT = {}
 
 if __name__ == '__main__':
-    # test_sdpa(torch.float16, 123, 4, 4, 4, 513, 512, 128, 128, is_causal=True)
-    loop_run()
+    # for i in range(400):
+    test_sdpa(torch.float16, 397, 2, 4, 4, 77, 1, 128, 128, is_causal=False, is_bhsd=False)
+    # GRAD_DICT = {}
+    # test_sdpa(torch.float16, 123, 2, 4, 4, 77, 1, 128, 128, is_causal=False, is_bhsd=True)
+    # test_sdpa(torch.float16, 123, 2, 4, 4, 77, 1, 128, 128, is_causal=True, is_bhsd=False)
+    # test_sdpa(torch.float16, 123, 2, 4, 4, 77, 1, 128, 128, is_causal=True, is_bhsd=True)
+    # loop_run()
     # test_sdpa(torch.float16, 123, 4, 4, 4, 513, 784, 128, 128, is_causal=True)
     # GRAD_DICT = {}
     # test_sdpa(torch.float16, 123, 4, 4, 4, 513, 784, 128, 128, is_causal=False)

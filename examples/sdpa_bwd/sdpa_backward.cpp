@@ -208,9 +208,7 @@ gemm_kernel(Trait &trait,
             Tensor<Engine0, Layout0> const& A,         // (M,K)
             Tensor<Engine1, Layout1> const& B,         // (N,K)
             SubgroupTensor<Engine2, Layout2, TVLayout2> & acc,
-            TiledMMA const & mma,
-            const int m_block = 0,
-            const int n_block = 0) {
+            TiledMMA const & mma) {
     // -----
     // Setup
     // -----
@@ -225,8 +223,8 @@ gemm_kernel(Trait &trait,
 
     auto tile_mnk = mma.tile_mnk();
 
-    Tensor gA = local_tile(cA, select<0,2>(tile_mnk), make_coord(m_block,_));  // (BLK_M,BLK_K,k)
-    Tensor gB = local_tile(cB, select<1,2>(tile_mnk), make_coord(n_block,_));  // (BLK_N,BLK_K,k)
+    Tensor gA = local_tile(cA, select<0,2>(tile_mnk), make_coord(0,_));  // (BLK_M,BLK_K,k)
+    Tensor gB = local_tile(cB, select<1,2>(tile_mnk), make_coord(0,_));  // (BLK_N,BLK_K,k)
 
     /* Create block 2D TiledCopies */
     auto copy_a = make_block_2d_copy_A(mma, A);
@@ -348,21 +346,19 @@ gemm_dQ(Trait &trait,
         Tensor<Engine0, Layout0> const& A,         // (M,K)
         Tensor<Engine1, Layout1> const& B,         // (N,K)
         Tensor<Engine2, Layout2> const& C,         // (M,N)
-        TiledMMA const & mma,
-        const int m_block = 0,
-        const int n_block = 0) {
+        TiledMMA const & mma) {
     auto sg = compat::get_nd_item<1>().get_sub_group();
     auto first_thread_in_sg_idx = sg.get_group_linear_id() * trait.SubgroupSize;
     auto tile_mnk = mma.tile_mnk();
     Tensor cC = make_identity_tensor(C.shape());   // (M,N)
-    Tensor gC = local_tile(cC, select<0, 1>(tile_mnk), make_coord(m_block, n_block));  // (BLK_M,BLK_N)
+    Tensor gC = local_tile(cC, select<0, 1>(tile_mnk), make_coord(0,0));  // (BLK_M,BLK_N)
     auto thr_mma = mma.get_slice(first_thread_in_sg_idx);
     auto tCrC = thr_mma.partition_sg_fragment_C(make_identity_tensor(select<0,1>(tile_mnk))); // allocate C fragment storage
     Tensor tCgC = thr_mma.partition_C(gC);
-    gemm_kernel<true>(trait, A, B, tCrC, mma, m_block, n_block);
+    gemm_kernel<true>(trait, A, B, tCrC, mma);
     int local_id = sg.get_local_id();
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i <  size(tCgC); ++i) {
+    for (int i = 0; i < size(tCgC); ++i) {
         auto [m, n] = tCgC(i);
         cutlass::atomicAdd(&C(m, n + local_id), tCrC(i));
     }
@@ -409,14 +405,16 @@ CUTLASS_DEVICE auto convert_layout_acc_layout(Layout acc_layout) {
     return l2;
 }
 
-template<class Engine0, class Layout0,
+template<bool Is_even_M,
+         class Engine0, class Layout0,
          class Engine1, class Layout1,
          class Engine2, class Layout2>
 CUTLASS_DEVICE void
 scale_apply_exp2(Tensor<Engine0, Layout0> &tensor,
                  Tensor<Engine1, Layout1> &max,
                  Tensor<Engine2, Layout2> &rC,
-                 const float scale) {
+                 const float scale,
+                 const int tail_m = 0) {
     static_assert(Layout0::rank == 2, "Only support 2D Tensor");
     static_assert(Layout1::rank == 1, "Only support 1D Tensor");
     auto sg = compat::get_nd_item<1>().get_sub_group();
@@ -424,18 +422,31 @@ scale_apply_exp2(Tensor<Engine0, Layout0> &tensor,
     Tensor rC_2d = make_tensor(
         rC.data(),
         convert_layout_2d_layout(rC.layout()));
-    CUTLASS_PRAGMA_UNROLL
-    for (int ni = 0; ni < size<1>(tensor); ++ni)  {
-        int n = get<1>(rC_2d(0, ni)) + sg_local_id;
-        const float max_scaled = max(n) == -INFINITY ? 0.f : max(n) * M_LOG2E;
+    if constexpr(Is_even_M) {
         CUTLASS_PRAGMA_UNROLL
-        for (int mi = 0; mi < size<0>(tensor); ++mi) {
-            tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
+        for (int ni = 0; ni < size<1>(tensor); ++ni)  {
+            int n = get<1>(rC_2d(0, ni)) + sg_local_id;
+            const float max_scaled = max(n) == -INFINITY ? 0.f : max(n) * M_LOG2E;
+            CUTLASS_PRAGMA_UNROLL
+            for (int mi = 0; mi < size<0>(tensor); ++mi) {
+                tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
+            }
+        }
+    } else {
+        CUTLASS_PRAGMA_UNROLL
+        for (int ni = 0; ni < size<1>(tensor); ++ni)  {
+            int n = get<1>(rC_2d(0, ni)) + sg_local_id;
+            const float max_scaled = ((max(n) == -INFINITY) or (n >= tail_m)) ? 0.f : max(n) * M_LOG2E;
+            CUTLASS_PRAGMA_UNROLL
+            for (int mi = 0; mi < size<0>(tensor); ++mi) {
+                tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
+            }
         }
     }
 }
 
-template<class Engine0, class Layout0,
+template<bool Is_even_M,
+         class Engine0, class Layout0,
          class Engine1, class Layout1,
          class Engine2, class Layout2,
          class Engine3, class Layout3>
@@ -444,20 +455,35 @@ softmax_backward(Tensor<Engine0, Layout0> &P,
                  Tensor<Engine1, Layout1> &dP_sum,
                  Tensor<Engine2, Layout2> &dP,
                  Tensor<Engine3, Layout3> &rC,
-                 const float scale) {
+                 const float scale,
+                 const int tail_m = 0) {
     Tensor rC_2d = make_tensor(
         rC.data(),
         convert_layout_2d_layout(rC.layout()));
     auto sg = compat::get_nd_item<1>().get_sub_group();
     int sg_local_id = sg.get_local_id();
-    CUTLASS_PRAGMA_UNROLL
-    for (int ni = 0; ni < size<1>(dP); ++ni) {
-        int n = get<1>(rC_2d(0, ni)) + sg_local_id;
-        const float dpsum = dP_sum(n);
+    if constexpr(Is_even_M) {
         CUTLASS_PRAGMA_UNROLL
-        for (int mi = 0; mi < size<0>(dP); ++mi) {
-            dP(mi, ni) = P(mi, ni) * (dP(mi, ni) - dpsum) * scale;
+        for (int ni = 0; ni < size<1>(dP); ++ni) {
+            int n = get<1>(rC_2d(0, ni)) + sg_local_id;
+            const float dpsum = dP_sum(n);
+            CUTLASS_PRAGMA_UNROLL
+            for (int mi = 0; mi < size<0>(dP); ++mi) {
+                dP(mi, ni) = P(mi, ni) * (dP(mi, ni) - dpsum) * scale;
+            }
         }
+    } else {
+        CUTLASS_PRAGMA_UNROLL
+        for (int ni = 0; ni < size<1>(dP); ++ni) {
+            int n = get<1>(rC_2d(0, ni)) + sg_local_id;
+            if (n < tail_m) {
+                const float dpsum = dP_sum(n);
+                CUTLASS_PRAGMA_UNROLL
+                for (int mi = 0; mi < size<0>(dP); ++mi) {
+                    dP(mi, ni) = P(mi, ni) * (dP(mi, ni) - dpsum) * scale;
+                }
+            }
+         }
     }
 }
 
@@ -500,9 +526,8 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
     const auto block_n_dim = tail_n == 0 ? Int<kBlockN>{} : ((tail_n + 1) & ~1);
     auto shapeO = make_shape(kBlockM, Int<kHeadDim>{});
     auto shapeQtOt = make_shape(Int<kHeadDim>{}, kBlockM);
-    auto shapeSPt = make_shape(block_n_dim, kBlockM);
-    auto shapeSP = make_shape(Int<kBlockM>{}, block_n_dim);
-    auto shapePt = make_shape(block_n_dim, kBlockM);
+    auto shapeSPt = make_shape(Int<kBlockN>{}, kBlockM);
+    auto shapeSP = make_shape(kBlockM, block_n_dim);
 
     using Shape1 = Shape<
         std::conditional_t<Is_even_N, Int<kBlockN>, int>, Int<kHeadDim>>;
@@ -541,7 +566,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
     Tensor mPt = make_tensor(make_gmem_ptr(param.pb_ptr + pb_offset),
                              make_layout(
                                  shapeSPt,
-                                 make_stride(kBlockM, _1{})));
+                                 make_stride(Int<kBlockM>{}, _1{})));
     Tensor mdOt = make_tensor(make_gmem_ptr(param.do_ptr + o_offset),
                               make_layout(
                                   shapeQtOt,
@@ -553,7 +578,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
     Tensor mdPt = make_tensor(make_gmem_ptr(param.pb_ptr + dsb_offset),
                               make_layout(
                                   shapeSPt,
-                                  make_stride(kBlockM, _1{})));
+                                  make_stride(Int<kBlockM>{}, _1{})));
     Tensor mQt = make_tensor(make_gmem_ptr(param.q_ptr + q_offset),
                               make_layout(
                                   shapeQtOt,
@@ -613,6 +638,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
     for (int m_block = 0; m_block < max_m_block; ++m_block) {
         const bool Is_even_M = not ((m_block == max_m_block - 1) and (tail_m != 0));
         if (not Is_even_M) {
+            const int block_m_dim = ((tail_m + 1) & ~1);
             mQ = make_tensor(make_gmem_ptr(mQ.data()),
                              make_layout(
                                  make_shape(tail_m, Int<kHeadDim>{}),
@@ -621,10 +647,22 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                              make_layout(
                                  make_shape(tail_m, Int<kHeadDim>{}),
                                  make_stride(param.o_r_stride, _1{})));
+            mPt = make_tensor(make_gmem_ptr(mPt.data()),
+                              make_layout(
+                                  make_shape(Int<kBlockN>{}, block_m_dim),
+                                  make_stride(Int<kBlockM>{}, _1{})));
             mdOt = make_tensor(make_gmem_ptr(mdOt.data()),
                                make_layout(
                                    make_shape(Int<kHeadDim>{}, tail_m),
                                    make_stride(_1{}, param.o_r_stride)));
+            mdPt = make_tensor(make_gmem_ptr(mdPt.data()),
+                               make_layout(
+                                   make_shape(Int<kBlockN>{}, block_m_dim),
+                                   make_stride(Int<kBlockM>{}, _1{})));
+            mdP = make_tensor(make_gmem_ptr(mdP.data()),
+                              make_layout(
+                                 make_shape(block_m_dim, block_n_dim),
+                                 make_stride(_1{}, Int<kBlockM>{})));
             mdQaccum = make_tensor(make_gmem_ptr(mdQaccum.data()),
                                    make_layout(
                                        shapedQ,
@@ -642,14 +680,18 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                                 tiled_mma_sdp);
         clear(rS);
         // S=QKt
-        gemm_SdP(trait, mKt, mQ, rS,
-                 tiled_mma_sdp);
+        gemm_SdP(trait, mKt, mQ, rS, tiled_mma_sdp);
         Tensor scores = make_tensor(rS.data(), convert_layout_acc_layout(rS.layout()));
         if constexpr(is_causal) {
             apply_mask_causal(scores, taccScS_rt, m_block * kBlockM, n_block * kBlockN, param.seq_len_kv - param.seq_len_q);
         }
-        scale_apply_exp2(scores, mLSE, taccScS_rt,
-                          param.scale_softmax_log2);
+        if (Is_even_M) {
+            scale_apply_exp2<true>(scores, mLSE, taccScS_rt,
+                                   param.scale_softmax_log2);
+        } else {
+            scale_apply_exp2<false>(scores, mLSE, taccScS_rt,
+                                    param.scale_softmax_log2, tail_m);
+        }
 
 #ifdef _DEBUG_
 #endif
@@ -658,13 +700,15 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                                   tiled_mma_sdp);
         clear(rdP);
         // dP=dO*Vt
-        gemm_SdP(trait, mVt, mdO, rdP,
-                 tiled_mma_sdp);
+        gemm_SdP(trait, mVt, mdO, rdP, tiled_mma_sdp);
 
         Tensor dS = make_tensor(rdP.data(), scores.layout());
         // dS=P(dP-sum_row(P))*scale
-        softmax_backward(scores, mdPsum, dS, taccScS_rt,
-                         param.scale_softmax);
+        if (Is_even_M) {
+            softmax_backward<true>(scores, mdPsum, dS, taccScS_rt, param.scale_softmax);
+        } else {
+            softmax_backward<false>(scores, mdPsum, dS, taccScS_rt, param.scale_softmax, tail_m);
+        }
         mha_reorder_copy(trait, tiled_mma_sdp, rS, mPt);
         mha_reorder_copy(trait, tiled_mma_sdp, rdP, mdPt); // copy dP to internal buff
 #ifdef _DEBUG_
@@ -672,14 +716,11 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         }
         sycl::group_barrier(group);
         // dV=Pt*dO
-        gemm_dKV(trait, mPt, mdOt, rdV,
-                 tiled_mma_dkv);
+        gemm_dKV(trait, mPt, mdOt, rdV, tiled_mma_dkv);
         // dK=dPt*Q
-        gemm_dKV(trait, mdPt, mQt, rdK,
-                 tiled_mma_dkv);
+        gemm_dKV(trait, mdPt, mQt, rdK, tiled_mma_dkv);
         // dQ=dP*K
-        gemm_dQ(trait, mdP, mK, mdQaccum,
-                tiled_mma_dq);
+        gemm_dQ(trait, mdP, mK, mdQaccum, tiled_mma_dq);
         // update ptr/atom copy
         mQ.data() = mQ.data() + int(kBlockM * param.q_r_stride);
         mdO.data() = mdO.data() + int(kBlockM * param.o_r_stride);
