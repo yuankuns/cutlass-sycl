@@ -109,7 +109,7 @@ auto convert_layout_2d_layout(Layout layout) {
     return l;
 }
 
-constexpr int tid = 16;
+constexpr int tid = 0;
 constexpr int bid = 0;
 
 const bool
@@ -213,8 +213,7 @@ gemm_kernel(Trait &trait,
             Tensor<Engine1, Layout1> const& B,         // (N,K)
             SubgroupTensor<Engine2, Layout2, TVLayout2> & acc,
             TiledMMA const & mma,
-            const int m_block = 0,
-            const int n_block = 0) {
+            bool debug = false) {
     // -----
     // Setup
     // -----
@@ -226,11 +225,17 @@ gemm_kernel(Trait &trait,
     /* Create proxy coordinate tensors for each global tensor */
     Tensor cA = make_identity_tensor(A.shape());   // (M,K)
     Tensor cB = make_identity_tensor(B.shape());   // (N,K)
-
+    if (is_cur_thread() and debug) {
+        print("A:\n");
+        print(A.shape());
+        print("\nB:\n");
+        print(B.shape());
+        print("\n");
+    }
     auto tile_mnk = mma.tile_mnk();
 
-    Tensor gA = local_tile(cA, select<0,2>(tile_mnk), make_coord(m_block,_));  // (BLK_M,BLK_K,k)
-    Tensor gB = local_tile(cB, select<1,2>(tile_mnk), make_coord(n_block,_));  // (BLK_N,BLK_K,k)
+    Tensor gA = local_tile(cA, select<0,2>(tile_mnk), make_coord(0,_));  // (BLK_M,BLK_K,k)
+    Tensor gB = local_tile(cB, select<1,2>(tile_mnk), make_coord(0,_));  // (BLK_N,BLK_K,k)
 
     /* Create block 2D TiledCopies */
     auto copy_a = make_block_2d_copy_A(mma, A);
@@ -298,6 +303,14 @@ gemm_kernel(Trait &trait,
         copy(copy_a, tAgA(_,_,_,k_tile), tArA);
         copy(copy_b, tBgB(_,_,_,k_tile), tBrB);
 
+        if (debug and is_cur_thread()) {
+            print("tArA(%d):\n", k_tile);
+            print_t(tArA);
+            print("\ntBrB(%d):\n", k_tile);
+            print_t(tBrB);
+            print("\n");
+        }
+
         /* Prefetch A/B tiles to L1 */
         prefetch(prefetch_a, pAgA(_,_,_,k_tile_prefetch));
         prefetch(prefetch_b, pBgB(_,_,_,k_tile_prefetch));
@@ -305,10 +318,23 @@ gemm_kernel(Trait &trait,
         /* Shuffle data from copy fragments to MMA fragments */
         reorder(tArA, tCrA);
         reorder(tBrB, tCrB);
+        if (debug and is_cur_thread()) {
+            print("tCrA(%d):\n", k_tile);
+            print_t(tCrA);
+            print("\ntCrB(%d):\n", k_tile);
+            print_t(tCrB);
+            print("\nacc0(%d):\n", k_tile);
+            print_t(acc);
+            print("\n");
+        }
 
         /* Accumulate C += A * B */
         gemm(mma, tCrA, tCrB, acc);
-
+        if (debug and is_cur_thread()) {
+            print("acc(%d):\n", k_tile);
+            print_t(acc);
+            print("\n");
+        }
         /* Other half of split barrier */
         barrier_wait(barrier_scope);
     }
@@ -338,8 +364,9 @@ gemm_dKV(Trait &trait,
          Tensor<Engine0, Layout0> const& A,         // (M,K)
          Tensor<Engine1, Layout1> const& B,         // (N,K)
          SubgroupTensor<Engine2, Layout2, TVLayout2> & rdKV,
-         TiledMMA const & mma) {
-    gemm_kernel<false>(trait, A, B, rdKV, mma);
+         TiledMMA const & mma,
+         bool debug = false) {
+    gemm_kernel<false>(trait, A, B, rdKV, mma, debug);
 }
 
 template<class Trait,
@@ -352,18 +379,16 @@ gemm_dQ(Trait &trait,
         Tensor<Engine0, Layout0> const& A,         // (M,K)
         Tensor<Engine1, Layout1> const& B,         // (N,K)
         Tensor<Engine2, Layout2> const& C,         // (M,N)
-        TiledMMA const & mma,
-        const int m_block = 0,
-        const int n_block = 0) {
+        TiledMMA const & mma) {
     auto sg = compat::get_nd_item<1>().get_sub_group();
     auto first_thread_in_sg_idx = sg.get_group_linear_id() * trait.SubgroupSize;
     auto tile_mnk = mma.tile_mnk();
     Tensor cC = make_identity_tensor(C.shape());   // (M,N)
-    Tensor gC = local_tile(cC, select<0, 1>(tile_mnk), make_coord(m_block, n_block));  // (BLK_M,BLK_N)
+    Tensor gC = local_tile(cC, select<0, 1>(tile_mnk), make_coord(0,0));  // (BLK_M,BLK_N)
     auto thr_mma = mma.get_slice(first_thread_in_sg_idx);
     auto tCrC = thr_mma.partition_sg_fragment_C(make_identity_tensor(select<0,1>(tile_mnk))); // allocate C fragment storage
     Tensor tCgC = thr_mma.partition_C(gC);
-    gemm_kernel<true>(trait, A, B, tCrC, mma, m_block, n_block);
+    gemm_kernel<true>(trait, A, B, tCrC, mma);
     int local_id = sg.get_local_id();
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i <  size(tCgC); ++i) {
@@ -397,9 +422,15 @@ template <class Trait, class TiledMma,
 void
 mha_reorder_copy(Trait & trait, TiledMma &tiled_mma,
                  SubgroupTensor<Engine0, Layout0, TVLayout0> &r,
-                 Tensor<Engine1, Layout1> &m){
+                 Tensor<Engine1, Layout1> &m,
+                 bool debug = false){
     auto r16 = create_reg<typename Trait::DType>(trait, m, tiled_mma);
     reorder(r, r16);
+    if (debug and is_cur_thread()) {
+        print("rdV16:\n");
+        print_t(r16);
+        print("\n");
+    }
     mha_copy(trait, tiled_mma, r16, m);
 }
 
@@ -679,6 +710,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                                      make_stride(param.s_r_stride, _1{})));
 #endif
         }
+        bool debug = n_block == 0;
         {
         auto rS = create_reg<V>(trait,
                                 mP,
@@ -729,7 +761,12 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         sycl::group_barrier(group);
         // dV=Pt*dO
         gemm_dKV(trait, mPt, mdOt, rdV,
-                 tiled_mma_dkv);
+                 tiled_mma_dkv, debug);
+        if (is_cur_thread()) {
+            print("rdV(%d):\n", m_block);
+            print_t(rdV);
+            print("\n");
+        }
         // dK=dPt*Q
         gemm_dKV(trait, mdPt, mQt, rdK,
                  tiled_mma_dkv);
@@ -750,7 +787,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         mdPsum.data() = mdPsum.data() + int(kBlockM);
 
     }
-    mha_reorder_copy(trait, tiled_mma_dkv, rdV, mdV);
+    mha_reorder_copy(trait, tiled_mma_dkv, rdV, mdV, true);
     mha_reorder_copy(trait, tiled_mma_dkv, rdK, mdK);
 }
 
