@@ -373,13 +373,12 @@ int main(int argc, char** argv)
 
   for (int m = 1; m < 64; m = m * 2) {
       for (int n = 1; n < 64; n = n * 2) {
-          for (int k = 32; k < 128; k = k * 2) {
-              // Native compute
-              test_case<half_t, half_t, float, 'R', 'R'>(Q, m, n, k);
-              test_case<half_t, half_t, float, 'C', 'R'>(Q, m, n, k);
-              test_case<half_t, half_t, float, 'R', 'C'>(Q, m, n, k);
-              test_case<half_t, half_t, float, 'C', 'C'>(Q, m, n, k);
-          }
+          int k = 1;
+          // Native compute
+          test_case<half_t, half_t, float, 'R', 'R'>(Q, m, n, k);
+          test_case<half_t, half_t, float, 'C', 'R'>(Q, m, n, k);
+          test_case<half_t, half_t, float, 'R', 'C'>(Q, m, n, k);
+          test_case<half_t, half_t, float, 'C', 'C'>(Q, m, n, k);
       }
   }
 }

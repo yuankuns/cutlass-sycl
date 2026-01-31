@@ -66,6 +66,14 @@ if (CUTLASS_ENABLE_SYCL)
       xe_gemm_64.cpp
     )
     cutlass_example_add_executable(
+      xe_gemm_acc_64
+      xe_gemm_acc_64.cpp
+    )
+    cutlass_example_add_executable(
+      xe_gemm_nan_64
+      xe_gemm_nan_64.cpp
+    )
+    cutlass_example_add_executable(
       xe_gemm_128
       xe_gemm_128.cpp
     )
