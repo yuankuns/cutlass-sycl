@@ -324,6 +324,53 @@ gemm_SdP(Trait &trait,
     gemm_kernel<true>(trait, A, B, rSdP, mma);
 }
 
+template <class Trait,
+          class Engine0, class Layout0,
+          class Engine1, class Layout1,
+          class Engine2, class Layout2, class TVLayout2,
+          class TiledMMA>
+void
+slm_save_C(Trait & trait,
+           Tensor<Engine0, Layout0> &mC,
+           Tensor<Engine1, Layout1> &sC,
+           SubgroupTensor<Engine2, Layout2, TVLayout2> & rC,
+           TiledMMA const & tiled_mma) {
+    using T = typename Trait::DType;
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<2>();
+    auto local_id = int(item.get_local_id(0));
+
+    Tensor cC = make_identity_tensor(mC.shape());
+
+    auto wg_tile = tiled_mma.tile_mnk();
+    auto copy_c = make_block_2d_copy_D(tiled_mma, mC);
+
+    using Atom = Copy_Atom<UniversalCopy<T>, T>;
+    using Tiler_MN = typename decltype(copy_c)::Tiler_MN;
+    using TVLayout = typename decltype(copy_c)::TiledLayout_TV;
+    auto slm_store = TiledCopy<Atom, TVLayout, Tiler_MN>{};
+    auto thr_slm_store = slm_store.get_slice(local_id);
+
+    Tensor tOrO = thr_slm_store.retile_S(rC.tensor());
+    Tensor tOsO = thr_slm_store.partition_D(sC);
+    copy(slm_store, tOrO, tOsO);
+}
+
+template<class Trait,
+         class Engine0, class Layout0,
+         class Engine1, class Layout1,
+         class Engine2, class Layout2, class TVLayout2,
+         class TiledMMA>
+void
+slm_reorder_save_C(Trait & trait,
+                   Tensor<Engine0, Layout0> &mC,
+                   Tensor < Engine1, Layout1> &sC,
+                   SubgroupTensor<Engine2, Layout2, TVLayout2> &r,
+                   TiledMMA const & tiled_mma){
+    auto r16 = create_reg<typename Trait::DType>(trait, mC, tiled_mma);
+    reorder(r, r16);
+    slm_save_C(trait, mC, sC, r16, tiled_mma);
+}
+
 template<class Trait,
          class Engine0, class Layout0,
          class Engine1, class Layout1,
@@ -480,7 +527,6 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
     const int local_id = sg.get_local_id();
     auto first_thread_in_sg_idx = sg.get_group_linear_id() * trait.SubgroupSize;
     auto bofst = Boffset(param);
-
     const index_t q_offset = bofst.q_offset(bidb, bidh, 0);
     const index_t k_offset = bofst.k_offset(bidb, bidhkv, n_block * kBlockN);
     const index_t v_offset = bofst.v_offset(bidb, bidhkv, n_block * kBlockN);
@@ -500,9 +546,9 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
     const auto block_n_dim = tail_n == 0 ? Int<kBlockN>{} : ((tail_n + 1) & ~1);
     auto shapeO = make_shape(kBlockM, Int<kHeadDim>{});
     auto shapeQtOt = make_shape(Int<kHeadDim>{}, kBlockM);
-    auto shapeSPt = make_shape(block_n_dim, kBlockM);
+    auto shapeSPt = make_shape(block_n_dim, Int<kBlockM>{});
     auto shapeSP = make_shape(Int<kBlockM>{}, block_n_dim);
-    auto shapePt = make_shape(block_n_dim, kBlockM);
+    auto shapePt = make_shape(block_n_dim, Int<kBlockM>{});
 
     using Shape1 = Shape<
         std::conditional_t<Is_even_N, Int<kBlockN>, int>, Int<kHeadDim>>;
@@ -520,6 +566,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         shapeKtVt = make_shape(tail_n, Int<kHeadDim>{});
         shapeKV = make_shape(Int<kHeadDim>{}, tail_n);
     }
+    auto smem = compat::local_mem<T[kBlockM * kBlockN]>();
 
     Tensor mQ = make_tensor(make_gmem_ptr(param.q_ptr + q_offset),
                             make_layout(
@@ -541,7 +588,11 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
     Tensor mPt = make_tensor(make_gmem_ptr(param.pb_ptr + pb_offset),
                              make_layout(
                                  shapeSPt,
-                                 make_stride(kBlockM, _1{})));
+                                 make_stride(Int<kBlockM>{}, _1{})));
+    Tensor sPt = make_tensor(make_smem_ptr(smem),
+                             make_layout(
+                                 shapeSPt,
+                                 make_stride(Int<kBlockM>{}, _1{})));
     Tensor mdOt = make_tensor(make_gmem_ptr(param.do_ptr + o_offset),
                               make_layout(
                                   shapeQtOt,
@@ -553,7 +604,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
     Tensor mdPt = make_tensor(make_gmem_ptr(param.pb_ptr + dsb_offset),
                               make_layout(
                                   shapeSPt,
-                                  make_stride(kBlockM, _1{})));
+                                  make_stride(Int<kBlockM>{}, _1{})));
     Tensor mQt = make_tensor(make_gmem_ptr(param.q_ptr + q_offset),
                               make_layout(
                                   shapeQtOt,
@@ -665,6 +716,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         // dS=P(dP-sum_row(P))*scale
         softmax_backward(scores, mdPsum, dS, taccScS_rt,
                          param.scale_softmax);
+        slm_reorder_save_C(trait, mPt, sPt, rS, tiled_mma_sdp);
         mha_reorder_copy(trait, tiled_mma_sdp, rS, mPt);
         mha_reorder_copy(trait, tiled_mma_sdp, rdP, mdPt); // copy dP to internal buff
 #ifdef _DEBUG_
@@ -1105,21 +1157,21 @@ void launch_mha_backward_headdim(ProblemShape problem_shape,
     for (int iii=0; iii < count; ++iii) {
     auto start0 = std::chrono::high_resolution_clock::now();
 #endif
-    auto dimGrid0 = compat::dim3(size(M_BLOCK), size(param.num_head_q), size(param.batch));
-    auto dimBlock0 = compat::dim3(size(kNSGs * trait.SubgroupSize), size(1), size(1));
-    compat::experimental::launch_properties launch_props0{
-        // sycl::ext::oneapi::experimental::work_group_scratch_size(0),
-    };
-    compat::experimental::kernel_properties kernel_props0{
-        sycl::ext::oneapi::experimental::sub_group_size<trait.SubgroupSize>};
-    compat::experimental::launch_policy policy0{dimGrid0, dimBlock0, launch_props0, kernel_props0};
-    auto event0 = compat::experimental::launch<
-        mha_dot_do_o<decltype(trait)>,
-        mhaodoDeviceName<decltype(trait)>>(policy0,
-                                           trait,
-                                           param);
-    EventManager::getInstance().addEvent(event0);
-    compat::wait_and_throw();
+    // auto dimGrid0 = compat::dim3(size(M_BLOCK), size(param.num_head_q), size(param.batch));
+    // auto dimBlock0 = compat::dim3(size(kNSGs * trait.SubgroupSize), size(1), size(1));
+    // compat::experimental::launch_properties launch_props0{
+    //     // sycl::ext::oneapi::experimental::work_group_scratch_size(0),
+    // };
+    // compat::experimental::kernel_properties kernel_props0{
+    //     sycl::ext::oneapi::experimental::sub_group_size<trait.SubgroupSize>};
+    // compat::experimental::launch_policy policy0{dimGrid0, dimBlock0, launch_props0, kernel_props0};
+    // auto event0 = compat::experimental::launch<
+    //     mha_dot_do_o<decltype(trait)>,
+    //     mhaodoDeviceName<decltype(trait)>>(policy0,
+    //                                        trait,
+    //                                        param);
+    // EventManager::getInstance().addEvent(event0);
+    // compat::wait_and_throw();
 #ifdef _BENCH_
     auto end0 = std::chrono::high_resolution_clock::now();
     dur0 += end0 - start0;
@@ -1152,21 +1204,21 @@ void launch_mha_backward_headdim(ProblemShape problem_shape,
 
     auto start2 = std::chrono::high_resolution_clock::now();
 #endif
-    auto dimGrid2 = compat::dim3(size(M_BLOCK), size(param.num_head_q), size(param.batch));
-    auto dimBlock2 = compat::dim3(size(kNSGs * trait.SubgroupSize), size(1), size(1));
-    compat::experimental::launch_properties launch_props2{
-        // sycl::ext::oneapi::experimental::work_group_scratch_size(0),
-    };
-    compat::experimental::kernel_properties kernel_props2{
-        sycl::ext::oneapi::experimental::sub_group_size<trait.SubgroupSize>};
-    compat::experimental::launch_policy policy2{dimGrid2, dimBlock2, launch_props2, kernel_props2};
-    auto event2 = compat::experimental::launch<
-        mhd_convert_dq<decltype(trait)>,
-        mhacvtDeviceName<decltype(trait)>>(policy2,
-                                           trait,
-                                           param);
-    EventManager::getInstance().addEvent(event2);
-    compat::wait_and_throw();
+    // auto dimGrid2 = compat::dim3(size(M_BLOCK), size(param.num_head_q), size(param.batch));
+    // auto dimBlock2 = compat::dim3(size(kNSGs * trait.SubgroupSize), size(1), size(1));
+    // compat::experimental::launch_properties launch_props2{
+    //     // sycl::ext::oneapi::experimental::work_group_scratch_size(0),
+    // };
+    // compat::experimental::kernel_properties kernel_props2{
+    //     sycl::ext::oneapi::experimental::sub_group_size<trait.SubgroupSize>};
+    // compat::experimental::launch_policy policy2{dimGrid2, dimBlock2, launch_props2, kernel_props2};
+    // auto event2 = compat::experimental::launch<
+    //     mhd_convert_dq<decltype(trait)>,
+    //     mhacvtDeviceName<decltype(trait)>>(policy2,
+    //                                        trait,
+    //                                        param);
+    // EventManager::getInstance().addEvent(event2);
+    // compat::wait_and_throw();
 #ifdef _BENCH_
     auto end2 = std::chrono::high_resolution_clock::now();
     dur2 += end2 - start2;
@@ -1199,47 +1251,48 @@ void launch_mha_backward(ProblemShape problem_shape,
                          const int seq_len_q_pad,
                          const int seq_len_kv_pad) {
     const int headdim = get<5>(problem_shape);
-    if (headdim == 64) {
-        constexpr int kBlockM = 64;
-        constexpr int kBlockN = 64;
-        constexpr int kHeadDim = 64;
-        constexpr int kNSGs = 8;
-        constexpr int AtomLayoutMSdP = 4;
-        constexpr int AtomLayoutNdKV = 2;
-        constexpr int AtomLayoutMdQ = 2;
-        static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
-        static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
-        launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN,
-                                    kHeadDim, kNSGs,
-                                    AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
-                                    is_causal, is_bhsd>(
-            problem_shape,
-            do_d, o_d, q_d, k_d, v_d,
-            lse_d, odo_d,
-            dqaccum_d, dq_d, dk_d, dv_d,
-            s_d, dp_d,
-            seq_len_q_pad, seq_len_kv_pad);
-    } else if (headdim == 96) {
-        constexpr int kBlockM = 64;
-        constexpr int kBlockN = 64;
-        constexpr int kHeadDim = 96;
-        constexpr int kNSGs = 8;
-        constexpr int AtomLayoutMSdP = 2;
-        constexpr int AtomLayoutNdKV = 4;
-        constexpr int AtomLayoutMdQ = 4;
-        static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
-        static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
-        launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN,
-                                    kHeadDim, kNSGs,
-                                    AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
-                                    is_causal, is_bhsd>(
-            problem_shape,
-            do_d, o_d, q_d, k_d, v_d,
-            lse_d, odo_d,
-            dqaccum_d, dq_d, dk_d, dv_d,
-            s_d, dp_d,
-            seq_len_q_pad, seq_len_kv_pad);
-    } else if (headdim == 128) {
+    // if (headdim == 64) {
+    //     constexpr int kBlockM = 64;
+    //     constexpr int kBlockN = 64;
+    //     constexpr int kHeadDim = 64;
+    //     constexpr int kNSGs = 8;
+    //     constexpr int AtomLayoutMSdP = 4;
+    //     constexpr int AtomLayoutNdKV = 2;
+    //     constexpr int AtomLayoutMdQ = 2;
+    //     static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
+    //     static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
+    //     launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN,
+    //                                 kHeadDim, kNSGs,
+    //                                 AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
+    //                                 is_causal, is_bhsd>(
+    //         problem_shape,
+    //         do_d, o_d, q_d, k_d, v_d,
+    //         lse_d, odo_d,
+    //         dqaccum_d, dq_d, dk_d, dv_d,
+    //         s_d, dp_d,
+    //         seq_len_q_pad, seq_len_kv_pad);
+    // } else if (headdim == 96) {
+    //     constexpr int kBlockM = 64;
+    //     constexpr int kBlockN = 64;
+    //     constexpr int kHeadDim = 96;
+    //     constexpr int kNSGs = 8;
+    //     constexpr int AtomLayoutMSdP = 2;
+    //     constexpr int AtomLayoutNdKV = 4;
+    //     constexpr int AtomLayoutMdQ = 4;
+    //     static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
+    //     static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
+    //     launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN,
+    //                                 kHeadDim, kNSGs,
+    //                                 AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
+    //                                 is_causal, is_bhsd>(
+    //         problem_shape,
+    //         do_d, o_d, q_d, k_d, v_d,
+    //         lse_d, odo_d,
+    //         dqaccum_d, dq_d, dk_d, dv_d,
+    //         s_d, dp_d,
+    //         seq_len_q_pad, seq_len_kv_pad);
+    // } else
+        if (headdim == 128) {
         constexpr int kBlockM = 64;
         constexpr int kBlockN = 64;
         constexpr int kHeadDim = 128;
@@ -1259,49 +1312,49 @@ void launch_mha_backward(ProblemShape problem_shape,
             dqaccum_d, dq_d, dk_d, dv_d,
             s_d, dp_d,
             seq_len_q_pad, seq_len_kv_pad);
-    } else if (headdim == 192) {
-        constexpr int kBlockM = 64;
-        constexpr int kBlockN = 32;
-        constexpr int kHeadDim = 192;
-        constexpr int kNSGs = 8;
-        constexpr int AtomLayoutMSdP = 4;
-        constexpr int AtomLayoutNdKV = 2;
-        constexpr int AtomLayoutMdQ = 2;
-        static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
-        static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
-        launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN,
-                                    kHeadDim, kNSGs,
-                                    AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
-                                    is_causal, is_bhsd>(
-            problem_shape,
-            do_d, o_d, q_d, k_d, v_d,
-            lse_d, odo_d,
-            dqaccum_d, dq_d, dk_d, dv_d,
-            s_d, dp_d,
-            seq_len_q_pad, seq_len_kv_pad);
-    } else if (headdim == 256) {
-        constexpr int kBlockM = 64;
-        constexpr int kBlockN = 32;
-        constexpr int kHeadDim = 256;
-        constexpr int kNSGs = 8;
-        constexpr int AtomLayoutMSdP = 4;
-        constexpr int AtomLayoutNdKV = 2;
-        constexpr int AtomLayoutMdQ = 2;
-        static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
-        static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
-        launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN,
-                                    kHeadDim, kNSGs,
-                                    AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
-                                    is_causal, is_bhsd>(
-            problem_shape,
-            do_d, o_d, q_d, k_d, v_d,
-            lse_d, odo_d,
-            dqaccum_d, dq_d, dk_d, dv_d,
-            s_d, dp_d,
-            seq_len_q_pad, seq_len_kv_pad);
-    } else {
-        assert(false && "only support headdim 64,96,128,192,256");
-    }
+    } // else if (headdim == 192) {
+    //     constexpr int kBlockM = 64;
+    //     constexpr int kBlockN = 32;
+    //     constexpr int kHeadDim = 192;
+    //     constexpr int kNSGs = 8;
+    //     constexpr int AtomLayoutMSdP = 4;
+    //     constexpr int AtomLayoutNdKV = 2;
+    //     constexpr int AtomLayoutMdQ = 2;
+    //     static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
+    //     static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
+    //     launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN,
+    //                                 kHeadDim, kNSGs,
+    //                                 AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
+    //                                 is_causal, is_bhsd>(
+    //         problem_shape,
+    //         do_d, o_d, q_d, k_d, v_d,
+    //         lse_d, odo_d,
+    //         dqaccum_d, dq_d, dk_d, dv_d,
+    //         s_d, dp_d,
+    //         seq_len_q_pad, seq_len_kv_pad);
+    // } else if (headdim == 256) {
+    //     constexpr int kBlockM = 64;
+    //     constexpr int kBlockN = 32;
+    //     constexpr int kHeadDim = 256;
+    //     constexpr int kNSGs = 8;
+    //     constexpr int AtomLayoutMSdP = 4;
+    //     constexpr int AtomLayoutNdKV = 2;
+    //     constexpr int AtomLayoutMdQ = 2;
+    //     static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
+    //     static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
+    //     launch_mha_backward_headdim<T, ProblemShape, kBlockM, kBlockN,
+    //                                 kHeadDim, kNSGs,
+    //                                 AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
+    //                                 is_causal, is_bhsd>(
+    //         problem_shape,
+    //         do_d, o_d, q_d, k_d, v_d,
+    //         lse_d, odo_d,
+    //         dqaccum_d, dq_d, dk_d, dv_d,
+    //         s_d, dp_d,
+    //         seq_len_q_pad, seq_len_kv_pad);
+    // } else {
+    //     assert(false && "only support headdim 64,96,128,192,256");
+    // }
 }
 
 int main(int argc, char**argv) {
@@ -1404,16 +1457,16 @@ int main(int argc, char**argv) {
     auto problem_shape = ProblemShapeRegular(BATCH, NUM_HEAD_Q, NUM_HEAD_KV,
                                              SEQ_LEN_QO, SEQ_LEN_KV, HEAD_SIZE_QK, HEAD_SIZE_VO);
     if (is_bhsd) {
-        if (is_causal)
-            launch_mha_backward<T, decltype(problem_shape),
-                                kBlockM, kBlockN, true, true>(
-                problem_shape,
-                do_d, o_d,
-                q_d, k_d, v_d,
-                lse_d, odo_d,
-                dqaccum_d, dq_d, dk_d, dv_d,
-                s_d, dp_d, SEQ_LEN_QO_PAD, SEQ_LEN_KV_PAD);
-        else
+        // if (is_causal)
+        //     launch_mha_backward<T, decltype(problem_shape),
+        //                         kBlockM, kBlockN, true, true>(
+        //         problem_shape,
+        //         do_d, o_d,
+        //         q_d, k_d, v_d,
+        //         lse_d, odo_d,
+        //         dqaccum_d, dq_d, dk_d, dv_d,
+        //         s_d, dp_d, SEQ_LEN_QO_PAD, SEQ_LEN_KV_PAD);
+        // else
             launch_mha_backward<T, decltype(problem_shape),
                                 kBlockM, kBlockN, false, true>(
                 problem_shape,
@@ -1422,27 +1475,27 @@ int main(int argc, char**argv) {
                 lse_d, odo_d,
                 dqaccum_d, dq_d, dk_d, dv_d,
                 s_d, dp_d, SEQ_LEN_QO_PAD, SEQ_LEN_KV_PAD);
-    } else {
-        if (is_causal) {
-            launch_mha_backward<T, decltype(problem_shape),
-                                kBlockM, kBlockN, true, false>(
-                problem_shape,
-                do_d, o_d,
-                q_d, k_d, v_d,
-                lse_d, odo_d,
-                dqaccum_d, dq_d, dk_d, dv_d,
-                s_d, dp_d, SEQ_LEN_QO_PAD, SEQ_LEN_KV_PAD);
-        } else {
-            launch_mha_backward<T, decltype(problem_shape),
-                                kBlockM, kBlockN, false, false>(
-                problem_shape,
-                do_d, o_d,
-                q_d, k_d, v_d,
-                lse_d, odo_d,
-                dqaccum_d, dq_d, dk_d, dv_d,
-                s_d, dp_d, SEQ_LEN_QO_PAD, SEQ_LEN_KV_PAD);
-        }
-    }
+    }//  else {
+    //     if (is_causal) {
+    //         launch_mha_backward<T, decltype(problem_shape),
+    //                             kBlockM, kBlockN, true, false>(
+    //             problem_shape,
+    //             do_d, o_d,
+    //             q_d, k_d, v_d,
+    //             lse_d, odo_d,
+    //             dqaccum_d, dq_d, dk_d, dv_d,
+    //             s_d, dp_d, SEQ_LEN_QO_PAD, SEQ_LEN_KV_PAD);
+    //     } else {
+    //         launch_mha_backward<T, decltype(problem_shape),
+    //                             kBlockM, kBlockN, false, false>(
+    //             problem_shape,
+    //             do_d, o_d,
+    //             q_d, k_d, v_d,
+    //             lse_d, odo_d,
+    //             dqaccum_d, dq_d, dk_d, dv_d,
+    //             s_d, dp_d, SEQ_LEN_QO_PAD, SEQ_LEN_KV_PAD);
+    //     }
+    // }
     float atol = 3e-3f;
     float rtol = 3e-3f;
 
