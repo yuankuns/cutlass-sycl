@@ -310,18 +310,36 @@ gemm_kernel(Trait &trait,
     }
 }
 
-template<class Trait,
-         class Engine0, class Layout0,
-         class Engine1, class Layout1,
-         class Engine2, class Layout2,
-         class TVLayout2, class TiledMMA>
+template <class Trait,
+          class Engine0, class Layout0,
+          class Engine1, class Layout1,
+          class Engine2, class Layout2, class TVLayout2,
+          class TiledMMA>
 void
-gemm_SdP(Trait &trait,
-         Tensor<Engine0, Layout0> const& A,         // (M,K)
-         Tensor<Engine1, Layout1> const& B,         // (N,K)
-         SubgroupTensor<Engine2, Layout2, TVLayout2> & rSdP,
-         TiledMMA const & mma) {
-    gemm_kernel<true>(trait, A, B, rSdP, mma);
+slm_load_A(Trait & trait,
+           Tensor<Engine0, Layout0> const &mA,
+           Tensor<Engine1, Layout1> &sA,
+           SubgroupTensor<Engine2, Layout2, TVLayout2> & rA,
+           TiledMMA const & tiled_mma) {
+    using T = typename Trait::DType;
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<2>();
+    auto local_id = int(item.get_local_id(0));
+
+    Tensor cA = make_identity_tensor(mA.shape());
+
+    auto wg_tile = tiled_mma.tile_mnk();
+    auto copy_a = make_block_2d_copy_A(tiled_mma, mA);
+
+    using Atom = Copy_Atom<UniversalCopy<T>, T>;
+    using Tiler_MN = typename decltype(copy_a)::Tiler_MN;
+    using TVLayout = typename decltype(copy_a)::TiledLayout_TV;
+    auto slm_load = TiledCopy<Atom, TVLayout, Tiler_MN>{};
+    auto thr_slm_load = slm_load.get_slice(local_id);
+
+    Tensor rAt = rA.tensor();
+    Tensor tIrI = thr_slm_load.retile_D(rAt);
+    Tensor tIsI = thr_slm_load.partition_S(sA);
+    copy(slm_load, tIsI, tIrI);
 }
 
 template <class Trait,
@@ -371,6 +389,135 @@ slm_reorder_save_C(Trait & trait,
     slm_save_C(trait, mC, sC, r16, tiled_mma);
 }
 
+template<bool clear_acc, class Trait,
+         class Engine0, class Layout0,
+         class Engine1, class Layout1,
+         class Engine2, class Layout2,
+         class Engine3, class Layout3, class TVLayout3,
+         class TiledMMA>
+void
+gemm_slm_kernel(Trait &trait,
+                Tensor<Engine0, Layout0> const& A,         // (M,K)
+                Tensor<Engine1, Layout1>      & sA,        // (M,K)
+                Tensor<Engine2, Layout2> const& B,         // (N,K)
+                SubgroupTensor<Engine3, Layout3, TVLayout3> & acc,
+                TiledMMA const & mma,
+                const int m_block = 0,
+                const int n_block = 0) {
+    // -----
+    // Setup
+    // -----
+
+    /* Get workgroup and local IDs */
+    auto sg = compat::get_nd_item<1>().get_sub_group();
+    auto first_thread_in_sg_idx = sg.get_group_linear_id() * Trait::SubgroupSize;
+
+    /* Create proxy coordinate tensors for each global tensor */
+    Tensor cA = make_identity_tensor(A.shape());   // (M,K)
+    Tensor cB = make_identity_tensor(B.shape());   // (N,K)
+
+    auto tile_mnk = mma.tile_mnk();
+
+    Tensor gA = local_tile(cA, select<0,2>(tile_mnk), make_coord(m_block,_));  // (BLK_M,BLK_K,k)
+    Tensor gB = local_tile(cB, select<1,2>(tile_mnk), make_coord(n_block,_));  // (BLK_N,BLK_K,k)
+
+    /* Create block 2D TiledCopies */
+    auto copy_a = make_block_2d_copy_A(mma, A);
+    auto copy_b = make_block_2d_copy_B(mma, B);
+
+    /* Slice TiledCopy/TiledMMA operations to thread (work-item) level */
+    auto thr_mma    =    mma.get_slice(first_thread_in_sg_idx);
+    auto thr_copy_a = copy_a.get_slice(first_thread_in_sg_idx);
+    auto thr_copy_b = copy_b.get_slice(first_thread_in_sg_idx);
+
+    /* Register fragments for MMA */
+    auto tCrA = thr_mma.partition_sg_fragment_A(gA(_,_,0));
+    auto tCrB = thr_mma.partition_sg_fragment_B(gB(_,_,0));
+
+    /* Register fragments for copies */
+    auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_,_,0));
+    auto tBrB = thr_copy_b.partition_sg_fragment_D(gB(_,_,0));
+
+    /* Partition global tensor (proxies) for copies */
+    Tensor tAgA = thr_copy_a.partition_S(gA);
+    Tensor tBgB = thr_copy_b.partition_S(gB);
+
+    /* Partition C */
+    // Tensor tCrC = partition_fragment_C(mma, select<0,1>(tile_mnk));
+
+    /* Create prefetch TiledCopy instances */
+    auto prefetch_a = make_block_2d_prefetch(copy_a);
+    auto prefetch_b = make_block_2d_prefetch(copy_b);
+
+    auto thr_prefetch_A = prefetch_a.get_slice(first_thread_in_sg_idx);
+    auto thr_prefetch_B = prefetch_b.get_slice(first_thread_in_sg_idx);
+
+    /* Partition global tensor (proxies) for prefetch */
+    auto pAgA = thr_prefetch_A.partition_S(gA);
+    auto pBgB = thr_prefetch_B.partition_S(gB);
+
+    /* Prefetch distance, in units of k tiles */
+    const int prefetch_dist = 3;
+
+    // ------
+    // Kernel
+    // ------
+
+    constexpr int barrier_scope = 2;
+
+    int k_tile_count = ceil_div(shape<1>(A), get<2>(tile_mnk));
+    int k_tile_prefetch = 0;
+    /* Clear the accumulators */
+    if constexpr(clear_acc)
+        clear(acc);
+
+    /* Warm up loops with prefetch to L1 */
+    CUTE_UNROLL
+    for (; k_tile_prefetch < prefetch_dist; k_tile_prefetch++) {
+        prefetch(prefetch_a, pAgA(_,_,_,k_tile_prefetch));
+        prefetch(prefetch_b, pBgB(_,_,_,k_tile_prefetch));
+    }
+
+    /* Main loop */
+    for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
+        /* Split barrier keeping threads loosely together */
+        barrier_arrive(barrier_scope);
+
+        /* Copy A/B from global memory (ideally L1 cache) to registers */
+        copy(copy_a, tAgA(_,_,_,k_tile), tArA);
+        copy(copy_b, tBgB(_,_,_,k_tile), tBrB);
+
+        /* Prefetch A/B tiles to L1 */
+        prefetch(prefetch_a, pAgA(_,_,_,k_tile_prefetch));
+        prefetch(prefetch_b, pBgB(_,_,_,k_tile_prefetch));
+
+        /* Shuffle data from copy fragments to MMA fragments */
+        slm_load_A(trait, A, sA, tArA, mma);
+        reorder(tArA, tCrA);
+        reorder(tBrB, tCrB);
+
+        /* Accumulate C += A * B */
+        gemm(mma, tCrA, tCrB, acc);
+
+        /* Other half of split barrier */
+        barrier_wait(barrier_scope);
+    }
+}
+
+template<class Trait,
+         class Engine0, class Layout0,
+         class Engine1, class Layout1,
+         class Engine2, class Layout2,
+         class TVLayout2, class TiledMMA>
+void
+gemm_SdP(Trait &trait,
+         Tensor<Engine0, Layout0> const& A,         // (M,K)
+         Tensor<Engine1, Layout1> const& B,         // (N,K)
+         SubgroupTensor<Engine2, Layout2, TVLayout2> & rSdP,
+         TiledMMA const & mma) {
+    gemm_kernel<true>(trait, A, B, rSdP, mma);
+}
+
 template<class Trait,
          class Engine0, class Layout0,
          class Engine1, class Layout1,
@@ -383,6 +530,22 @@ gemm_dKV(Trait &trait,
          SubgroupTensor<Engine2, Layout2, TVLayout2> & rdKV,
          TiledMMA const & mma) {
     gemm_kernel<false>(trait, A, B, rdKV, mma);
+}
+
+template<class Trait,
+         class Engine0, class Layout0,
+         class Engine1, class Layout1,
+         class Engine2, class Layout2,
+         class Engine3, class Layout3,
+         class TVLayout3, class TiledMMA>
+void
+gemm_dKV2(Trait &trait,
+          Tensor<Engine0, Layout0> const& A,         // (M,K)
+          Tensor<Engine1, Layout1> & sA,         // (M,K)
+          Tensor<Engine2, Layout2> const& B,         // (N,K)
+          SubgroupTensor<Engine3, Layout3, TVLayout3> & rdKV,
+          TiledMMA const & mma) {
+    gemm_slm_kernel<false>(trait, A, sA, B, rdKV, mma);
 }
 
 template<class Trait,
@@ -724,7 +887,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         }
         sycl::group_barrier(group);
         // dV=Pt*dO
-        gemm_dKV(trait, mPt, mdOt, rdV,
+        gemm_dKV2(trait, mPt, sPt, mdOt, rdV,
                  tiled_mma_dkv);
         // dK=dPt*Q
         gemm_dKV(trait, mdPt, mQt, rdK,
