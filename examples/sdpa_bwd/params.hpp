@@ -47,7 +47,7 @@ struct FAKernel {
                                                SubgroupLayoutdQ>::TiledMMA;
     static constexpr auto bP = Int<2>{}; // Pipeline
     static constexpr int SubgroupSize = 16;
-    static constexpr int smem_size = kBlockM * kBlockN * sizeof(DType);
+    static constexpr int smem_size = 0;
 
     FAKernel() {}
 };
