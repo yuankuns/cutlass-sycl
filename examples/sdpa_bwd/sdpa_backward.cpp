@@ -334,8 +334,7 @@ slm_load_A(Trait & trait,
     auto slm_load = TiledCopy<Atom, TVLayout, Tiler_MN>{};
     auto thr_slm_load = slm_load.get_slice(local_id);
 
-    Tensor rAt = rA.tensor();
-    Tensor tIrI = thr_slm_load.retile_D(rAt);
+    Tensor tIrI = thr_slm_load.retile_D(rA);
     Tensor tIsI = thr_slm_load.partition_S(sA);
     copy(slm_load, tIsI, tIrI);
 }
@@ -366,7 +365,7 @@ slm_save_C(Trait & trait,
     auto slm_store = TiledCopy<Atom, TVLayout, Tiler_MN>{};
     auto thr_slm_store = slm_store.get_slice(local_id);
 
-    Tensor tOrO = thr_slm_store.retile_S(rC.tensor());
+    Tensor tOrO = thr_slm_store.retile_S(rC);
     Tensor tOsO = thr_slm_store.partition_D(sC);
     copy(slm_store, tOrO, tOsO);
 }
@@ -942,9 +941,17 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
 #endif
         }
         sycl::group_barrier(group);
-        if (m_block == 0 and n_block == 0 and is_cur_thread()) {
+        barrier_arrive(SPIRVScope::ScopeWorkgroup, SPIRVMemorySemantics::SemanticsRelease | SPIRVMemorySemantics::SemanticsWGMemory);
+        barrier_wait(SPIRVScope::ScopeWorkgroup, SPIRVMemorySemantics::SemanticsAcquire | SPIRVMemorySemantics::SemanticsWGMemory);
+        if (m_block == 0 and n_block == 0 and cute::thread0()) {
             print("sPt:");
-            print_d(sPt);
+            for (int m = 0; m < kBlockM; ++m) {
+                for (int n = 0; n < kBlockN; ++n) {
+                    print(sPt(n, m));
+                    print(", ");
+                }
+                print("\n");
+            }
         }
         // dV=Pt*dO
         gemm_dKV2(trait, mPt, sPt, mdOt, rdV, tiled_mma_dkv);
