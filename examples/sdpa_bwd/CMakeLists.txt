@@ -5,6 +5,12 @@ cutlass_example_add_executable(
   sdpa_backward.cpp
   cnpy.cpp
 )
+
+cutlass_example_add_executable(
+  sdpa_backward_bench
+  sdpa_backward_bench.cpp
+)
+
 cutlass_example_add_executable(
   test_noeven
   test_noeven.cpp
