@@ -32,9 +32,9 @@ inline int compute_strided_index_gpu(
 // GPU Kernel: Compute o * do (row-wise dot product)
 // ========================================
 
-template<typename T>
+template<typename T, typename V>
 void compute_odo_kernel(
-    float* odo_output,
+    V* odo_output,
     const T* o,
     const T* do_data,
     int seq_len,
@@ -43,10 +43,10 @@ void compute_odo_kernel(
 ) {
     int i = item.get_global_id(0);
     if (i < seq_len) {
-        float sum = 0.0f;
+        V sum = static_cast<V>(0.0f);
         for (int d = 0; d < head_size; ++d) {
-            sum += static_cast<float>(o[i * head_size + d]) * 
-                   static_cast<float>(do_data[i * head_size + d]);
+            sum += static_cast<V>(o[i * head_size + d]) * 
+                   static_cast<V>(do_data[i * head_size + d]);
         }
         odo_output[i] = sum;
     }
@@ -78,11 +78,11 @@ void apply_causal_mask_kernel(
 // GPU Kernel: Compute P = softmax(S) using LSE
 // ========================================
 
-template<typename T>
+template<typename T, typename V>
 void compute_softmax_with_lse_kernel(
     T* P,
     const T* S,
-    const float* lse,
+    const V* lse,
     int seq_len_q,
     int seq_len_k,
     sycl::nd_item<2> item
@@ -92,8 +92,8 @@ void compute_softmax_with_lse_kernel(
     
     if (i < seq_len_q && j < seq_len_k) {
         int idx = i * seq_len_k + j;
-        float s_val = static_cast<float>(S[idx]);
-        float p_val = sycl::exp(s_val - lse[i]);
+        V s_val = static_cast<V>(S[idx]);
+        V p_val = sycl::exp(s_val - lse[i]);
         P[idx] = static_cast<T>(p_val);
     }
 }
@@ -102,12 +102,12 @@ void compute_softmax_with_lse_kernel(
 // GPU Kernel: Compute dS = P * (dP - oDo) [Softmax Backward]
 // ========================================
 
-template<typename T>
+template<typename T, typename V>
 void compute_softmax_backward_kernel(
     T* dS,
     const T* P,
-    const float* dP,
-    const float* oDo,
+    const V* dP,
+    const V* oDo,
     int seq_len_q,
     int seq_len_k,
     sycl::nd_item<2> item
@@ -117,22 +117,22 @@ void compute_softmax_backward_kernel(
     
     if (i < seq_len_q && j < seq_len_k) {
         int idx = i * seq_len_k + j;
-        float p_val = static_cast<float>(P[idx]);
-        float dp_val = dP[idx];
-        float odo_val = oDo[i];
-        float ds_val = p_val * (dp_val - odo_val);
+        V p_val = static_cast<V>(P[idx]);
+        V dp_val = dP[idx];
+        V odo_val = oDo[i];
+        V ds_val = p_val * (dp_val - odo_val);
         dS[idx] = static_cast<T>(ds_val);
     }
 }
 
 // ========================================
-// GPU Kernel: Convert fp32 to T
+// GPU Kernel: Convert V to T
 // ========================================
 
-template<typename T>
-void convert_fp32_to_T_kernel(
+template<typename T, typename V>
+void convert_V_to_T_kernel(
     T* dst,
-    const float* src,
+    const V* src,
     int size,
     sycl::nd_item<1> item
 ) {
@@ -330,14 +330,14 @@ void sdpa_backward_reference_gpu(
             T* d_dQ = compat::malloc<T>(seq_len_qo * head_size_qk);
             T* d_dK = compat::malloc<T>(seq_len_kv * head_size_qk);
             
-            float* d_oDo = compat::malloc<float>(seq_len_qo);
-            float* d_lse = compat::malloc<float>(seq_len_qo);
+            V* d_oDo = compat::malloc<V>(seq_len_qo);
+            V* d_lse = compat::malloc<V>(seq_len_qo);
             
-            // Allocate fp32 buffers for GEMM outputs
-            float* d_dV_fp32 = compat::malloc<float>(seq_len_kv * head_size_vo);
-            float* d_dP_fp32 = compat::malloc<float>(seq_len_qo * seq_len_kv);
-            float* d_dQ_fp32 = compat::malloc<float>(seq_len_qo * head_size_qk);
-            float* d_dK_fp32 = compat::malloc<float>(seq_len_kv * head_size_qk);
+            // Allocate V buffers for GEMM outputs
+            V* d_dV_V = compat::malloc<V>(seq_len_kv * head_size_vo);
+            V* d_dP_V = compat::malloc<V>(seq_len_qo * seq_len_kv);
+            V* d_dQ_V = compat::malloc<V>(seq_len_qo * head_size_qk);
+            V* d_dK_V = compat::malloc<V>(seq_len_kv * head_size_qk);
             
             // ========================================
             // Copy input data from host to device
@@ -351,7 +351,7 @@ void sdpa_backward_reference_gpu(
             
             // Copy LSE
             int lse_offset = (b * num_head_qo + h_qo) * seq_len_qo;
-            compat::memcpy<float>(d_lse, lse_ptr + lse_offset, seq_len_qo);
+            compat::memcpy<V>(d_lse, lse_ptr + lse_offset, seq_len_qo);
             
             compat::wait_and_throw();
             
@@ -422,12 +422,12 @@ void sdpa_backward_reference_gpu(
             // Step 5: Compute dV = P^T @ dO
             // ========================================
             
-            device_gemm<T, float>(seq_len_kv, head_size_vo, seq_len_qo,
+            device_gemm<T, V>(seq_len_kv, head_size_vo, seq_len_qo,
                        static_cast<T>(1.0f), d_P, seq_len_kv, true,
                        d_dO, head_size_vo, false,
-                       static_cast<T>(0.0f), d_dV_fp32, head_size_vo);
+                       static_cast<T>(0.0f), d_dV_V, head_size_vo);
             
-            // Convert fp32 to T
+            // Convert V to T
             {
                 sycl::range<1> grid((seq_len_kv * head_size_vo + 255) / 256);
                 sycl::range<1> block(256);
@@ -436,7 +436,7 @@ void sdpa_backward_reference_gpu(
                     cgh.parallel_for(
                         sycl::nd_range<1>(grid * block, block),
                         [=](sycl::nd_item<1> item) {
-                            convert_fp32_to_T_kernel(d_dV, d_dV_fp32, seq_len_kv * head_size_vo, item);
+                            convert_V_to_T_kernel(d_dV, d_dV_V, seq_len_kv * head_size_vo, item);
                         }
                     );
                 }).wait();
@@ -446,10 +446,10 @@ void sdpa_backward_reference_gpu(
             // Step 6: Compute dP = dO @ V^T
             // ========================================
             
-            device_gemm<T, float>(seq_len_qo, seq_len_kv, head_size_vo,
+            device_gemm<T, V>(seq_len_qo, seq_len_kv, head_size_vo,
                        static_cast<T>(1.0f), d_dO, head_size_vo, false,
                        d_V, head_size_vo, true,
-                       static_cast<T>(0.0f), d_dP_fp32, seq_len_kv);
+                       static_cast<T>(0.0f), d_dP_V, seq_len_kv);
             
             // ========================================
             // Step 7: Compute dS = P * (dP - oDo)
@@ -463,7 +463,7 @@ void sdpa_backward_reference_gpu(
                     cgh.parallel_for(
                         sycl::nd_range<2>(grid * block, block),
                         [=](sycl::nd_item<2> item) {
-                            compute_softmax_backward_kernel(d_dS, d_P, d_dP_fp32, d_oDo, seq_len_qo, seq_len_kv, item);
+                            compute_softmax_backward_kernel(d_dS, d_P, d_dP_V, d_oDo, seq_len_qo, seq_len_kv, item);
                         }
                     );
                 }).wait();
@@ -473,12 +473,12 @@ void sdpa_backward_reference_gpu(
             // Step 8: Compute dQ = (scale * dS) @ K
             // ========================================
             
-            device_gemm<T, float>(seq_len_qo, head_size_qk, seq_len_kv,
+            device_gemm<T, V>(seq_len_qo, head_size_qk, seq_len_kv,
                        static_cast<T>(scale), d_dS, seq_len_kv, false,
                        d_K, head_size_qk, false,
-                       static_cast<T>(0.0f), d_dQ_fp32, head_size_qk);
+                       static_cast<T>(0.0f), d_dQ_V, head_size_qk);
             
-            // Convert fp32 to T
+            // Convert V to T
             {
                 sycl::range<1> grid((seq_len_qo * head_size_qk + 255) / 256);
                 sycl::range<1> block(256);
@@ -487,7 +487,7 @@ void sdpa_backward_reference_gpu(
                     cgh.parallel_for(
                         sycl::nd_range<1>(grid * block, block),
                         [=](sycl::nd_item<1> item) {
-                            convert_fp32_to_T_kernel(d_dQ, d_dQ_fp32, seq_len_qo * head_size_qk, item);
+                            convert_V_to_T_kernel(d_dQ, d_dQ_V, seq_len_qo * head_size_qk, item);
                         }
                     );
                 }).wait();
@@ -497,12 +497,12 @@ void sdpa_backward_reference_gpu(
             // Step 9: Compute dK = (scale * dS)^T @ Q
             // ========================================
             
-            device_gemm<T, float>(seq_len_kv, head_size_qk, seq_len_qo,
+            device_gemm<T, V>(seq_len_kv, head_size_qk, seq_len_qo,
                        static_cast<T>(scale), d_dS, seq_len_kv, true,
                        d_Q, head_size_qk, false,
-                       static_cast<T>(0.0f), d_dK_fp32, head_size_qk);
+                       static_cast<T>(0.0f), d_dK_V, head_size_qk);
             
-            // Convert fp32 to T
+            // Convert V to T
             {
                 sycl::range<1> grid((seq_len_kv * head_size_qk + 255) / 256);
                 sycl::range<1> block(256);
@@ -511,7 +511,7 @@ void sdpa_backward_reference_gpu(
                     cgh.parallel_for(
                         sycl::nd_range<1>(grid * block, block),
                         [=](sycl::nd_item<1> item) {
-                            convert_fp32_to_T_kernel(d_dK, d_dK_fp32, seq_len_kv * head_size_qk, item);
+                            convert_V_to_T_kernel(d_dK, d_dK_V, seq_len_kv * head_size_qk, item);
                         }
                     );
                 }).wait();
@@ -527,7 +527,7 @@ void sdpa_backward_reference_gpu(
             
             // Copy oDo back
             int odo_offset = (b * num_head_qo + h_qo) * seq_len_qo;
-            compat::memcpy<float>(odo_ptr + odo_offset, d_oDo, seq_len_qo);
+            compat::memcpy<V>(odo_ptr + odo_offset, d_oDo, seq_len_qo);
             
             // For dqaccum, copy from d_dQ to float accumulator
             if (dqaccum_ptr) {
@@ -561,10 +561,10 @@ void sdpa_backward_reference_gpu(
             compat::free(d_dK);
             compat::free(d_oDo);
             compat::free(d_lse);
-            compat::free(d_dV_fp32);
-            compat::free(d_dP_fp32);
-            compat::free(d_dQ_fp32);
-            compat::free(d_dK_fp32);
+            compat::free(d_dV_V);
+            compat::free(d_dP_V);
+            compat::free(d_dQ_V);
+            compat::free(d_dK_V);
         }
     }
 }
