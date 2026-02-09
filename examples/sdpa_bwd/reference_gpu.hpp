@@ -80,7 +80,7 @@ void apply_causal_mask_kernel(
 
 template<typename T, typename V>
 void compute_softmax_with_lse_kernel(
-    T* P,
+    V* P,
     const T* S,
     const V* lse,
     int seq_len_q,
@@ -94,7 +94,7 @@ void compute_softmax_with_lse_kernel(
         int idx = i * seq_len_k + j;
         V s_val = static_cast<V>(S[idx]);
         V p_val = sycl::exp(s_val - lse[i]);
-        P[idx] = static_cast<T>(p_val);
+        P[idx] = p_val;
     }
 }
 
@@ -104,8 +104,8 @@ void compute_softmax_with_lse_kernel(
 
 template<typename T, typename V>
 void compute_softmax_backward_kernel(
-    T* dS,
-    const T* P,
+    V* dS,
+    const V* P,
     const V* dP,
     const V* oDo,
     int seq_len_q,
@@ -117,11 +117,11 @@ void compute_softmax_backward_kernel(
     
     if (i < seq_len_q && j < seq_len_k) {
         int idx = i * seq_len_k + j;
-        V p_val = static_cast<V>(P[idx]);
+        V p_val = P[idx];
         V dp_val = dP[idx];
         V odo_val = oDo[i];
         V ds_val = p_val * (dp_val - odo_val);
-        dS[idx] = static_cast<T>(ds_val);
+        dS[idx] = ds_val;
     }
 }
 
@@ -322,9 +322,10 @@ void sdpa_backward_reference_gpu(
             T* d_dO = compat::malloc<T>(seq_len_qo * head_size_vo);
             
             T* d_S = compat::malloc<T>(seq_len_qo * seq_len_kv);
-            T* d_P = compat::malloc<T>(seq_len_qo * seq_len_kv);
-            T* d_dP = compat::malloc<T>(seq_len_qo * seq_len_kv);
-            T* d_dS = compat::malloc<T>(seq_len_qo * seq_len_kv);
+            V* d_P = compat::malloc<V>(seq_len_qo * seq_len_kv);
+            T* d_P_T = compat::malloc<T>(seq_len_qo * seq_len_kv);  // T version for GEMM
+            V* d_dS = compat::malloc<V>(seq_len_qo * seq_len_kv);
+            T* d_dS_T = compat::malloc<T>(seq_len_qo * seq_len_kv);  // T version for GEMM
             
             T* d_dV = compat::malloc<T>(seq_len_kv * head_size_vo);
             T* d_dQ = compat::malloc<T>(seq_len_qo * head_size_qk);
@@ -400,6 +401,21 @@ void sdpa_backward_reference_gpu(
                 }).wait();
             }
             
+            // Convert P from V to T for GEMM
+            {
+                sycl::range<1> grid((seq_len_qo * seq_len_kv + 255) / 256);
+                sycl::range<1> block(256);
+                
+                q.submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(
+                        sycl::nd_range<1>(grid * block, block),
+                        [=](sycl::nd_item<1> item) {
+                            convert_V_to_T_kernel(d_P_T, d_P, seq_len_qo * seq_len_kv, item);
+                        }
+                    );
+                }).wait();
+            }
+            
             // ========================================
             // Step 4: Compute oDo = sum(O * dO, dim=-1)
             // ========================================
@@ -423,7 +439,7 @@ void sdpa_backward_reference_gpu(
             // ========================================
             
             device_gemm<T, V>(seq_len_kv, head_size_vo, seq_len_qo,
-                       static_cast<T>(1.0f), d_P, seq_len_kv, true,
+                       static_cast<T>(1.0f), d_P_T, seq_len_kv, true,
                        d_dO, head_size_vo, false,
                        static_cast<T>(0.0f), d_dV_V, head_size_vo);
             
@@ -469,12 +485,27 @@ void sdpa_backward_reference_gpu(
                 }).wait();
             }
             
+            // Convert dS from V to T for GEMM
+            {
+                sycl::range<1> grid((seq_len_qo * seq_len_kv + 255) / 256);
+                sycl::range<1> block(256);
+                
+                q.submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(
+                        sycl::nd_range<1>(grid * block, block),
+                        [=](sycl::nd_item<1> item) {
+                            convert_V_to_T_kernel(d_dS_T, d_dS, seq_len_qo * seq_len_kv, item);
+                        }
+                    );
+                }).wait();
+            }
+            
             // ========================================
             // Step 8: Compute dQ = (scale * dS) @ K
             // ========================================
             
             device_gemm<T, V>(seq_len_qo, head_size_qk, seq_len_kv,
-                       static_cast<T>(scale), d_dS, seq_len_kv, false,
+                       static_cast<T>(scale), d_dS_T, seq_len_kv, false,
                        d_K, head_size_qk, false,
                        static_cast<T>(0.0f), d_dQ_V, head_size_qk);
             
@@ -498,7 +529,7 @@ void sdpa_backward_reference_gpu(
             // ========================================
             
             device_gemm<T, V>(seq_len_kv, head_size_qk, seq_len_qo,
-                       static_cast<T>(scale), d_dS, seq_len_kv, true,
+                       static_cast<T>(scale), d_dS_T, seq_len_kv, true,
                        d_Q, head_size_qk, false,
                        static_cast<T>(0.0f), d_dK_V, head_size_qk);
             
@@ -554,8 +585,9 @@ void sdpa_backward_reference_gpu(
             compat::free(d_dO);
             compat::free(d_S);
             compat::free(d_P);
-            compat::free(d_dP);
+            compat::free(d_P_T);
             compat::free(d_dS);
+            compat::free(d_dS_T);
             compat::free(d_dV);
             compat::free(d_dQ);
             compat::free(d_dK);
