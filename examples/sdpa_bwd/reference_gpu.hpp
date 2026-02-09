@@ -377,7 +377,7 @@ void sdpa_backward_reference_gpu(
                     cgh.parallel_for(
                         sycl::nd_range<2>(grid * block, block),
                         [=](sycl::nd_item<2> item) {
-                            apply_causal_mask_kernel(d_S, seq_len_qo, seq_len_kv, item);
+                            apply_causal_mask_kernel<T>(d_S, seq_len_qo, seq_len_kv, item);
                         }
                     );
                 }).wait();
@@ -395,7 +395,7 @@ void sdpa_backward_reference_gpu(
                     cgh.parallel_for(
                         sycl::nd_range<2>(grid * block, block),
                         [=](sycl::nd_item<2> item) {
-                            compute_softmax_with_lse_kernel(d_P, d_S, d_lse, seq_len_qo, seq_len_kv, item);
+                            compute_softmax_with_lse_kernel<T, V>(d_P, d_S, d_lse, seq_len_qo, seq_len_kv, item);
                         }
                     );
                 }).wait();
@@ -410,7 +410,7 @@ void sdpa_backward_reference_gpu(
                     cgh.parallel_for(
                         sycl::nd_range<1>(grid * block, block),
                         [=](sycl::nd_item<1> item) {
-                            convert_V_to_T_kernel(d_P_T, d_P, seq_len_qo * seq_len_kv, item);
+                            convert_V_to_T_kernel<T, V>(d_P_T, d_P, seq_len_qo * seq_len_kv, item);
                         }
                     );
                 }).wait();
@@ -428,7 +428,7 @@ void sdpa_backward_reference_gpu(
                     cgh.parallel_for(
                         sycl::nd_range<1>(grid * block, block),
                         [=](sycl::nd_item<1> item) {
-                            compute_odo_kernel(d_oDo, d_O, d_dO, seq_len_qo, head_size_vo, item);
+                            compute_odo_kernel<T, V>(d_oDo, d_O, d_dO, seq_len_qo, head_size_vo, item);
                         }
                     );
                 }).wait();
@@ -452,7 +452,7 @@ void sdpa_backward_reference_gpu(
                     cgh.parallel_for(
                         sycl::nd_range<1>(grid * block, block),
                         [=](sycl::nd_item<1> item) {
-                            convert_V_to_T_kernel(d_dV, d_dV_V, seq_len_kv * head_size_vo, item);
+                            convert_V_to_T_kernel<T, V>(d_dV, d_dV_V, seq_len_kv * head_size_vo, item);
                         }
                     );
                 }).wait();
@@ -479,7 +479,7 @@ void sdpa_backward_reference_gpu(
                     cgh.parallel_for(
                         sycl::nd_range<2>(grid * block, block),
                         [=](sycl::nd_item<2> item) {
-                            compute_softmax_backward_kernel(d_dS, d_P, d_dP_V, d_oDo, seq_len_qo, seq_len_kv, item);
+                            compute_softmax_backward_kernel<T, V>(d_dS, d_P, d_dP_V, d_oDo, seq_len_qo, seq_len_kv, item);
                         }
                     );
                 }).wait();
@@ -494,7 +494,7 @@ void sdpa_backward_reference_gpu(
                     cgh.parallel_for(
                         sycl::nd_range<1>(grid * block, block),
                         [=](sycl::nd_item<1> item) {
-                            convert_V_to_T_kernel(d_dS_T, d_dS, seq_len_qo * seq_len_kv, item);
+                            convert_V_to_T_kernel<T, V>(d_dS_T, d_dS, seq_len_qo * seq_len_kv, item);
                         }
                     );
                 }).wait();
@@ -518,7 +518,7 @@ void sdpa_backward_reference_gpu(
                     cgh.parallel_for(
                         sycl::nd_range<1>(grid * block, block),
                         [=](sycl::nd_item<1> item) {
-                            convert_V_to_T_kernel(d_dQ, d_dQ_V, seq_len_qo * head_size_qk, item);
+                            convert_V_to_T_kernel<T, V>(d_dQ, d_dQ_V, seq_len_qo * head_size_qk, item);
                         }
                     );
                 }).wait();
@@ -542,7 +542,7 @@ void sdpa_backward_reference_gpu(
                     cgh.parallel_for(
                         sycl::nd_range<1>(grid * block, block),
                         [=](sycl::nd_item<1> item) {
-                            convert_V_to_T_kernel(d_dK, d_dK_V, seq_len_kv * head_size_qk, item);
+                            convert_V_to_T_kernel<T, V>(d_dK, d_dK_V, seq_len_kv * head_size_qk, item);
                         }
                     );
                 }).wait();
