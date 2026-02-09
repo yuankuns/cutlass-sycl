@@ -143,6 +143,57 @@ void convert_V_to_T_kernel(
 }
 
 // ========================================
+// Helper: Convert V to T
+// ========================================
+
+template<typename T, typename V>
+void convert_V_to_T(
+    sycl::queue& q,
+    T* dst,
+    const V* src,
+    int size
+) {
+    sycl::range<1> grid((size + 255) / 256);
+    sycl::range<1> block(256);
+    
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(grid * block, block),
+            [=](sycl::nd_item<1> item) {
+                convert_V_to_T_kernel<T, V>(dst, src, size, item);
+            }
+        );
+    }).wait();
+}
+
+// ========================================
+// Helper: Convert T to V
+// ========================================
+
+template<typename T, typename V>
+void convert_T_to_V(
+    sycl::queue& q,
+    V* dst,
+    const T* src,
+    int size
+) {
+    sycl::range<1> grid((size + 255) / 256);
+    sycl::range<1> block(256);
+    
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(grid * block, block),
+            [=](sycl::nd_item<1> item) {
+                int i = item.get_global_id(0);
+                if (i < size) {
+                    dst[i] = static_cast<V>(src[i]);
+                }
+            }
+        );
+    }).wait();
+}
+
+// ========================================
 // Helper: Device GEMM wrapper
 // ========================================
 
@@ -367,22 +418,7 @@ void sdpa_backward_reference_gpu(
                        static_cast<T>(0.0f), d_S_T, seq_len_kv);
             
             // Convert S from T to V for higher precision
-            {
-                sycl::range<1> grid((seq_len_qo * seq_len_kv + 255) / 256);
-                sycl::range<1> block(256);
-                
-                q.submit([&](sycl::handler& cgh) {
-                    cgh.parallel_for(
-                        sycl::nd_range<1>(grid * block, block),
-                        [=](sycl::nd_item<1> item) {
-                            int i = item.get_global_id(0);
-                            if (i < seq_len_qo * seq_len_kv) {
-                                d_S[i] = static_cast<V>(d_S_T[i]);
-                            }
-                        }
-                    );
-                }).wait();
-            }
+            convert_T_to_V<T, V>(q, d_S, d_S_T, seq_len_qo * seq_len_kv);
             
             // ========================================
             // Step 2: Apply causal mask
@@ -421,19 +457,7 @@ void sdpa_backward_reference_gpu(
             }
             
             // Convert P from V to T for GEMM
-            {
-                sycl::range<1> grid((seq_len_qo * seq_len_kv + 255) / 256);
-                sycl::range<1> block(256);
-                
-                q.submit([&](sycl::handler& cgh) {
-                    cgh.parallel_for(
-                        sycl::nd_range<1>(grid * block, block),
-                        [=](sycl::nd_item<1> item) {
-                            convert_V_to_T_kernel<T, V>(d_P_T, d_P, seq_len_qo * seq_len_kv, item);
-                        }
-                    );
-                }).wait();
-            }
+            convert_V_to_T<T, V>(q, d_P_T, d_P, seq_len_qo * seq_len_kv);
             
             // ========================================
             // Step 4: Compute oDo = sum(O * dO, dim=-1)
@@ -463,19 +487,7 @@ void sdpa_backward_reference_gpu(
                        static_cast<T>(0.0f), d_dV_V, head_size_vo);
             
             // Convert V to T
-            {
-                sycl::range<1> grid((seq_len_kv * head_size_vo + 255) / 256);
-                sycl::range<1> block(256);
-                
-                q.submit([&](sycl::handler& cgh) {
-                    cgh.parallel_for(
-                        sycl::nd_range<1>(grid * block, block),
-                        [=](sycl::nd_item<1> item) {
-                            convert_V_to_T_kernel<T, V>(d_dV, d_dV_V, seq_len_kv * head_size_vo, item);
-                        }
-                    );
-                }).wait();
-            }
+            convert_V_to_T<T, V>(q, d_dV, d_dV_V, seq_len_kv * head_size_vo);
             
             // ========================================
             // Step 6: Compute dP = dO @ V^T
@@ -505,19 +517,7 @@ void sdpa_backward_reference_gpu(
             }
             
             // Convert dS from V to T for GEMM
-            {
-                sycl::range<1> grid((seq_len_qo * seq_len_kv + 255) / 256);
-                sycl::range<1> block(256);
-                
-                q.submit([&](sycl::handler& cgh) {
-                    cgh.parallel_for(
-                        sycl::nd_range<1>(grid * block, block),
-                        [=](sycl::nd_item<1> item) {
-                            convert_V_to_T_kernel<T, V>(d_dS_T, d_dS, seq_len_qo * seq_len_kv, item);
-                        }
-                    );
-                }).wait();
-            }
+            convert_V_to_T<T, V>(q, d_dS_T, d_dS, seq_len_qo * seq_len_kv);
             
             // ========================================
             // Step 8: Compute dQ = (scale * dS) @ K
@@ -529,19 +529,7 @@ void sdpa_backward_reference_gpu(
                        static_cast<T>(0.0f), d_dQ_V, head_size_qk);
             
             // Convert V to T
-            {
-                sycl::range<1> grid((seq_len_qo * head_size_qk + 255) / 256);
-                sycl::range<1> block(256);
-                
-                q.submit([&](sycl::handler& cgh) {
-                    cgh.parallel_for(
-                        sycl::nd_range<1>(grid * block, block),
-                        [=](sycl::nd_item<1> item) {
-                            convert_V_to_T_kernel<T, V>(d_dQ, d_dQ_V, seq_len_qo * head_size_qk, item);
-                        }
-                    );
-                }).wait();
-            }
+            convert_V_to_T<T, V>(q, d_dQ, d_dQ_V, seq_len_qo * head_size_qk);
             
             // ========================================
             // Step 9: Compute dK = (scale * dS)^T @ Q
@@ -553,19 +541,7 @@ void sdpa_backward_reference_gpu(
                        static_cast<T>(0.0f), d_dK_V, head_size_qk);
             
             // Convert V to T
-            {
-                sycl::range<1> grid((seq_len_kv * head_size_qk + 255) / 256);
-                sycl::range<1> block(256);
-                
-                q.submit([&](sycl::handler& cgh) {
-                    cgh.parallel_for(
-                        sycl::nd_range<1>(grid * block, block),
-                        [=](sycl::nd_item<1> item) {
-                            convert_V_to_T_kernel<T, V>(d_dK, d_dK_V, seq_len_kv * head_size_qk, item);
-                        }
-                    );
-                }).wait();
-            }
+            convert_V_to_T<T, V>(q, d_dK, d_dK_V, seq_len_kv * head_size_qk);
             
             // ========================================
             // Step 10: Copy results back to host
