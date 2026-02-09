@@ -373,7 +373,6 @@ void sdpa_backward_reference_gpu(
             T* d_dO = compat::malloc<T>(seq_len_qo * head_size_vo);
             
             V* d_S = compat::malloc<V>(seq_len_qo * seq_len_kv);
-            T* d_S_T = compat::malloc<T>(seq_len_qo * seq_len_kv);  // T version for GEMM output
             V* d_P = compat::malloc<V>(seq_len_qo * seq_len_kv);
             T* d_P_T = compat::malloc<T>(seq_len_qo * seq_len_kv);  // T version for GEMM
             V* d_dS = compat::malloc<V>(seq_len_qo * seq_len_kv);
@@ -412,13 +411,10 @@ void sdpa_backward_reference_gpu(
             // Step 1: Compute S = Q @ K^T (scaled)
             // ========================================
             
-            device_gemm(seq_len_qo, seq_len_kv, head_size_qk,
+            device_gemm<T, V>(seq_len_qo, seq_len_kv, head_size_qk,
                        static_cast<T>(scale), d_Q, head_size_qk, false,
                        d_K, head_size_qk, true,
-                       static_cast<T>(0.0f), d_S_T, seq_len_kv);
-            
-            // Convert S from T to V for higher precision
-            convert_T_to_V<T, V>(q, d_S, d_S_T, seq_len_qo * seq_len_kv);
+                       static_cast<T>(0.0f), d_S, seq_len_kv);
             
             // ========================================
             // Step 2: Apply causal mask
@@ -579,7 +575,6 @@ void sdpa_backward_reference_gpu(
             compat::free(d_O);
             compat::free(d_dO);
             compat::free(d_S);
-            compat::free(d_S_T);
             compat::free(d_P);
             compat::free(d_P_T);
             compat::free(d_dS);
