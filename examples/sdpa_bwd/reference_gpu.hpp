@@ -56,9 +56,9 @@ void compute_odo_kernel(
 // GPU Kernel: Apply causal mask
 // ========================================
 
-template<typename T>
+template<typename T, typename V>
 void apply_causal_mask_kernel(
-    T* S,
+    V* S,
     int seq_len_q,
     int seq_len_k,
     sycl::nd_item<2> item
@@ -69,7 +69,7 @@ void apply_causal_mask_kernel(
     if (i < seq_len_q && j < seq_len_k) {
         int offset = seq_len_k - seq_len_q;
         if (j > i + offset) {
-            S[i * seq_len_k + j] = static_cast<T>(-INFINITY);
+            S[i * seq_len_k + j] = static_cast<V>(-INFINITY);
         }
     }
 }
@@ -81,7 +81,7 @@ void apply_causal_mask_kernel(
 template<typename T, typename V>
 void compute_softmax_with_lse_kernel(
     V* P,
-    const T* S,
+    const V* S,
     const V* lse,
     int seq_len_q,
     int seq_len_k,
@@ -92,7 +92,7 @@ void compute_softmax_with_lse_kernel(
     
     if (i < seq_len_q && j < seq_len_k) {
         int idx = i * seq_len_k + j;
-        V s_val = static_cast<V>(S[idx]);
+        V s_val = S[idx];
         V p_val = sycl::exp(s_val - lse[i]);
         P[idx] = p_val;
     }
@@ -321,7 +321,8 @@ void sdpa_backward_reference_gpu(
             T* d_O = compat::malloc<T>(seq_len_qo * head_size_vo);
             T* d_dO = compat::malloc<T>(seq_len_qo * head_size_vo);
             
-            T* d_S = compat::malloc<T>(seq_len_qo * seq_len_kv);
+            V* d_S = compat::malloc<V>(seq_len_qo * seq_len_kv);
+            T* d_S_T = compat::malloc<T>(seq_len_qo * seq_len_kv);  // T version for GEMM output
             V* d_P = compat::malloc<V>(seq_len_qo * seq_len_kv);
             T* d_P_T = compat::malloc<T>(seq_len_qo * seq_len_kv);  // T version for GEMM
             V* d_dS = compat::malloc<V>(seq_len_qo * seq_len_kv);
@@ -363,7 +364,25 @@ void sdpa_backward_reference_gpu(
             device_gemm(seq_len_qo, seq_len_kv, head_size_qk,
                        static_cast<T>(scale), d_Q, head_size_qk, false,
                        d_K, head_size_qk, true,
-                       static_cast<T>(0.0f), d_S, seq_len_kv);
+                       static_cast<T>(0.0f), d_S_T, seq_len_kv);
+            
+            // Convert S from T to V for higher precision
+            {
+                sycl::range<1> grid((seq_len_qo * seq_len_kv + 255) / 256);
+                sycl::range<1> block(256);
+                
+                q.submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(
+                        sycl::nd_range<1>(grid * block, block),
+                        [=](sycl::nd_item<1> item) {
+                            int i = item.get_global_id(0);
+                            if (i < seq_len_qo * seq_len_kv) {
+                                d_S[i] = static_cast<V>(d_S_T[i]);
+                            }
+                        }
+                    );
+                }).wait();
+            }
             
             // ========================================
             // Step 2: Apply causal mask
@@ -377,7 +396,7 @@ void sdpa_backward_reference_gpu(
                     cgh.parallel_for(
                         sycl::nd_range<2>(grid * block, block),
                         [=](sycl::nd_item<2> item) {
-                            apply_causal_mask_kernel<T>(d_S, seq_len_qo, seq_len_kv, item);
+                            apply_causal_mask_kernel<T, V>(d_S, seq_len_qo, seq_len_kv, item);
                         }
                     );
                 }).wait();
@@ -584,6 +603,7 @@ void sdpa_backward_reference_gpu(
             compat::free(d_O);
             compat::free(d_dO);
             compat::free(d_S);
+            compat::free(d_S_T);
             compat::free(d_P);
             compat::free(d_P_T);
             compat::free(d_dS);
