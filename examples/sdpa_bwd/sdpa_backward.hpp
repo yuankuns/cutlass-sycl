@@ -269,12 +269,13 @@ gemm_dQ(Trait &trait,
         auto [m, n] = tCgC(i);
 #if defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_INTEL_TARGET)
         // Use inline assembly for Intel GPU atomic add
+        // LSC atomic fadd: atomically adds val to memory at addr
         float* addr = &C(m, n + local_id);
         float val = tCrC(i);
         asm volatile (
             "lsc_atomic_fadd.ugm.uc.ca (M1, 1) null:d32 flat[%0] %1:d32"
             :
-            : "rw"(addr), "rw"(val)
+            : "rw.u"(addr), "rw"(val)
             : "memory"
         );
 #else
