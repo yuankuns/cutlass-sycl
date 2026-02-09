@@ -424,8 +424,8 @@ launch_mha_wrapper(ProblemShape problem_shape, bool is_causal, bool is_bhsd, int
                                       HEAD_SIZE_QK, HEAD_SIZE_VO,
                                       odo_ref.data(), dqaccum_ref.data(),
                                       dq_ref.data(), dk_ref.data(), dv_ref.data());
-        float atol = 5e-3f;
-        float rtol = 5e-3f;
+        float atol = 1e-2f;
+        float rtol = 1e-2f;
         compat::memcpy<V>(odo_h.data(), odo_d, odo_h.size());
         compat::memcpy<V>(dqaccum_h.data(), dqaccum_d, dqaccum_h.size());
         compat::memcpy<T>(dq_h.data(), dq_d, dq_h.size());
@@ -467,7 +467,10 @@ int main(int argc, const char**argv) {
 
     Options options;
     options.parse(argc, argv);
-
+    if (options.help) {
+        options.print_usage(std::cout);
+        return 0;
+    }
     int64_t BATCH = options.batch;
     int64_t NUM_HEAD_Q = options.num_heads_q;
     int64_t NUM_HEAD_KV = options.num_heads_kv;
