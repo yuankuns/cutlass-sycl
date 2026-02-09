@@ -267,7 +267,19 @@ gemm_dQ(Trait &trait,
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i <  size(tCgC); ++i) {
         auto [m, n] = tCgC(i);
+#if defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_INTEL_TARGET)
+        // Use inline assembly for Intel GPU atomic add
+        float* addr = &C(m, n + local_id);
+        float val = tCrC(i);
+        asm volatile (
+            "lsc_atomic_fadd.ugm.uc.ca (M1, 1) null:d32 flat[%0] %1:d32"
+            :
+            : "rw"(addr), "rw"(val)
+            : "memory"
+        );
+#else
         cutlass::atomicAdd(&C(m, n + local_id), tCrC(i));
+#endif
     }
 }
 
