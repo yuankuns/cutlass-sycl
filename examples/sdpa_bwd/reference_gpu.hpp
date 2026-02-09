@@ -106,7 +106,7 @@ template<typename T>
 void compute_softmax_backward_kernel(
     T* dS,
     const T* P,
-    const T* dP,
+    const float* dP,
     const float* oDo,
     int seq_len_q,
     int seq_len_k,
@@ -118,7 +118,7 @@ void compute_softmax_backward_kernel(
     if (i < seq_len_q && j < seq_len_k) {
         int idx = i * seq_len_k + j;
         float p_val = static_cast<float>(P[idx]);
-        float dp_val = static_cast<float>(dP[idx]);
+        float dp_val = dP[idx];
         float odo_val = oDo[i];
         float ds_val = p_val * (dp_val - odo_val);
         dS[idx] = static_cast<T>(ds_val);
@@ -126,17 +126,34 @@ void compute_softmax_backward_kernel(
 }
 
 // ========================================
-// Helper: Device GEMM wrapper
+// GPU Kernel: Convert fp32 to T
 // ========================================
 
 template<typename T>
+void convert_fp32_to_T_kernel(
+    T* dst,
+    const float* src,
+    int size,
+    sycl::nd_item<1> item
+) {
+    int i = item.get_global_id(0);
+    if (i < size) {
+        dst[i] = static_cast<T>(src[i]);
+    }
+}
+
+// ========================================
+// Helper: Device GEMM wrapper
+// ========================================
+
+template<typename T, typename C_TYPE = T>
 void device_gemm(
     int M, int N, int K,
     T alpha,
     const T* A, int lda, bool trans_A,
     const T* B, int ldb, bool trans_B,
     T beta,
-    T* C, int ldc
+    C_TYPE* C, int ldc
 ) {
     using LayoutRowMajor = cutlass::layout::RowMajor;
     using LayoutColMajor = cutlass::layout::ColumnMajor;
@@ -145,12 +162,12 @@ void device_gemm(
         // C = A @ B
         cutlass::TensorRef<T, LayoutRowMajor> ref_A(const_cast<T*>(A), lda);
         cutlass::TensorRef<T, LayoutRowMajor> ref_B(const_cast<T*>(B), ldb);
-        cutlass::TensorRef<T, LayoutRowMajor> ref_C(C, ldc);
+        cutlass::TensorRef<C_TYPE, LayoutRowMajor> ref_C(C, ldc);
         
         cutlass::reference::device::GemmComplex<
             T, LayoutRowMajor,
             T, LayoutRowMajor,
-            T, LayoutRowMajor,
+            C_TYPE, LayoutRowMajor,
             float, float
         >(
             {M, N, K},
@@ -163,12 +180,12 @@ void device_gemm(
         // C = A @ B^T
         cutlass::TensorRef<T, LayoutRowMajor> ref_A(const_cast<T*>(A), lda);
         cutlass::TensorRef<T, LayoutColMajor> ref_BT(const_cast<T*>(B), ldb);
-        cutlass::TensorRef<T, LayoutRowMajor> ref_C(C, ldc);
+        cutlass::TensorRef<C_TYPE, LayoutRowMajor> ref_C(C, ldc);
         
         cutlass::reference::device::GemmComplex<
             T, LayoutRowMajor,
             T, LayoutColMajor,
-            T, LayoutRowMajor,
+            C_TYPE, LayoutRowMajor,
             float, float
         >(
             {M, N, K},
@@ -181,12 +198,12 @@ void device_gemm(
         // C = A^T @ B
         cutlass::TensorRef<T, LayoutColMajor> ref_AT(const_cast<T*>(A), lda);
         cutlass::TensorRef<T, LayoutRowMajor> ref_B(const_cast<T*>(B), ldb);
-        cutlass::TensorRef<T, LayoutRowMajor> ref_C(C, ldc);
+        cutlass::TensorRef<C_TYPE, LayoutRowMajor> ref_C(C, ldc);
         
         cutlass::reference::device::GemmComplex<
             T, LayoutColMajor,
             T, LayoutRowMajor,
-            T, LayoutRowMajor,
+            C_TYPE, LayoutRowMajor,
             float, float
         >(
             {M, N, K},
@@ -316,6 +333,12 @@ void sdpa_backward_reference_gpu(
             float* d_oDo = compat::malloc<float>(seq_len_qo);
             float* d_lse = compat::malloc<float>(seq_len_qo);
             
+            // Allocate fp32 buffers for GEMM outputs
+            float* d_dV_fp32 = compat::malloc<float>(seq_len_kv * head_size_vo);
+            float* d_dP_fp32 = compat::malloc<float>(seq_len_qo * seq_len_kv);
+            float* d_dQ_fp32 = compat::malloc<float>(seq_len_qo * head_size_qk);
+            float* d_dK_fp32 = compat::malloc<float>(seq_len_kv * head_size_qk);
+            
             // ========================================
             // Copy input data from host to device
             // ========================================
@@ -399,19 +422,34 @@ void sdpa_backward_reference_gpu(
             // Step 5: Compute dV = P^T @ dO
             // ========================================
             
-            device_gemm(seq_len_kv, head_size_vo, seq_len_qo,
+            device_gemm<T, float>(seq_len_kv, head_size_vo, seq_len_qo,
                        static_cast<T>(1.0f), d_P, seq_len_kv, true,
                        d_dO, head_size_vo, false,
-                       static_cast<T>(0.0f), d_dV, head_size_vo);
+                       static_cast<T>(0.0f), d_dV_fp32, head_size_vo);
+            
+            // Convert fp32 to T
+            {
+                sycl::range<1> grid((seq_len_kv * head_size_vo + 255) / 256);
+                sycl::range<1> block(256);
+                
+                q.submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(
+                        sycl::nd_range<1>(grid * block, block),
+                        [=](sycl::nd_item<1> item) {
+                            convert_fp32_to_T_kernel(d_dV, d_dV_fp32, seq_len_kv * head_size_vo, item);
+                        }
+                    );
+                }).wait();
+            }
             
             // ========================================
             // Step 6: Compute dP = dO @ V^T
             // ========================================
             
-            device_gemm(seq_len_qo, seq_len_kv, head_size_vo,
+            device_gemm<T, float>(seq_len_qo, seq_len_kv, head_size_vo,
                        static_cast<T>(1.0f), d_dO, head_size_vo, false,
                        d_V, head_size_vo, true,
-                       static_cast<T>(0.0f), d_dP, seq_len_kv);
+                       static_cast<T>(0.0f), d_dP_fp32, seq_len_kv);
             
             // ========================================
             // Step 7: Compute dS = P * (dP - oDo)
@@ -425,7 +463,7 @@ void sdpa_backward_reference_gpu(
                     cgh.parallel_for(
                         sycl::nd_range<2>(grid * block, block),
                         [=](sycl::nd_item<2> item) {
-                            compute_softmax_backward_kernel(d_dS, d_P, d_dP, d_oDo, seq_len_qo, seq_len_kv, item);
+                            compute_softmax_backward_kernel(d_dS, d_P, d_dP_fp32, d_oDo, seq_len_qo, seq_len_kv, item);
                         }
                     );
                 }).wait();
@@ -435,19 +473,49 @@ void sdpa_backward_reference_gpu(
             // Step 8: Compute dQ = (scale * dS) @ K
             // ========================================
             
-            device_gemm(seq_len_qo, head_size_qk, seq_len_kv,
+            device_gemm<T, float>(seq_len_qo, head_size_qk, seq_len_kv,
                        static_cast<T>(scale), d_dS, seq_len_kv, false,
                        d_K, head_size_qk, false,
-                       static_cast<T>(0.0f), d_dQ, head_size_qk);
+                       static_cast<T>(0.0f), d_dQ_fp32, head_size_qk);
+            
+            // Convert fp32 to T
+            {
+                sycl::range<1> grid((seq_len_qo * head_size_qk + 255) / 256);
+                sycl::range<1> block(256);
+                
+                q.submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(
+                        sycl::nd_range<1>(grid * block, block),
+                        [=](sycl::nd_item<1> item) {
+                            convert_fp32_to_T_kernel(d_dQ, d_dQ_fp32, seq_len_qo * head_size_qk, item);
+                        }
+                    );
+                }).wait();
+            }
             
             // ========================================
             // Step 9: Compute dK = (scale * dS)^T @ Q
             // ========================================
             
-            device_gemm(seq_len_kv, head_size_qk, seq_len_qo,
+            device_gemm<T, float>(seq_len_kv, head_size_qk, seq_len_qo,
                        static_cast<T>(scale), d_dS, seq_len_kv, true,
                        d_Q, head_size_qk, false,
-                       static_cast<T>(0.0f), d_dK, head_size_qk);
+                       static_cast<T>(0.0f), d_dK_fp32, head_size_qk);
+            
+            // Convert fp32 to T
+            {
+                sycl::range<1> grid((seq_len_kv * head_size_qk + 255) / 256);
+                sycl::range<1> block(256);
+                
+                q.submit([&](sycl::handler& cgh) {
+                    cgh.parallel_for(
+                        sycl::nd_range<1>(grid * block, block),
+                        [=](sycl::nd_item<1> item) {
+                            convert_fp32_to_T_kernel(d_dK, d_dK_fp32, seq_len_kv * head_size_qk, item);
+                        }
+                    );
+                }).wait();
+            }
             
             // ========================================
             // Step 10: Copy results back to host
@@ -493,6 +561,10 @@ void sdpa_backward_reference_gpu(
             compat::free(d_dK);
             compat::free(d_oDo);
             compat::free(d_lse);
+            compat::free(d_dV_fp32);
+            compat::free(d_dP_fp32);
+            compat::free(d_dQ_fp32);
+            compat::free(d_dK_fp32);
         }
     }
 }
