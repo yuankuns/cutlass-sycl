@@ -268,20 +268,7 @@ gemm_dQ(Trait &trait,
     for (int i = 0; i <  size(tCgC); ++i) {
         auto [m, n] = tCgC(i);
 #if defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_INTEL_TARGET)
-        // Use inline assembly for Intel GPU atomic add
-        // LSC atomic fadd: atomically adds val to memory at addr
-        // Cache policy: .uc (uncached L1) .ca (cache-allocate L3)
-        //   - Bypass L1 to avoid cache thrashing from atomic operations
-        //   - Use L3 cache to reduce global memory bandwidth for this accumulator pattern
-        uint64_t addr = reinterpret_cast<uint64_t>(&C(m, n + local_id));
-        float val = tCrC(i);
-        float unused_old_value;
-        __asm__(
-            "lsc_atomic_fadd.ugm.uc.ca (M1, 1) %0:d32 flat[%1]:a64 %2:d32"
-            : "=rw"(unused_old_value)
-            : "rw"(addr), "rw"(val)
-            : "memory"
-        );
+        cutlass::atomicAdd(&C(m, n + local_id), tCrC(i));
 #else
         cutlass::atomicAdd(&C(m, n + local_id), tCrC(i));
 #endif
