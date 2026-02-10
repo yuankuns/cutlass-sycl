@@ -276,7 +276,7 @@ gemm_dQ(Trait &trait,
         uint64_t addr = reinterpret_cast<uint64_t>(&C(m, n + local_id));
         float val = tCrC(i);
         __asm__(
-            "lsc_atomic_fadd.ugm.uc.ca (M1, 1) null:d32 flat[%0]:a64 %1:d32"
+            "lsc_atomic_fadd.ugm.uc.ca (M1, 1) flat[%0]:a64 %1:d32"
             :
             : "rw"(addr), "rw"(val)
             : "memory"
