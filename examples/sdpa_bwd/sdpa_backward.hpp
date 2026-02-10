@@ -275,10 +275,10 @@ gemm_dQ(Trait &trait,
         //   - Use L3 cache to reduce global memory bandwidth for this accumulator pattern
         uint64_t addr = reinterpret_cast<uint64_t>(&C(m, n + local_id));
         float val = tCrC(i);
-        float dummy;
+        float unused_old_value;
         __asm__(
             "lsc_atomic_fadd.ugm.uc.ca (M1, 1) %0:d32 flat[%1]:a64 %2:d32"
-            : "=rw"(dummy)
+            : "=rw"(unused_old_value)
             : "rw"(addr), "rw"(val)
             : "memory"
         );
