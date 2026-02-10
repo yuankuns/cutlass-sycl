@@ -277,7 +277,7 @@ gemm_dQ(Trait &trait,
         float val = tCrC(i);
         float unused_old_value;
         __asm__(
-            "lsc_atomic_fadd.ugm.uc.ca (M1, 1) %0:d32 flat[%1]:a64 %2:d32"
+            "lsc_atomic_fadd.ugm.uc.ca (M1, 1) %0 flat[%1]:a64 %2"
             : "=rw"(unused_old_value)
             : "rw"(addr), "rw"(val)
             : "memory"
