@@ -273,12 +273,12 @@ gemm_dQ(Trait &trait,
         // Cache policy: .uc (uncached L1) .ca (cache-allocate L3)
         //   - Bypass L1 to avoid cache thrashing from atomic operations
         //   - Use L3 cache to reduce global memory bandwidth for this accumulator pattern
-        float* addr = &C(m, n + local_id);
+        uintptr_t addr = reinterpret_cast<uintptr_t>(&C(m, n + local_id));
         float val = tCrC(i);
-        asm volatile (
+        asm (
             "lsc_atomic_fadd.ugm.uc.ca (M1, 1) null:d32 flat[%0] %1:d32"
             :
-            : "rw.u"(addr), "rw"(val)
+            : "rw"(addr), "rw"(val)
             : "memory"
         );
 #else
