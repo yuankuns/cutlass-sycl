@@ -13,6 +13,7 @@ using namespace cute;
 template<class Engine0, class Layout0,
          class Engine1, class Layout1,
          class Engine2, class Layout2, class TVLayout2>
+__attribute__((always_inline))
 void
 save_slm(Tensor<Engine0, Layout0> &s,
          Tensor<Engine1, Layout1> const& g,
@@ -23,12 +24,12 @@ save_slm(Tensor<Engine0, Layout0> &s,
         auto [mi, ni] = g(i);
         // s(mi, ni + local_id) = r(i);
         auto &sv = *reinterpret_cast<const cute::intel::storage_vector_t<half_t, 32>*>(&r(i));
-        int *payload = reinterpret_cast<int *>(&s(mi, ni + local_id));
+        uintptr_t base_addr = reinterpret_cast<uintptr_t>(raw_pointer_cast(s.data()));
+        uintptr_t element_addr = reinterpret_cast<uintptr_t>(&s(mi, ni + local_id));
+        uint32_t payload = static_cast<uint32_t>(element_addr - base_addr);
 #ifdef __SYCL_DEVICE_ONLY__
-        __asm__(
-            "lsc_store.slm (M1,1) flat[%1]:a32 %0:d16u32\n"
-            :: "rw" (sv), "rw.u"(payload)
-            );
+        __asm__("lsc_store.slm (M1,1) flat[%1]:a32 %0:d32"
+            : : "rw"(sv), "rw"(payload));
 #endif
     }
 }
