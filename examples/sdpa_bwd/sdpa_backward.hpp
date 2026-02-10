@@ -278,7 +278,7 @@ gemm_dQ(Trait &trait,
         asm volatile (
             "lsc_atomic_fadd.ugm.uc.ca (M1, 1) null:d32 flat[%0] %1:d32"
             :
-            : "r"(addr), "r"(val)
+            : "rw.u"(addr), "rw"(val)
             : "memory"
         );
 #else
