@@ -267,7 +267,11 @@ gemm_dQ(Trait &trait,
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i <  size(tCgC); ++i) {
         auto [m, n] = tCgC(i);
+#if defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_INTEL_TARGET)
         cutlass::atomicAdd(&C(m, n + local_id), tCrC(i));
+#else
+        cutlass::atomicAdd(&C(m, n + local_id), tCrC(i));
+#endif
     }
 }
 
