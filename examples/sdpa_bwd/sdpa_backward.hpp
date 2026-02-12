@@ -361,10 +361,55 @@ scale_apply_exp2(Tensor<Engine0, Layout0> &tensor,
     CUTLASS_PRAGMA_UNROLL
     for (int mi = 0; mi < size<0>(tensor); ++mi) {
         const float max_scaled = max(mi) == -INFINITY ? 0.f : max(mi) * M_LOG2E;
+#if defined(__SYCL_DEVICE_ONLY__)
+        if constexpr (decltype(size<1>(tensor))::value == 1) {
+            const float neg_max_scaled = -max_scaled;
+            // For subgroup size 16, always use SIMD16 instructions
+            // Each work-item in the subgroup processes its own element
+            float val = tensor(mi, 0);
+            // Fused mad+exp using SIMD16 instructions
+            // All 16 work-items in subgroup execute in parallel
+            __asm__ volatile (
+                "mad (M1, 16) %0(0,0)<1> %1(0,0)<1;1,0> %2(0,0)<0;1,0> %3(0,0)<0;1,0>\n\t"
+                "exp (M1, 16) %0(0,0)<1> %0(0,0)<1;1,0>"
+                : "=rw"(val)
+                : "0"(val), "rw"(scale), "rw"(neg_max_scaled)
+                );
+            tensor(mi, 0) = val;
+        } else if constexpr (decltype(size<1>(tensor))::value == 2) {
+            const float neg_max_scaled = -max_scaled;
+            // For size<1> == 2, process 2 elements per work-item using SIMD32
+            // Load both values
+            float val0 = tensor(mi, 0);
+            float val1 = tensor(mi, 1);
+            // Fused mad+exp using SIMD32 instructions (2x16 = 32 floats total)
+            // All 16 work-items in subgroup execute in parallel, each processing 2 elements
+            __asm__ volatile (
+                "mad (M1, 16) %0(0,0)<1> %2(0,0)<1;1,0> %4(0,0)<0;1,0> %5(0,0)<0;1,0>\n\t"
+                "mad (M1, 16) %1(0,0)<1> %3(0,0)<1;1,0> %4(0,0)<0;1,0> %5(0,0)<0;1,0>\n\t"
+                "exp (M1, 16) %0(0,0)<1> %0(0,0)<1;1,0>\n\t"
+                "exp (M1, 16) %1(0,0)<1> %1(0,0)<1;1,0>"
+                : "=rw"(val0), "=rw"(val1)
+                : "0"(val0), "1"(val1), "rw"(scale), "rw"(neg_max_scaled)
+                );
+            tensor(mi, 0) = val0;
+            tensor(mi, 1) = val1;
+        } else {
+            // Unsupported size, fail at compile time
+            static_assert(decltype(size<1>(tensor))::value == 1 || decltype(size<1>(tensor))::value == 2, 
+                          "SYCL inline assembly path only supports size<1>(tensor) == 1 or 2");
+            // Fallback path (will never execute due to static_assert)
+            CUTLASS_PRAGMA_UNROLL
+            for (int ni = 0; ni < size<1>(tensor); ++ni)  {
+                tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
+            }
+        }
+#else
         CUTLASS_PRAGMA_UNROLL
         for (int ni = 0; ni < size<1>(tensor); ++ni)  {
             tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
         }
+#endif
     }
 }
 
