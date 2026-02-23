@@ -21,7 +21,6 @@ runs:
           #purge existing intel graphics packages
           dpkg -l | grep -E 'libigc|intel-igc|libigdgmm|libigdfcl|libze-intel-gpu|libze1|libze-dev|intel-opencl-icd|intel-metrics-discovery|intel-gsc|intel-ocloc' | awk '{print $2}' | xargs -r sudo apt-get purge -y || true
           sudo rm -f /etc/apt/sources.list.d/kobuk-team-ubuntu-intel-graphics-*
-          sudo rm -f /etc/apt/sources.list.d/intel-gpu-*.list
 
           sudo add-apt-repository ppa:kobuk-team/intel-graphics
           sudo apt update
@@ -41,7 +40,6 @@ runs:
           #purge existing intel graphics packages
           dpkg -l | grep -E 'libigc|intel-igc|libigdgmm|libigdfcl|libze-intel-gpu|libze1|libze-dev|intel-opencl-icd|intel-metrics-discovery|intel-gsc|intel-ocloc' | awk '{print $2}' | xargs -r sudo apt-get purge -y || true
           sudo rm -f /etc/apt/sources.list.d/kobuk-team-ubuntu-intel-graphics-*
-          sudo rm -f /etc/apt/sources.list.d/intel-gpu-*.list
 
           sudo add-apt-repository ppa:kobuk-team/intel-graphics-staging
           sudo apt update
