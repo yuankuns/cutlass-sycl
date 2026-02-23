@@ -76,7 +76,7 @@ runs:
           sudo apt update
           sudo apt-get install -y libze-intel-gpu1 libze-dev intel-metrics-discovery \
             intel-opencl-icd ocl-icd-opencl-dev clinfo intel-gsc intel-ocloc g++
-            
+          dpkg -l | grep libhwloc15 > /dev/null || sudo apt install -y libhwloc15
           rm -rf igc
           mkdir igc
           cd igc
