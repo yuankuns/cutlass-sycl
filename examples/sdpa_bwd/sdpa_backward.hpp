@@ -612,8 +612,8 @@ mha_backward_seq(T trait,
     const int bidb = BlockIdxZ();
     const int bidhq = BlockIdxY();
     const int bidhkv = bidhq / param.num_qh_per_kvh;
-    // const int max_n_block = ceil_div(param.seq_len_kv, trait.kBlockN);
-    for (int n_block = 0; n_block < param.n_block; ++n_block)
+    const int bidnblk = BlockIdxX();
+    for (int n_block = bidnblk; n_block < param.n_block; n_block += GridDimX())
         if (param.tail_n > 0 and n_block == param.n_block - 1)
             dq_dk_dv_1colblock<false, false>(trait, param, bidb, bidhq, bidhkv, param.n_block - 1, param.tail_n);
         else
