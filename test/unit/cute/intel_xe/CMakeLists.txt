@@ -52,6 +52,7 @@ cutlass_test_unit_add_executable(
   xe_copy_prefetch_2d.cpp
   xe_vnni_2d.cpp
   xe_transpose_2d.cpp
+  scale_apply_exp2_test.cpp
 )
 else()
 cutlass_test_unit_add_executable(

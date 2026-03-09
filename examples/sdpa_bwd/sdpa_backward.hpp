@@ -8,7 +8,7 @@ auto convert_layout_2d_layout(Layout layout) {
     return l;
 }
 
-constexpr int tid = 1;
+constexpr int tid = 17;  // Second SG, thread 1
 constexpr int bid = 0;
 
 const bool
@@ -525,6 +525,7 @@ scale_apply_exp2(Tensor<Engine0, Layout0> &tensor,
                  Tensor<Engine1, Layout1> &max,
                  Tensor<Engine2, Layout2> &rC,
                  const float scale,
+                 bool debug = false,
                  const int tail_m = 0) {
     static_assert(Layout0::rank == 2, "Only support 2D Tensor");
     static_assert(Layout1::rank == 1, "Only support 1D Tensor");
@@ -532,16 +533,90 @@ scale_apply_exp2(Tensor<Engine0, Layout0> &tensor,
         rC.data(),
         convert_layout_2d_layout(rC.layout()));
     if constexpr(Is_even_M) {
+#if defined(__SYCL_DEVICE_ONLY__)
+        // Use inline asm optimization from cute_util.hpp
         CUTLASS_PRAGMA_UNROLL
         for (int ni = 0; ni < size<1>(tensor); ++ni)  {
             int n = get<1>(rC_2d(0, ni));
             const float max_scaled = max(n) == -INFINITY ? 0.f : max(n) * M_LOG2E;
+            const float neg_max_scaled = -max_scaled;
+            auto t = tensor(_, ni);
+            //static_assert(decltype(size<1>(tensor))::value == 1, "Expect 1 element in the inner dimension for float4 optimization");
+            // DEBUG: Print layout info for debugging Int<8> issues
+            // Uncomment the following block to enable debug output
+            /*
+            if (is_cur_thread() and ni == 0) {
+                print("scale_apply_exp2: size<0>(tensor)=%d size<1>(tensor)=%d\n", (int)size<0>(tensor), (int)size<1>(tensor));
+                print("  full tensor layout: ");
+                print(tensor.layout());
+                print("\n  t layout: ");
+                print(t.layout());
+                print("\n");
+            }
+            */
+            if (debug and is_cur_thread() and ni == 0) {
+                print("full tensor: ");
+                print(tensor);
+                print("\ntensor before exp2:");
+                print_t(t);
+                intel::float4& vals = *recast_ptr<intel::float4>(&t(0));
+                print("tensor with intel::float4:");
+                print("%f %f %f %f\n", vals.x, vals.y, vals.z, vals.w);
+            }
+            ScaleExpHelper<decltype(size<0>(tensor))>::apply(t, scale, neg_max_scaled, debug);
+            if (debug and is_cur_thread() and ni == 0) {
+                print("neg_max_scaled: %f\n", neg_max_scaled);
+                print("tensor after exp2:");
+                print_t(t);
+                intel::float4& vals_after = *recast_ptr<intel::float4>(&t(0));
+                print("tensor after with intel::float4:");
+                print("%f %f %f %f\n", vals_after.x, vals_after.y, vals_after.z, vals_after.w);
+            }
+        }
+#else
+        // Fallback for host compilation
+        CUTLASS_PRAGMA_UNROLL
+        for (int ni = 0; ni < size<1>(tensor); ++ni)  {
+            int n = get<1>(rC_2d(0, ni));
+            const float max_scaled = max(n) == -INFINITY ? 0.f : max(n) * M_LOG2E;
+            const float neg_max_scaled = -max_scaled;
+            auto t = tensor(_, ni);
+            if (debug and is_cur_thread() and ni == 0) {
+                print("full tensor: ");
+                print(tensor);
+                print("\ntensor before exp2:");
+                print_t(t);
+                intel::float4& vals = *recast_ptr<intel::float4>(&t(0));
+                print("tensor with intel::float4:");
+                print("%f %f %f %f\n", vals[0], vals[1], vals[2], vals[3]);
+            }
             CUTLASS_PRAGMA_UNROLL
             for (int mi = 0; mi < size<0>(tensor); ++mi) {
                 tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
             }
+            if (debug and is_cur_thread() and ni == 0) {
+                print("neg_max_scaled: %f\n", neg_max_scaled);
+                print("tensor after exp2:");
+                print_t(t);
+                intel::float4& vals_after = *recast_ptr<intel::float4>(&t(0));
+                print("tensor after with intel::float4:");
+                print("%f %f %f %f\n", vals_after[0], vals_after[1], vals_after[2], vals_after[3]);
+            }
         }
+#endif
     } else {
+#if defined(__SYCL_DEVICE_ONLY__)
+        // Use inline asm optimization from cute_util.hpp
+        CUTLASS_PRAGMA_UNROLL
+        for (int ni = 0; ni < size<1>(tensor); ++ni)  {
+            int n = get<1>(rC_2d(0, ni));
+            const float max_scaled = ((max(n) == -INFINITY) or (n >= tail_m)) ? 0.f : max(n) * M_LOG2E;
+            const float neg_max_scaled = -max_scaled;
+            auto t = tensor(_, ni);
+            ScaleExpHelper<decltype(size<0>(tensor))>::apply(t, scale, neg_max_scaled);
+        }
+#else
+        // Fallback for host compilation
         CUTLASS_PRAGMA_UNROLL
         for (int ni = 0; ni < size<1>(tensor); ++ni)  {
             int n = get<1>(rC_2d(0, ni));
@@ -551,6 +626,7 @@ scale_apply_exp2(Tensor<Engine0, Layout0> &tensor,
                 tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
             }
         }
+#endif
     }
 }
 
@@ -830,10 +906,10 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         // P=softmax(S,lse)
         if (Is_even_M) {
             scale_apply_exp2<true>(scores, mLSE, taccScS_rt,
-                                   param.scale_softmax_log2);
+                                   param.scale_softmax_log2, m_block == 0 and n_block == 0);
         } else {
             scale_apply_exp2<false>(scores, mLSE, taccScS_rt,
-                                    param.scale_softmax_log2,
+                                    param.scale_softmax_log2, false,
                                     tail_m);
         }
         auto rdP = create_reg<V>(trait,

@@ -92,6 +92,11 @@ struct Param {
     const float *lse_ptr;
     const float scale_softmax;
     const float scale_softmax_log2;
+    // debug: exp2 validation buffer, layout [thread_id * 32 + ni*8 + mi]
+    // first half = input to ScaleExpHelper, second half = output
+    // size must be kNSGs*16 * 32 * 2 = 128*64 floats
+    float* exp2_debug_in  = nullptr;  // [threads * elts]: values before ScaleExpHelper
+    float* exp2_debug_out = nullptr;  // [threads * elts]: values after ScaleExpHelper
     // write
     float *odo_ptr;
     float *dqaccum_ptr;
