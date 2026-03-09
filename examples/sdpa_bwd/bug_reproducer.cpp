@@ -4,12 +4,13 @@
 // for headdim=192/256, with real DPAS GEMM for realistic register pressure.
 //
 // Variants tested:
-//   copy32   - float8 init copy + (M1,32)              -- WRONG on 192/256
-//   elem16   - per-element local float + (M1,16)       -- correct
-//   c_ref    - pure C++ sycl::exp2                     -- reference
-//   recast16 - recast_ptr<float8> alias + (M1,16)
-//   copy16   - 8 separate float locals + (M1,16)       -- correct
-//   recast32 - recast_ptr<float8> alias + (M1,32)      -- WRONG on 192/256
+//   copy32     - float8 init copy + (M1,32)              -- WRONG on 192/256
+//   elem16     - per-element local float + (M1,16)       -- correct
+//   c_ref      - pure C++ sycl::exp2                     -- reference
+//   mad16exp32 - float8 init copy, mad(M1,16) + exp(M1,32) -- diagnostic
+//   recast16   - recast_ptr<float8> alias + (M1,16)
+//   copy16     - 8 separate float locals + (M1,16)       -- correct
+//   recast32   - recast_ptr<float8> alias + (M1,32)      -- WRONG on 192/256
 //
 // Build:
 //   source /opt/intel/oneapi/setvars.sh && cd build
@@ -37,12 +38,13 @@ template<typename Trait>
 struct BugReproKernel {
     const cutlass::bfloat16_t* Kt;
     const cutlass::bfloat16_t* Q;
-    float* out_c_ref;      // pure C++ exp2 -- reference
-    float* out_copy16;     // 8 separate float locals in one asm block + (M1,16) -- correct
-    float* out_copy32;     // float8 init copy + (M1,32) -- WRONG
-    float* out_elem16;     // per-element local float + (M1,16) -- correct
-    float* out_recast16;   // recast_ptr<float8> alias + (M1,16)
-    float* out_recast32;   // recast_ptr<float8> alias + (M1,32) -- WRONG
+    float* out_c_ref;        // pure C++ exp2 -- reference
+    float* out_copy16;       // 8 separate float locals in one asm block + (M1,16) -- correct
+    float* out_copy32;       // float8 init copy + (M1,32) -- WRONG
+    float* out_elem16;       // per-element local float + (M1,16) -- correct
+    float* out_mad16exp32;   // float8 init copy, mad(M1,16) + exp(M1,32) -- diagnostic
+    float* out_recast16;     // recast_ptr<float8> alias + (M1,16)
+    float* out_recast32;     // recast_ptr<float8> alias + (M1,32) -- WRONG
 
     CUTLASS_DEVICE void operator()(sycl::nd_item<1>) const {
 #if defined(__SYCL_DEVICE_ONLY__)
@@ -68,6 +70,7 @@ struct BugReproKernel {
         auto rS4 = create_reg<float>(trait, mKt, tiled_mma);
         auto rS5 = create_reg<float>(trait, mKt, tiled_mma);
         auto rS6 = create_reg<float>(trait, mKt, tiled_mma);
+        auto rS7 = create_reg<float>(trait, mKt, tiled_mma);
         gemm_SdP(trait, mKt, mQ, rS0, tiled_mma);
         gemm_SdP(trait, mKt, mQ, rS1, tiled_mma);
         gemm_SdP(trait, mKt, mQ, rS2, tiled_mma);
@@ -75,6 +78,7 @@ struct BugReproKernel {
         gemm_SdP(trait, mKt, mQ, rS4, tiled_mma);
         gemm_SdP(trait, mKt, mQ, rS5, tiled_mma);
         gemm_SdP(trait, mKt, mQ, rS6, tiled_mma);
+        gemm_SdP(trait, mKt, mQ, rS7, tiled_mma);
 
         auto s0 = make_tensor(rS0.data(), convert_layout_acc_layout(rS0.layout()));
         auto s1 = make_tensor(rS1.data(), convert_layout_acc_layout(rS1.layout()));
@@ -84,6 +88,7 @@ struct BugReproKernel {
         auto s4 = make_tensor(rS4.data(), convert_layout_acc_layout(rS4.layout()));
         auto s5 = make_tensor(rS5.data(), convert_layout_acc_layout(rS5.layout()));
         auto s6 = make_tensor(rS6.data(), convert_layout_acc_layout(rS6.layout()));
+        auto s7 = make_tensor(rS7.data(), convert_layout_acc_layout(rS7.layout()));
 
         auto lid = int(compat::get_nd_item<1>().get_local_id(0));
         if (cute::thread0()){
@@ -102,6 +107,7 @@ struct BugReproKernel {
                 s4(mi, ni) = v;
                 s5(mi, ni) = v;
                 s6(mi, ni) = v;
+                s7(mi, ni) = v;
             }
         }
 
@@ -160,6 +166,35 @@ struct BugReproKernel {
             for (int mi = 0; mi < size<0>(s2); ++mi) {
                 s2(mi, ni) = sycl::exp2(s2(mi, ni) * scale + neg_max);
             }
+        }
+
+        // mad16exp32: float8 init copy, mad(M1,16) + exp(M1,32) -- diagnostic
+        CUTLASS_PRAGMA_UNROLL
+        for (int ni = 0; ni < size<1>(s7); ++ni) {
+            auto t = s7(_, ni);
+            intel::float8 v = {t(0), t(1), t(2), t(3), t(4), t(5), t(6), t(7)};
+            __asm__ volatile (
+                "{\n"
+                ".decl VALS_%= v_type=G type=F num_elts=128 alias=<%0,0>\n"
+                ".decl SCALE_%= v_type=G type=F num_elts=16 alias=<%1,0>\n"
+                ".decl NEG_MAX_%= v_type=G type=F num_elts=16 alias=<%2,0>\n"
+                "mad (M1,16) VALS_%=(0,0)<1>   VALS_%=(0,0)<1;1,0>   SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
+                "mad (M1,16) VALS_%=(0,16)<1>  VALS_%=(0,16)<1;1,0>  SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
+                "mad (M1,16) VALS_%=(0,32)<1>  VALS_%=(0,32)<1;1,0>  SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
+                "mad (M1,16) VALS_%=(0,48)<1>  VALS_%=(0,48)<1;1,0>  SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
+                "mad (M1,16) VALS_%=(0,64)<1>  VALS_%=(0,64)<1;1,0>  SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
+                "mad (M1,16) VALS_%=(0,80)<1>  VALS_%=(0,80)<1;1,0>  SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
+                "mad (M1,16) VALS_%=(0,96)<1>  VALS_%=(0,96)<1;1,0>  SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
+                "mad (M1,16) VALS_%=(0,112)<1> VALS_%=(0,112)<1;1,0> SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
+                "exp (M1,32) VALS_%=(0,0)<1>  VALS_%=(0,0)<1;1,0>\n"
+                "exp (M1,32) VALS_%=(0,32)<1> VALS_%=(0,32)<1;1,0>\n"
+                "exp (M1,32) VALS_%=(0,64)<1> VALS_%=(0,64)<1;1,0>\n"
+                "exp (M1,32) VALS_%=(0,96)<1> VALS_%=(0,96)<1;1,0>\n"
+                "}\n"
+                : "+rw"(v) : "rw"(scale), "rw"(neg_max)
+            );
+            t(0)=v[0]; t(1)=v[1]; t(2)=v[2]; t(3)=v[3];
+            t(4)=v[4]; t(5)=v[5]; t(6)=v[6]; t(7)=v[7];
         }
 
         // recast16: recast_ptr<intel::float8> alias + (M1,16)
@@ -265,12 +300,13 @@ struct BugReproKernel {
             CUTLASS_PRAGMA_UNROLL
             for (int mi = 0; mi < size<0>(s0); ++mi) {
                 int idx = lid * elts + ni * size<0>(s0) + mi;
-                out_c_ref[idx]    = s2(mi, ni);
-                out_copy16[idx]   = s4(mi, ni);
-                out_copy32[idx]   = s0(mi, ni);
-                out_elem16[idx]   = s1(mi, ni);
-                out_recast16[idx] = s3(mi, ni);
-                out_recast32[idx] = s5(mi, ni);
+                out_c_ref[idx]        = s2(mi, ni);
+                out_copy16[idx]       = s4(mi, ni);
+                out_copy32[idx]       = s0(mi, ni);
+                out_elem16[idx]       = s1(mi, ni);
+                out_mad16exp32[idx]   = s7(mi, ni);
+                out_recast16[idx]     = s3(mi, ni);
+                out_recast32[idx]     = s5(mi, ni);
             }
         }
 #endif
@@ -288,12 +324,13 @@ void run_test(sycl::queue& q, const char* label) {
 
     auto* Kt_d    = sycl::malloc_device<cutlass::bfloat16_t>(kBlockN * kHeadDim, q);
     auto* Q_d     = sycl::malloc_device<cutlass::bfloat16_t>(kBlockM * kHeadDim, q);
-    auto* c_ref_d    = sycl::malloc_device<float>(total, q);
-    auto* copy16_d   = sycl::malloc_device<float>(total, q);
-    auto* copy32_d   = sycl::malloc_device<float>(total, q);
-    auto* elem16_d   = sycl::malloc_device<float>(total, q);
-    auto* recast16_d = sycl::malloc_device<float>(total, q);
-    auto* recast32_d = sycl::malloc_device<float>(total, q);
+    auto* c_ref_d      = sycl::malloc_device<float>(total, q);
+    auto* copy16_d     = sycl::malloc_device<float>(total, q);
+    auto* copy32_d     = sycl::malloc_device<float>(total, q);
+    auto* elem16_d     = sycl::malloc_device<float>(total, q);
+    auto* mad16exp32_d = sycl::malloc_device<float>(total, q);
+    auto* recast16_d   = sycl::malloc_device<float>(total, q);
+    auto* recast32_d   = sycl::malloc_device<float>(total, q);
 
     std::vector<cutlass::bfloat16_t> Kt_h(kBlockN * kHeadDim), Q_h(kBlockM * kHeadDim);
     { std::mt19937 rng(42); std::uniform_real_distribution<float> dist(-1.f, 1.f);
@@ -303,7 +340,7 @@ void run_test(sycl::queue& q, const char* label) {
     q.memcpy(Q_d,  Q_h.data(),  Q_h.size()  * sizeof(cutlass::bfloat16_t)).wait();
 
     q.submit([&](sycl::handler& h) {
-        BugReproKernel<Trait> k{Kt_d, Q_d, c_ref_d, copy16_d, copy32_d, elem16_d, recast16_d, recast32_d};
+        BugReproKernel<Trait> k{Kt_d, Q_d, c_ref_d, copy16_d, copy32_d, elem16_d, mad16exp32_d, recast16_d, recast32_d};
         h.parallel_for(sycl::nd_range<1>(threads, threads),
                        sycl::ext::oneapi::experimental::properties{
                            sycl::ext::oneapi::experimental::sub_group_size<16>},
@@ -311,43 +348,46 @@ void run_test(sycl::queue& q, const char* label) {
     }).wait();
 
     std::vector<float> copy32_h(total), elem16_h(total), c_ref_h(total),
-                       recast16_h(total), copy16_h(total), recast32_h(total);
-    q.memcpy(copy32_h.data(),   copy32_d,   total * sizeof(float)).wait();
-    q.memcpy(elem16_h.data(),   elem16_d,   total * sizeof(float)).wait();
-    q.memcpy(c_ref_h.data(),    c_ref_d,    total * sizeof(float)).wait();
-    q.memcpy(recast16_h.data(), recast16_d, total * sizeof(float)).wait();
-    q.memcpy(copy16_h.data(),   copy16_d,   total * sizeof(float)).wait();
-    q.memcpy(recast32_h.data(), recast32_d, total * sizeof(float)).wait();
+                       mad16exp32_h(total), recast16_h(total), copy16_h(total), recast32_h(total);
+    q.memcpy(copy32_h.data(),     copy32_d,     total * sizeof(float)).wait();
+    q.memcpy(elem16_h.data(),     elem16_d,     total * sizeof(float)).wait();
+    q.memcpy(c_ref_h.data(),      c_ref_d,      total * sizeof(float)).wait();
+    q.memcpy(mad16exp32_h.data(), mad16exp32_d, total * sizeof(float)).wait();
+    q.memcpy(recast16_h.data(),   recast16_d,   total * sizeof(float)).wait();
+    q.memcpy(copy16_h.data(),     copy16_d,     total * sizeof(float)).wait();
+    q.memcpy(recast32_h.data(),   recast32_d,   total * sizeof(float)).wait();
 
-    int mm_copy32=0, mm_elem16=0, mm_r16=0, mm_copy16=0, mm_r32=0;
+    int mm_copy32=0, mm_elem16=0, mm_r16=0, mm_copy16=0, mm_r32=0, mm_m16e32=0;
     for (int i = 0; i < total; ++i) {
         float ref = c_ref_h[i];
         auto bad = [&](float v){ return std::abs(v-ref)/(std::abs(ref)+1e-8f) > 0.01f; };
-        if (bad(copy32_h[i]))   ++mm_copy32;
-        if (bad(elem16_h[i]))   ++mm_elem16;
-        if (bad(recast16_h[i])) ++mm_r16;
-        if (bad(copy16_h[i]))   ++mm_copy16;
-        if (bad(recast32_h[i])) ++mm_r32;
+        if (bad(copy32_h[i]))     ++mm_copy32;
+        if (bad(elem16_h[i]))     ++mm_elem16;
+        if (bad(mad16exp32_h[i])) ++mm_m16e32;
+        if (bad(recast16_h[i]))   ++mm_r16;
+        if (bad(copy16_h[i]))     ++mm_copy16;
+        if (bad(recast32_h[i]))   ++mm_r32;
     }
 
     printf("\n%s\n", label);
-    printf("  copy32   (float8 init copy, M1,32):                   %d/%d mismatches\n", mm_copy32,  total);
-    printf("  elem16   (per-element local, M1,16):                  %d/%d mismatches\n", mm_elem16,  total);
-    printf("  recast16 (recast_ptr<float8> alias, M1,16):           %d/%d mismatches\n", mm_r16,     total);
-    printf("  copy16   (8 separate locals, M1,16 in one asm block): %d/%d mismatches\n", mm_copy16,  total);
-    printf("  recast32 (recast_ptr<float8> alias, M1,32):           %d/%d mismatches\n", mm_r32,     total);
+    printf("  copy32     (float8 init copy, M1,32):                   %d/%d mismatches\n", mm_copy32,  total);
+    printf("  elem16     (per-element local, M1,16):                  %d/%d mismatches\n", mm_elem16,  total);
+    printf("  mad16exp32 (float8, mad M1,16 + exp M1,32):            %d/%d mismatches\n", mm_m16e32,  total);
+    printf("  recast16   (recast_ptr<float8> alias, M1,16):           %d/%d mismatches\n", mm_r16,     total);
+    printf("  copy16     (8 separate locals, M1,16 in one asm block): %d/%d mismatches\n", mm_copy16,  total);
+    printf("  recast32   (recast_ptr<float8> alias, M1,32):           %d/%d mismatches\n", mm_r32,     total);
 
-    printf("  idx  %-12s %-12s %-12s %-12s %-12s\n", "c_ref","copy32","recast16","copy16","recast32");
+    printf("  idx  %-12s %-12s %-12s %-12s %-12s %-12s\n", "c_ref","copy32","mad16exp32","recast16","copy16","recast32");
     for (int i = 0; i < 8; ++i) {
         auto flag = [&](float v){ return std::abs(v-c_ref_h[i])/(std::abs(c_ref_h[i])+1e-8f)>0.01f ? "✗":"✓"; };
-        printf("  %3d  %-12g %-12g %-12g %-12g %-12g  %s%s%s%s\n", i,
-               c_ref_h[i], copy32_h[i], recast16_h[i], copy16_h[i], recast32_h[i],
-               flag(copy32_h[i]), flag(recast16_h[i]), flag(copy16_h[i]), flag(recast32_h[i]));
+        printf("  %3d  %-12g %-12g %-12g %-12g %-12g %-12g  %s%s%s%s%s\n", i,
+               c_ref_h[i], copy32_h[i], mad16exp32_h[i], recast16_h[i], copy16_h[i], recast32_h[i],
+               flag(copy32_h[i]), flag(mad16exp32_h[i]), flag(recast16_h[i]), flag(copy16_h[i]), flag(recast32_h[i]));
     }
 
     sycl::free(Kt_d, q); sycl::free(Q_d, q);
     sycl::free(copy32_d, q); sycl::free(elem16_d, q); sycl::free(c_ref_d, q);
-    sycl::free(recast16_d, q); sycl::free(copy16_d, q); sycl::free(recast32_d, q);
+    sycl::free(mad16exp32_d, q); sycl::free(recast16_d, q); sycl::free(copy16_d, q); sycl::free(recast32_d, q);
 }
 
 int main() {
