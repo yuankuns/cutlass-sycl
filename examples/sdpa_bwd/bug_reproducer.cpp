@@ -1,7 +1,7 @@
 // Bug reproducer: inline asm exp2 variants validation across headdims.
 //
 // Compares multiple inline asm approaches for scale+exp2 against pure C++ reference
-// for headdim=128/192/256, with real DPAS GEMM for realistic register pressure.
+// for headdim=192/256, with real DPAS GEMM for realistic register pressure.
 //
 // Variants tested:
 //   copy32   - float8 init copy + (M1,32)              -- WRONG on 192/256
@@ -28,8 +28,6 @@
 
 using namespace cute;
 
-// headdim=128: kBlockN=64, kBlockM=64, kNSGs=8, AtomLayoutMSdP=2
-using Trait128 = FAKernel<cutlass::bfloat16_t, 128, 64, 64, 8, 2, 2, 4, false>;
 // headdim=192: kBlockN=32, kBlockM=64, kNSGs=8, AtomLayoutMSdP=4
 using Trait192 = FAKernel<cutlass::bfloat16_t, 192, 64, 32, 8, 4, 2, 2, false>;
 // headdim=256: kBlockN=32, kBlockM=64, kNSGs=8, AtomLayoutMSdP=4
@@ -88,6 +86,10 @@ struct BugReproKernel {
         auto s6 = make_tensor(rS6.data(), convert_layout_acc_layout(rS6.layout()));
 
         auto lid = int(compat::get_nd_item<1>().get_local_id(0));
+        if (cute::thread0()){
+            print(s0);
+            print("\n");
+        }
         CUTLASS_PRAGMA_UNROLL
         for (int ni = 0; ni < size<1>(s0); ++ni) {
             CUTLASS_PRAGMA_UNROLL
@@ -106,35 +108,29 @@ struct BugReproKernel {
         const float scale   = sycl::rsqrt(float(kHeadDim));
         const float neg_max = 0.f;
 
-        // copy32: float8 init copy + (M1,32) -- WRONG on headdim=192/256
+        // copy32: float8 init copy + (M1,32) -- WRONG
         CUTLASS_PRAGMA_UNROLL
         for (int ni = 0; ni < size<1>(s0); ++ni) {
             auto t = s0(_, ni);
-            if constexpr (size<0>(s0) == 8) {
-                intel::float8 v = {t(0), t(1), t(2), t(3), t(4), t(5), t(6), t(7)};
-                __asm__ volatile (
-                    "{\n"
-                    ".decl VALS_%= v_type=G type=F num_elts=128 alias=<%0,0>\n"
-                    ".decl SCALE_%= v_type=G type=F num_elts=16 alias=<%1,0>\n"
-                    ".decl NEG_MAX_%= v_type=G type=F num_elts=16 alias=<%2,0>\n"
-                    "mad (M1,32) VALS_%=(0,0)<1>  VALS_%=(0,0)<1;1,0>  SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
-                    "mad (M1,32) VALS_%=(0,32)<1> VALS_%=(0,32)<1;1,0> SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
-                    "mad (M1,32) VALS_%=(0,64)<1> VALS_%=(0,64)<1;1,0> SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
-                    "mad (M1,32) VALS_%=(0,96)<1> VALS_%=(0,96)<1;1,0> SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
-                    "exp (M1,32) VALS_%=(0,0)<1>  VALS_%=(0,0)<1;1,0>\n"
-                    "exp (M1,32) VALS_%=(0,32)<1> VALS_%=(0,32)<1;1,0>\n"
-                    "exp (M1,32) VALS_%=(0,64)<1> VALS_%=(0,64)<1;1,0>\n"
-                    "exp (M1,32) VALS_%=(0,96)<1> VALS_%=(0,96)<1;1,0>\n"
-                    "}\n"
-                    : "+rw"(v) : "rw"(scale), "rw"(neg_max)
-                );
-                t(0)=v[0]; t(1)=v[1]; t(2)=v[2]; t(3)=v[3];
-                t(4)=v[4]; t(5)=v[5]; t(6)=v[6]; t(7)=v[7];
-            } else {
-                CUTLASS_PRAGMA_UNROLL
-                for (int mi = 0; mi < size<0>(s0); ++mi)
-                    t(mi) = sycl::exp2(t(mi) * scale + neg_max);
-            }
+            intel::float8 v = {t(0), t(1), t(2), t(3), t(4), t(5), t(6), t(7)};
+            __asm__ volatile (
+                "{\n"
+                ".decl VALS_%= v_type=G type=F num_elts=128 alias=<%0,0>\n"
+                ".decl SCALE_%= v_type=G type=F num_elts=16 alias=<%1,0>\n"
+                ".decl NEG_MAX_%= v_type=G type=F num_elts=16 alias=<%2,0>\n"
+                "mad (M1,32) VALS_%=(0,0)<1>  VALS_%=(0,0)<1;1,0>  SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
+                "mad (M1,32) VALS_%=(0,32)<1> VALS_%=(0,32)<1;1,0> SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
+                "mad (M1,32) VALS_%=(0,64)<1> VALS_%=(0,64)<1;1,0> SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
+                "mad (M1,32) VALS_%=(0,96)<1> VALS_%=(0,96)<1;1,0> SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
+                "exp (M1,32) VALS_%=(0,0)<1>  VALS_%=(0,0)<1;1,0>\n"
+                "exp (M1,32) VALS_%=(0,32)<1> VALS_%=(0,32)<1;1,0>\n"
+                "exp (M1,32) VALS_%=(0,64)<1> VALS_%=(0,64)<1;1,0>\n"
+                "exp (M1,32) VALS_%=(0,96)<1> VALS_%=(0,96)<1;1,0>\n"
+                "}\n"
+                : "+rw"(v) : "rw"(scale), "rw"(neg_max)
+            );
+            t(0)=v[0]; t(1)=v[1]; t(2)=v[2]; t(3)=v[3];
+            t(4)=v[4]; t(5)=v[5]; t(6)=v[6]; t(7)=v[7];
         }
 
         // elem16: per-element local float + (M1,16) -- correct
@@ -170,44 +166,37 @@ struct BugReproKernel {
         CUTLASS_PRAGMA_UNROLL
         for (int ni = 0; ni < size<1>(s3); ++ni) {
             auto t = s3(_, ni);
-            if constexpr (size<0>(s3) == 8) {
-                intel::float8& v8 = *recast_ptr<intel::float8>(&t(0));
-                __asm__ volatile (
-                    "{\n"
-                    ".decl VALS_%= v_type=G type=F num_elts=128 alias=<%0,0>\n"
-                    ".decl SCALE_%= v_type=G type=F num_elts=16 alias=<%1,0>\n"
-                    ".decl NEG_MAX_%= v_type=G type=F num_elts=16 alias=<%2,0>\n"
-                    "mad (M1,16) VALS_%=(0,0)<1>  VALS_%=(0,0)<1;1,0>  SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
-                    "mad (M1,16) VALS_%=(0,16)<1> VALS_%=(0,16)<1;1,0> SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
-                    "mad (M1,16) VALS_%=(0,32)<1> VALS_%=(0,32)<1;1,0> SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
-                    "mad (M1,16) VALS_%=(0,48)<1> VALS_%=(0,48)<1;1,0> SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
-                    "mad (M1,16) VALS_%=(0,64)<1> VALS_%=(0,64)<1;1,0> SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
-                    "mad (M1,16) VALS_%=(0,80)<1> VALS_%=(0,80)<1;1,0> SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
-                    "mad (M1,16) VALS_%=(0,96)<1>  VALS_%=(0,96)<1;1,0>  SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
-                    "mad (M1,16) VALS_%=(0,112)<1> VALS_%=(0,112)<1;1,0> SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
-                    "exp (M1,16) VALS_%=(0,0)<1>  VALS_%=(0,0)<1;1,0>\n"
-                    "exp (M1,16) VALS_%=(0,16)<1> VALS_%=(0,16)<1;1,0>\n"
-                    "exp (M1,16) VALS_%=(0,32)<1> VALS_%=(0,32)<1;1,0>\n"
-                    "exp (M1,16) VALS_%=(0,48)<1> VALS_%=(0,48)<1;1,0>\n"
-                    "exp (M1,16) VALS_%=(0,64)<1> VALS_%=(0,64)<1;1,0>\n"
-                    "exp (M1,16) VALS_%=(0,80)<1> VALS_%=(0,80)<1;1,0>\n"
-                    "exp (M1,16) VALS_%=(0,96)<1>  VALS_%=(0,96)<1;1,0>\n"
-                    "exp (M1,16) VALS_%=(0,112)<1> VALS_%=(0,112)<1;1,0>\n"
-                    "}\n"
-                    : "+rw"(v8) : "rw"(scale), "rw"(neg_max)
-                );
-            } else {
-                CUTLASS_PRAGMA_UNROLL
-                for (int mi = 0; mi < size<0>(s3); ++mi)
-                    t(mi) = sycl::exp2(t(mi) * scale + neg_max);
-            }
+            intel::float8& v8 = *recast_ptr<intel::float8>(&t(0));
+            __asm__ volatile (
+                "{\n"
+                ".decl VALS_%= v_type=G type=F num_elts=128 alias=<%0,0>\n"
+                ".decl SCALE_%= v_type=G type=F num_elts=16 alias=<%1,0>\n"
+                ".decl NEG_MAX_%= v_type=G type=F num_elts=16 alias=<%2,0>\n"
+                "mad (M1,16) VALS_%=(0,0)<1>  VALS_%=(0,0)<1;1,0>  SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
+                "mad (M1,16) VALS_%=(0,16)<1> VALS_%=(0,16)<1;1,0> SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
+                "mad (M1,16) VALS_%=(0,32)<1> VALS_%=(0,32)<1;1,0> SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
+                "mad (M1,16) VALS_%=(0,48)<1> VALS_%=(0,48)<1;1,0> SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
+                "mad (M1,16) VALS_%=(0,64)<1> VALS_%=(0,64)<1;1,0> SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
+                "mad (M1,16) VALS_%=(0,80)<1> VALS_%=(0,80)<1;1,0> SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
+                "mad (M1,16) VALS_%=(0,96)<1>  VALS_%=(0,96)<1;1,0>  SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
+                "mad (M1,16) VALS_%=(0,112)<1> VALS_%=(0,112)<1;1,0> SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
+                "exp (M1,16) VALS_%=(0,0)<1>  VALS_%=(0,0)<1;1,0>\n"
+                "exp (M1,16) VALS_%=(0,16)<1> VALS_%=(0,16)<1;1,0>\n"
+                "exp (M1,16) VALS_%=(0,32)<1> VALS_%=(0,32)<1;1,0>\n"
+                "exp (M1,16) VALS_%=(0,48)<1> VALS_%=(0,48)<1;1,0>\n"
+                "exp (M1,16) VALS_%=(0,64)<1> VALS_%=(0,64)<1;1,0>\n"
+                "exp (M1,16) VALS_%=(0,80)<1> VALS_%=(0,80)<1;1,0>\n"
+                "exp (M1,16) VALS_%=(0,96)<1>  VALS_%=(0,96)<1;1,0>\n"
+                "exp (M1,16) VALS_%=(0,112)<1> VALS_%=(0,112)<1;1,0>\n"
+                "}\n"
+                : "+rw"(v8) : "rw"(scale), "rw"(neg_max)
+            );
         }
 
         // copy16: 8 separate float locals in one asm block + (M1,16) -- correct
         CUTLASS_PRAGMA_UNROLL
         for (int ni = 0; ni < size<1>(s4); ++ni) {
             auto t = s4(_, ni);
-            if constexpr (size<0>(s4) == 8) {
             float v0=t(0), v1=t(1), v2=t(2), v3=t(3),
                   v4=t(4), v5=t(5), v6=t(6), v7=t(7);
             __asm__ volatile (
@@ -245,41 +234,29 @@ struct BugReproKernel {
             );
             t(0)=v0; t(1)=v1; t(2)=v2; t(3)=v3;
             t(4)=v4; t(5)=v5; t(6)=v6; t(7)=v7;
-            } else {
-                // size<0>!=8: not applicable, use c_ref result
-                auto t2 = s2(_, ni);
-                CUTLASS_PRAGMA_UNROLL
-                for (int mi = 0; mi < size<0>(s4); ++mi) t(mi) = t2(mi);
-            }
         }
 
-        // recast32: recast_ptr<intel::float8> alias + (M1,32) -- WRONG on headdim=192/256
+        // recast32: recast_ptr<intel::float8> alias + (M1,32) -- WRONG
         CUTLASS_PRAGMA_UNROLL
         for (int ni = 0; ni < size<1>(s5); ++ni) {
             auto t = s5(_, ni);
-            if constexpr (size<0>(s5) == 8) {
-                intel::float8& v8 = *recast_ptr<intel::float8>(&t(0));
-                __asm__ volatile (
-                    "{\n"
-                    ".decl VALS_%= v_type=G type=F num_elts=128 alias=<%0,0>\n"
-                    ".decl SCALE_%= v_type=G type=F num_elts=16 alias=<%1,0>\n"
-                    ".decl NEG_MAX_%= v_type=G type=F num_elts=16 alias=<%2,0>\n"
-                    "mad (M1,32) VALS_%=(0,0)<1>  VALS_%=(0,0)<1;1,0>  SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
-                    "mad (M1,32) VALS_%=(0,32)<1> VALS_%=(0,32)<1;1,0> SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
-                    "mad (M1,32) VALS_%=(0,64)<1> VALS_%=(0,64)<1;1,0> SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
-                    "mad (M1,32) VALS_%=(0,96)<1> VALS_%=(0,96)<1;1,0> SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
-                    "exp (M1,32) VALS_%=(0,0)<1>  VALS_%=(0,0)<1;1,0>\n"
-                    "exp (M1,32) VALS_%=(0,32)<1> VALS_%=(0,32)<1;1,0>\n"
-                    "exp (M1,32) VALS_%=(0,64)<1> VALS_%=(0,64)<1;1,0>\n"
-                    "exp (M1,32) VALS_%=(0,96)<1> VALS_%=(0,96)<1;1,0>\n"
-                    "}\n"
-                    : "+rw"(v8) : "rw"(scale), "rw"(neg_max)
-                );
-            } else {
-                CUTLASS_PRAGMA_UNROLL
-                for (int mi = 0; mi < size<0>(s5); ++mi)
-                    t(mi) = sycl::exp2(t(mi) * scale + neg_max);
-            }
+            intel::float8& v8 = *recast_ptr<intel::float8>(&t(0));
+            __asm__ volatile (
+                "{\n"
+                ".decl VALS_%= v_type=G type=F num_elts=128 alias=<%0,0>\n"
+                ".decl SCALE_%= v_type=G type=F num_elts=16 alias=<%1,0>\n"
+                ".decl NEG_MAX_%= v_type=G type=F num_elts=16 alias=<%2,0>\n"
+                "mad (M1,32) VALS_%=(0,0)<1>  VALS_%=(0,0)<1;1,0>  SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
+                "mad (M1,32) VALS_%=(0,32)<1> VALS_%=(0,32)<1;1,0> SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
+                "mad (M1,32) VALS_%=(0,64)<1> VALS_%=(0,64)<1;1,0> SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
+                "mad (M1,32) VALS_%=(0,96)<1> VALS_%=(0,96)<1;1,0> SCALE_%=(0,0)<0;1,0> NEG_MAX_%=(0,0)<1;1,0>\n"
+                "exp (M1,32) VALS_%=(0,0)<1>  VALS_%=(0,0)<1;1,0>\n"
+                "exp (M1,32) VALS_%=(0,32)<1> VALS_%=(0,32)<1;1,0>\n"
+                "exp (M1,32) VALS_%=(0,64)<1> VALS_%=(0,64)<1;1,0>\n"
+                "exp (M1,32) VALS_%=(0,96)<1> VALS_%=(0,96)<1;1,0>\n"
+                "}\n"
+                : "+rw"(v8) : "rw"(scale), "rw"(neg_max)
+            );
         }
 
         const int elts = size(s0);
@@ -333,44 +310,44 @@ void run_test(sycl::queue& q, const char* label) {
                        k);
     }).wait();
 
-    std::vector<float> c_ref_h(total), copy16_h(total), copy32_h(total),
-                       elem16_h(total), recast16_h(total), recast32_h(total);
-    q.memcpy(c_ref_h.data(),    c_ref_d,    total * sizeof(float)).wait();
-    q.memcpy(copy16_h.data(),   copy16_d,   total * sizeof(float)).wait();
+    std::vector<float> copy32_h(total), elem16_h(total), c_ref_h(total),
+                       recast16_h(total), copy16_h(total), recast32_h(total);
     q.memcpy(copy32_h.data(),   copy32_d,   total * sizeof(float)).wait();
     q.memcpy(elem16_h.data(),   elem16_d,   total * sizeof(float)).wait();
+    q.memcpy(c_ref_h.data(),    c_ref_d,    total * sizeof(float)).wait();
     q.memcpy(recast16_h.data(), recast16_d, total * sizeof(float)).wait();
+    q.memcpy(copy16_h.data(),   copy16_d,   total * sizeof(float)).wait();
     q.memcpy(recast32_h.data(), recast32_d, total * sizeof(float)).wait();
 
-    int mm_copy16=0, mm_copy32=0, mm_elem16=0, mm_r16=0, mm_r32=0;
+    int mm_copy32=0, mm_elem16=0, mm_r16=0, mm_copy16=0, mm_r32=0;
     for (int i = 0; i < total; ++i) {
         float ref = c_ref_h[i];
         auto bad = [&](float v){ return std::abs(v-ref)/(std::abs(ref)+1e-8f) > 0.01f; };
-        if (bad(copy16_h[i]))   ++mm_copy16;
         if (bad(copy32_h[i]))   ++mm_copy32;
         if (bad(elem16_h[i]))   ++mm_elem16;
         if (bad(recast16_h[i])) ++mm_r16;
+        if (bad(copy16_h[i]))   ++mm_copy16;
         if (bad(recast32_h[i])) ++mm_r32;
     }
 
     printf("\n%s\n", label);
-    printf("  copy16   (8 separate locals, M1,16 in one asm block): %d/%d mismatches\n", mm_copy16,  total);
     printf("  copy32   (float8 init copy, M1,32):                   %d/%d mismatches\n", mm_copy32,  total);
     printf("  elem16   (per-element local, M1,16):                  %d/%d mismatches\n", mm_elem16,  total);
     printf("  recast16 (recast_ptr<float8> alias, M1,16):           %d/%d mismatches\n", mm_r16,     total);
+    printf("  copy16   (8 separate locals, M1,16 in one asm block): %d/%d mismatches\n", mm_copy16,  total);
     printf("  recast32 (recast_ptr<float8> alias, M1,32):           %d/%d mismatches\n", mm_r32,     total);
 
-    printf("  idx  %-12s %-12s %-12s %-12s %-12s %-12s\n", "c_ref","copy16","copy32","elem16","recast16","recast32");
+    printf("  idx  %-12s %-12s %-12s %-12s %-12s\n", "c_ref","copy32","recast16","copy16","recast32");
     for (int i = 0; i < 8; ++i) {
         auto flag = [&](float v){ return std::abs(v-c_ref_h[i])/(std::abs(c_ref_h[i])+1e-8f)>0.01f ? "✗":"✓"; };
-        printf("  %3d  %-12g %-12g %-12g %-12g %-12g %-12g  %s%s%s%s%s\n", i,
-               c_ref_h[i], copy16_h[i], copy32_h[i], elem16_h[i], recast16_h[i], recast32_h[i],
-               flag(copy16_h[i]), flag(copy32_h[i]), flag(elem16_h[i]), flag(recast16_h[i]), flag(recast32_h[i]));
+        printf("  %3d  %-12g %-12g %-12g %-12g %-12g  %s%s%s%s\n", i,
+               c_ref_h[i], copy32_h[i], recast16_h[i], copy16_h[i], recast32_h[i],
+               flag(copy32_h[i]), flag(recast16_h[i]), flag(copy16_h[i]), flag(recast32_h[i]));
     }
 
     sycl::free(Kt_d, q); sycl::free(Q_d, q);
-    sycl::free(c_ref_d, q); sycl::free(copy16_d, q); sycl::free(copy32_d, q);
-    sycl::free(elem16_d, q); sycl::free(recast16_d, q); sycl::free(recast32_d, q);
+    sycl::free(copy32_d, q); sycl::free(elem16_d, q); sycl::free(c_ref_d, q);
+    sycl::free(recast16_d, q); sycl::free(copy16_d, q); sycl::free(recast32_d, q);
 }
 
 int main() {
@@ -378,7 +355,6 @@ int main() {
     printf("Device: %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
     printf("Driver: %s\n", q.get_device().get_info<sycl::info::device::driver_version>().c_str());
 
-    run_test<Trait128>(q, "headdim=128, scores=(Int<8>,Int<8>), ScaleExpHelper<Int<8>>");
     run_test<Trait192>(q, "headdim=192, scores=(Int<8>,Int<2>), ScaleExpHelper<Int<8>>");
     run_test<Trait256>(q, "headdim=256, scores=(Int<8>,Int<2>), ScaleExpHelper<Int<8>>");
 
