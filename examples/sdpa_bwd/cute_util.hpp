@@ -5,19 +5,24 @@ template<typename T>
 struct ScaleExpHelper {
     template<class Engine0, class Layout0>
     static CUTLASS_DEVICE void apply(
-        Tensor<Engine0, Layout0> &tensor, int ni, float scale, float neg_max_scaled) {
+        Tensor<Engine0, Layout0> &tensor, float scale, float neg_max_scaled) {
         // Generic implementation using loop
         static constexpr int M = T::value;
         CUTLASS_PRAGMA_UNROLL
         for (int mi = 0; mi < M; ++mi) {
-            float val = tensor(mi, ni);
+            float val = tensor(mi);
             __asm__ volatile (
-                "mad (M1, 16) %0(0,0)<1> %1(0,0)<1;1,0> %2(0,0)<0;1,0> %3(0,0)<1;1,0>\n\t"
-                "exp (M1, 16) %0(0,0)<1> %0(0,0)<1;1,0>"
-                : "=rw"(val)
-                : "0"(val), "rw"(scale), "rw"(neg_max_scaled)
+                "{\n"
+                ".decl VAL v_type=G type=F num_elts=16 alias=<%0,0>\n"
+                ".decl SCALE v_type=G type=F num_elts=16 alias=<%1,0>\n"
+                ".decl NEG_MAX v_type=G type=F num_elts=16 alias=<%2,0>\n"
+                "mad (M1, 16) VAL(0,0)<1> VAL(0,0)<1;1,0> SCALE(0,0)<0;1,0> NEG_MAX(0,0)<1;1,0>\n"
+                "exp (M1, 16) VAL(0,0)<1> VAL(0,0)<1;1,0>\n"
+                "}\n"
+                : "+rw"(val)
+                : "rw"(scale), "rw"(neg_max_scaled)
             );
-            tensor(mi, ni) = val;
+            tensor(mi) = val;
         }
     }
 };
@@ -26,15 +31,19 @@ template<>
 struct ScaleExpHelper<Int<1>> {
     template<class Engine0, class Layout0>
     static CUTLASS_DEVICE void apply(
-        Tensor<Engine0, Layout0> &tensor, int ni, float scale, float neg_max_scaled) {
-        float val = tensor(0, ni);
+        Tensor<Engine0, Layout0> &tensor, float scale, float neg_max_scaled) {
+        float& val = *recast_ptr<float>(&tensor(0));
         __asm__ volatile (
-            "mad (M1, 16) %0(0,0)<1> %1(0,0)<1;1,0> %2(0,0)<0;1,0> %3(0,0)<1;1,0>\n\t"
-            "exp (M1, 16) %0(0,0)<1> %0(0,0)<1;1,0>"
-            : "=rw"(val)
-            : "0"(val), "rw"(scale), "rw"(neg_max_scaled)
+            "{\n"
+            ".decl VAL v_type=G type=F num_elts=16 alias=<%0,0>\n"
+            ".decl SCALE v_type=G type=F num_elts=16 alias=<%1,0>\n"
+            ".decl NEG_MAX v_type=G type=F num_elts=16 alias=<%2,0>\n"
+            "mad (M1, 16) VAL(0,0)<1> VAL(0,0)<1;1,0> SCALE(0,0)<0;1,0> NEG_MAX(0,0)<1;1,0>\n"
+            "exp (M1, 16) VAL(0,0)<1> VAL(0,0)<1;1,0>\n"
+            "}\n"
+            : "+rw"(val)
+            : "rw"(scale), "rw"(neg_max_scaled)
         );
-        tensor(0, ni) = val;
     }
 };
 
@@ -42,19 +51,21 @@ template<>
 struct ScaleExpHelper<Int<2>> {
     template<class Engine0, class Layout0>
     static CUTLASS_DEVICE void apply(
-        Tensor<Engine0, Layout0> &tensor, int ni, float scale, float neg_max_scaled) {
-        float val0 = tensor(0, ni);
-        float val1 = tensor(1, ni);
+        Tensor<Engine0, Layout0> &tensor, float scale, float neg_max_scaled) {
+        intel::float2& vals = *recast_ptr<intel::float2>(&tensor(0));
         __asm__ volatile (
-            "mad (M1, 16) %0(0,0)<1> %2(0,0)<1;1,0> %4(0,0)<0;1,0> %5(0,0)<1;1,0>\n\t"
-            "mad (M1, 16) %1(0,0)<1> %3(0,0)<1;1,0> %4(0,0)<0;1,0> %5(0,0)<1;1,0>\n\t"
-            "exp (M1, 16) %0(0,0)<1> %0(0,0)<1;1,0>\n\t"
-            "exp (M1, 16) %1(0,0)<1> %1(0,0)<1;1,0>"
-            : "=rw"(val0), "=rw"(val1)
-            : "0"(val0), "1"(val1), "rw"(scale), "rw"(neg_max_scaled)
+            "{\n"
+            ".decl VALS v_type=G type=F num_elts=32 alias=<%0,0>\n"
+            ".decl SCALE v_type=G type=F num_elts=16 alias=<%1,0>\n"
+            ".decl NEG_MAX v_type=G type=F num_elts=16 alias=<%2,0>\n"
+            "mad (M1, 16) VALS(0,0)<1>  VALS(0,0)<1;1,0>  SCALE(0,0)<0;1,0> NEG_MAX(0,0)<1;1,0>\n"
+            "mad (M1, 16) VALS(0,16)<1> VALS(0,16)<1;1,0> SCALE(0,0)<0;1,0> NEG_MAX(0,0)<1;1,0>\n"
+            "exp (M1, 16) VALS(0,0)<1>  VALS(0,0)<1;1,0>\n"
+            "exp (M1, 16) VALS(0,16)<1> VALS(0,16)<1;1,0>\n"
+            "}\n"
+            : "+rw"(vals)
+            : "rw"(scale), "rw"(neg_max_scaled)
         );
-        tensor(0, ni) = val0;
-        tensor(1, ni) = val1;
     }
 };
 
@@ -62,27 +73,25 @@ template<>
 struct ScaleExpHelper<Int<4>> {
     template<class Engine0, class Layout0>
     static CUTLASS_DEVICE void apply(
-        Tensor<Engine0, Layout0> &tensor, int ni, float scale, float neg_max_scaled) {
-    float val0 = tensor(0, ni);
-    float val1 = tensor(1, ni);
-    float val2 = tensor(2, ni);
-    float val3 = tensor(3, ni);
-    __asm__ volatile (
-        "mad (M1, 16) %0(0,0)<1> %4(0,0)<1;1,0> %8(0,0)<0;1,0> %9(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %1(0,0)<1> %5(0,0)<1;1,0> %8(0,0)<0;1,0> %9(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %2(0,0)<1> %6(0,0)<1;1,0> %8(0,0)<0;1,0> %9(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %3(0,0)<1> %7(0,0)<1;1,0> %8(0,0)<0;1,0> %9(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %0(0,0)<1> %0(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %1(0,0)<1> %1(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %2(0,0)<1> %2(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %3(0,0)<1> %3(0,0)<1;1,0>"
-        : "=rw"(val0), "=rw"(val1), "=rw"(val2), "=rw"(val3)
-        : "0"(val0), "1"(val1), "2"(val2), "3"(val3), "rw"(scale), "rw"(neg_max_scaled)
-    );
-    tensor(0, ni) = val0;
-    tensor(1, ni) = val1;
-    tensor(2, ni) = val2;
-    tensor(3, ni) = val3;
+        Tensor<Engine0, Layout0> &tensor, float scale, float neg_max_scaled) {
+        intel::float4& vals = *recast_ptr<intel::float4>(&tensor(0));
+        __asm__ volatile (
+            "{\n"
+            ".decl VALS v_type=G type=F num_elts=64 alias=<%0,0>\n"
+            ".decl SCALE v_type=G type=F num_elts=16 alias=<%1,0>\n"
+            ".decl NEG_MAX v_type=G type=F num_elts=16 alias=<%2,0>\n"
+            "mad (M1, 16) VALS(0,0)<1>  VALS(0,0)<1;1,0>  SCALE(0,0)<0;1,0> NEG_MAX(0,0)<1;1,0>\n"
+            "mad (M1, 16) VALS(0,16)<1> VALS(0,16)<1;1,0> SCALE(0,0)<0;1,0> NEG_MAX(0,0)<1;1,0>\n"
+            "mad (M1, 16) VALS(0,32)<1> VALS(0,32)<1;1,0> SCALE(0,0)<0;1,0> NEG_MAX(0,0)<1;1,0>\n"
+            "mad (M1, 16) VALS(0,48)<1> VALS(0,48)<1;1,0> SCALE(0,0)<0;1,0> NEG_MAX(0,0)<1;1,0>\n"
+            "exp (M1, 16) VALS(0,0)<1>  VALS(0,0)<1;1,0>\n"
+            "exp (M1, 16) VALS(0,16)<1> VALS(0,16)<1;1,0>\n"
+            "exp (M1, 16) VALS(0,32)<1> VALS(0,32)<1;1,0>\n"
+            "exp (M1, 16) VALS(0,48)<1> VALS(0,48)<1;1,0>\n"
+            "}\n"
+            : "+rw"(vals)
+            : "rw"(scale), "rw"(neg_max_scaled)
+        );
     }
 };
 
@@ -90,46 +99,25 @@ template<>
 struct ScaleExpHelper<Int<8>> {
     template<class Engine0, class Layout0>
     static CUTLASS_DEVICE void apply(
-        Tensor<Engine0, Layout0> &tensor, int ni, float scale, float neg_max_scaled) {
-    float val0 = tensor(0, ni);
-    float val1 = tensor(1, ni);
-    float val2 = tensor(2, ni);
-    float val3 = tensor(3, ni);
-    float val4 = tensor(4, ni);
-    float val5 = tensor(5, ni);
-    float val6 = tensor(6, ni);
-    float val7 = tensor(7, ni);
-    __asm__ volatile (
-        "mad (M1, 16) %0(0,0)<1> %8(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %1(0,0)<1> %9(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %2(0,0)<1> %10(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %3(0,0)<1> %11(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %4(0,0)<1> %12(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %5(0,0)<1> %13(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %6(0,0)<1> %14(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %7(0,0)<1> %15(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %0(0,0)<1> %0(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %1(0,0)<1> %1(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %2(0,0)<1> %2(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %3(0,0)<1> %3(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %4(0,0)<1> %4(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %5(0,0)<1> %5(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %6(0,0)<1> %6(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %7(0,0)<1> %7(0,0)<1;1,0>"
-        : "=rw"(val0), "=rw"(val1), "=rw"(val2), "=rw"(val3),
-          "=rw"(val4), "=rw"(val5), "=rw"(val6), "=rw"(val7)
-        : "0"(val0), "1"(val1), "2"(val2), "3"(val3),
-          "4"(val4), "5"(val5), "6"(val6), "7"(val7),
-          "rw"(scale), "rw"(neg_max_scaled)
-    );
-    tensor(0, ni) = val0;
-    tensor(1, ni) = val1;
-    tensor(2, ni) = val2;
-    tensor(3, ni) = val3;
-    tensor(4, ni) = val4;
-    tensor(5, ni) = val5;
-    tensor(6, ni) = val6;
-    tensor(7, ni) = val7;
+        Tensor<Engine0, Layout0> &tensor, float scale, float neg_max_scaled) {
+        // Process 8 elements one at a time to avoid GRF aliasing issues
+        // This is safer than the float8 approach which can fail for certain tensor layouts
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < 8; ++i) {
+            float val = tensor(i);
+            __asm__ volatile (
+                "{\n"
+                ".decl VAL v_type=G type=F num_elts=16 alias=<%0,0>\n"
+                ".decl SCALE v_type=G type=F num_elts=16 alias=<%1,0>\n"
+                ".decl NEG_MAX v_type=G type=F num_elts=16 alias=<%2,0>\n"
+                "mad (M1, 16) VAL(0,0)<1> VAL(0,0)<1;1,0> SCALE(0,0)<0;1,0> NEG_MAX(0,0)<1;1,0>\n"
+                "exp (M1, 16) VAL(0,0)<1> VAL(0,0)<1;1,0>\n"
+                "}\n"
+                : "+rw"(val)
+                : "rw"(scale), "rw"(neg_max_scaled)
+            );
+            tensor(i) = val;
+        }
     }
 };
 
@@ -137,170 +125,42 @@ template<>
 struct ScaleExpHelper<Int<32>> {
     template<class Engine0, class Layout0>
     static CUTLASS_DEVICE void apply(
-        Tensor<Engine0, Layout0> &tensor, int ni, float scale, float neg_max_scaled) {
-    // Unrolled 4x8 processing - group 0
-    float val0 = tensor(0, ni);
-    float val1 = tensor(1, ni);
-    float val2 = tensor(2, ni);
-    float val3 = tensor(3, ni);
-    float val4 = tensor(4, ni);
-    float val5 = tensor(5, ni);
-    float val6 = tensor(6, ni);
-    float val7 = tensor(7, ni);
-    __asm__ volatile (
-        "mad (M1, 16) %0(0,0)<1> %8(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %1(0,0)<1> %9(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %2(0,0)<1> %10(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %3(0,0)<1> %11(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %4(0,0)<1> %12(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %5(0,0)<1> %13(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %6(0,0)<1> %14(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %7(0,0)<1> %15(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %0(0,0)<1> %0(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %1(0,0)<1> %1(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %2(0,0)<1> %2(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %3(0,0)<1> %3(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %4(0,0)<1> %4(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %5(0,0)<1> %5(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %6(0,0)<1> %6(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %7(0,0)<1> %7(0,0)<1;1,0>"
-        : "=rw"(val0), "=rw"(val1), "=rw"(val2), "=rw"(val3),
-          "=rw"(val4), "=rw"(val5), "=rw"(val6), "=rw"(val7)
-        : "0"(val0), "1"(val1), "2"(val2), "3"(val3),
-          "4"(val4), "5"(val5), "6"(val6), "7"(val7),
-          "rw"(scale), "rw"(neg_max_scaled)
-    );
-    tensor(0, ni) = val0;
-    tensor(1, ni) = val1;
-    tensor(2, ni) = val2;
-    tensor(3, ni) = val3;
-    tensor(4, ni) = val4;
-    tensor(5, ni) = val5;
-    tensor(6, ni) = val6;
-    tensor(7, ni) = val7;
-
-    // Unrolled 4x8 processing - group 1
-    val0 = tensor(8, ni);
-    val1 = tensor(9, ni);
-    val2 = tensor(10, ni);
-    val3 = tensor(11, ni);
-    val4 = tensor(12, ni);
-    val5 = tensor(13, ni);
-    val6 = tensor(14, ni);
-    val7 = tensor(15, ni);
-    __asm__ volatile (
-        "mad (M1, 16) %0(0,0)<1> %8(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %1(0,0)<1> %9(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %2(0,0)<1> %10(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %3(0,0)<1> %11(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %4(0,0)<1> %12(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %5(0,0)<1> %13(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %6(0,0)<1> %14(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %7(0,0)<1> %15(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %0(0,0)<1> %0(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %1(0,0)<1> %1(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %2(0,0)<1> %2(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %3(0,0)<1> %3(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %4(0,0)<1> %4(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %5(0,0)<1> %5(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %6(0,0)<1> %6(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %7(0,0)<1> %7(0,0)<1;1,0>"
-        : "=rw"(val0), "=rw"(val1), "=rw"(val2), "=rw"(val3),
-          "=rw"(val4), "=rw"(val5), "=rw"(val6), "=rw"(val7)
-        : "0"(val0), "1"(val1), "2"(val2), "3"(val3),
-          "4"(val4), "5"(val5), "6"(val6), "7"(val7),
-          "rw"(scale), "rw"(neg_max_scaled)
-    );
-    tensor(8, ni) = val0;
-    tensor(9, ni) = val1;
-    tensor(10, ni) = val2;
-    tensor(11, ni) = val3;
-    tensor(12, ni) = val4;
-    tensor(13, ni) = val5;
-    tensor(14, ni) = val6;
-    tensor(15, ni) = val7;
-
-    // Unrolled 4x8 processing - group 2
-    val0 = tensor(16, ni);
-    val1 = tensor(17, ni);
-    val2 = tensor(18, ni);
-    val3 = tensor(19, ni);
-    val4 = tensor(20, ni);
-    val5 = tensor(21, ni);
-    val6 = tensor(22, ni);
-    val7 = tensor(23, ni);
-    __asm__ volatile (
-        "mad (M1, 16) %0(0,0)<1> %8(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %1(0,0)<1> %9(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %2(0,0)<1> %10(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %3(0,0)<1> %11(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %4(0,0)<1> %12(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %5(0,0)<1> %13(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %6(0,0)<1> %14(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %7(0,0)<1> %15(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %0(0,0)<1> %0(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %1(0,0)<1> %1(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %2(0,0)<1> %2(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %3(0,0)<1> %3(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %4(0,0)<1> %4(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %5(0,0)<1> %5(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %6(0,0)<1> %6(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %7(0,0)<1> %7(0,0)<1;1,0>"
-        : "=rw"(val0), "=rw"(val1), "=rw"(val2), "=rw"(val3),
-          "=rw"(val4), "=rw"(val5), "=rw"(val6), "=rw"(val7)
-        : "0"(val0), "1"(val1), "2"(val2), "3"(val3),
-          "4"(val4), "5"(val5), "6"(val6), "7"(val7),
-          "rw"(scale), "rw"(neg_max_scaled)
-    );
-    tensor(16, ni) = val0;
-    tensor(17, ni) = val1;
-    tensor(18, ni) = val2;
-    tensor(19, ni) = val3;
-    tensor(20, ni) = val4;
-    tensor(21, ni) = val5;
-    tensor(22, ni) = val6;
-    tensor(23, ni) = val7;
-
-    // Unrolled 4x8 processing - group 3
-    val0 = tensor(24, ni);
-    val1 = tensor(25, ni);
-    val2 = tensor(26, ni);
-    val3 = tensor(27, ni);
-    val4 = tensor(28, ni);
-    val5 = tensor(29, ni);
-    val6 = tensor(30, ni);
-    val7 = tensor(31, ni);
-    __asm__ volatile (
-        "mad (M1, 16) %0(0,0)<1> %8(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %1(0,0)<1> %9(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %2(0,0)<1> %10(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %3(0,0)<1> %11(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %4(0,0)<1> %12(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %5(0,0)<1> %13(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %6(0,0)<1> %14(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "mad (M1, 16) %7(0,0)<1> %15(0,0)<1;1,0> %16(0,0)<0;1,0> %17(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %0(0,0)<1> %0(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %1(0,0)<1> %1(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %2(0,0)<1> %2(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %3(0,0)<1> %3(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %4(0,0)<1> %4(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %5(0,0)<1> %5(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %6(0,0)<1> %6(0,0)<1;1,0>\n\t"
-        "exp (M1, 16) %7(0,0)<1> %7(0,0)<1;1,0>"
-        : "=rw"(val0), "=rw"(val1), "=rw"(val2), "=rw"(val3),
-          "=rw"(val4), "=rw"(val5), "=rw"(val6), "=rw"(val7)
-        : "0"(val0), "1"(val1), "2"(val2), "3"(val3),
-          "4"(val4), "5"(val5), "6"(val6), "7"(val7),
-          "rw"(scale), "rw"(neg_max_scaled)
-    );
-    tensor(24, ni) = val0;
-    tensor(25, ni) = val1;
-    tensor(26, ni) = val2;
-    tensor(27, ni) = val3;
-    tensor(28, ni) = val4;
-    tensor(29, ni) = val5;
-    tensor(30, ni) = val6;
-    tensor(31, ni) = val7;
+        Tensor<Engine0, Layout0> &tensor, float scale, float neg_max_scaled) {
+        // Tensor layout is ((_8,_4)):((_1,_8)) meaning:
+        // - Elements 0-7 are contiguous (stride=1)
+        // - Elements 8-15 start at offset 8 (stride=1 within group)
+        // - Elements 16-23 start at offset 16, etc.
+        // So we can directly recast each group of 8 consecutive elements to intel::float8
+        #pragma unroll
+        for (int group = 0; group < 4; group++) {
+            int offset = group * 8;
+            intel::float8& vals = *recast_ptr<intel::float8>(&tensor(offset));
+            __asm__ volatile (
+                "{\n"
+                ".decl VALS v_type=G type=F num_elts=128 alias=<%0,0>\n"
+                ".decl SCALE v_type=G type=F num_elts=16 alias=<%1,0>\n"
+                ".decl NEG_MAX v_type=G type=F num_elts=16 alias=<%2,0>\n"
+                "mad (M1, 16) VALS(0,0)<1>   VALS(0,0)<1;1,0>   SCALE(0,0)<0;1,0> NEG_MAX(0,0)<1;1,0>\n"
+                "mad (M1, 16) VALS(0,16)<1>  VALS(0,16)<1;1,0>  SCALE(0,0)<0;1,0> NEG_MAX(0,0)<1;1,0>\n"
+                "mad (M1, 16) VALS(0,32)<1>  VALS(0,32)<1;1,0>  SCALE(0,0)<0;1,0> NEG_MAX(0,0)<1;1,0>\n"
+                "mad (M1, 16) VALS(0,48)<1>  VALS(0,48)<1;1,0>  SCALE(0,0)<0;1,0> NEG_MAX(0,0)<1;1,0>\n"
+                "mad (M1, 16) VALS(0,64)<1>  VALS(0,64)<1;1,0>  SCALE(0,0)<0;1,0> NEG_MAX(0,0)<1;1,0>\n"
+                "mad (M1, 16) VALS(0,80)<1>  VALS(0,80)<1;1,0>  SCALE(0,0)<0;1,0> NEG_MAX(0,0)<1;1,0>\n"
+                "mad (M1, 16) VALS(0,96)<1>  VALS(0,96)<1;1,0>  SCALE(0,0)<0;1,0> NEG_MAX(0,0)<1;1,0>\n"
+                "mad (M1, 16) VALS(0,112)<1> VALS(0,112)<1;1,0> SCALE(0,0)<0;1,0> NEG_MAX(0,0)<1;1,0>\n"
+                "exp (M1, 16) VALS(0,0)<1>   VALS(0,0)<1;1,0>\n"
+                "exp (M1, 16) VALS(0,16)<1>  VALS(0,16)<1;1,0>\n"
+                "exp (M1, 16) VALS(0,32)<1>  VALS(0,32)<1;1,0>\n"
+                "exp (M1, 16) VALS(0,48)<1>  VALS(0,48)<1;1,0>\n"
+                "exp (M1, 16) VALS(0,64)<1>  VALS(0,64)<1;1,0>\n"
+                "exp (M1, 16) VALS(0,80)<1>  VALS(0,80)<1;1,0>\n"
+                "exp (M1, 16) VALS(0,96)<1>  VALS(0,96)<1;1,0>\n"
+                "exp (M1, 16) VALS(0,112)<1> VALS(0,112)<1;1,0>\n"
+                "}\n"
+                : "+rw"(vals)
+                : "rw"(scale), "rw"(neg_max_scaled)
+            );
+        }
     }
 };
 #endif // end of __SYCL_DEVICE_ONLY__

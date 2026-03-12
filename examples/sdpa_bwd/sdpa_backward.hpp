@@ -328,15 +328,29 @@ scale_apply_exp2(Tensor<Engine0, Layout0> &tensor,
         rC.data(),
         convert_layout_2d_layout(rC.layout()));
     if constexpr(Is_even_M) {
+#if defined(__SYCL_DEVICE_ONLY__)
         CUTLASS_PRAGMA_UNROLL
         for (int ni = 0; ni < size<1>(tensor); ++ni)  {
             int n = get<1>(rC_2d(0, ni)) + sg_local_id;
             const float max_scaled = max(n) == -INFINITY ? 0.f : max(n) * M_LOG2E;
+            const float neg_max_scaled = -max_scaled;
+            auto t = tensor(_, ni);
+            ScaleExpHelper<decltype(size<0>(tensor))>::apply(t, scale, neg_max_scaled);
+        }
+#else
+        // Fallback for sycl
+        CUTLASS_PRAGMA_UNROLL
+        for (int ni = 0; ni < size<1>(tensor); ++ni)  {
+            int n = get<1>(rC_2d(0, ni));
+            const float max_scaled = max(n) == -INFINITY ? 0.f : max(n) * M_LOG2E;
+            const float neg_max_scaled = -max_scaled;
+            auto t = tensor(_, ni);
             CUTLASS_PRAGMA_UNROLL
             for (int mi = 0; mi < size<0>(tensor); ++mi) {
                 tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
             }
         }
+#endif
     } else {
         CUTLASS_PRAGMA_UNROLL
         for (int ni = 0; ni < size<1>(tensor); ++ni)  {
@@ -627,8 +641,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                                    param.scale_softmax_log2);
         } else {
             scale_apply_exp2<false>(scores, mLSE, taccScS_rt,
-                                    param.scale_softmax_log2,
-                                    tail_m);
+                                    param.scale_softmax_log2, tail_m);
         }
         auto rdP = create_reg<V>(trait,
                                  mdPt,
