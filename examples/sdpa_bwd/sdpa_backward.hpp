@@ -421,6 +421,35 @@ gemm_dQ(Trait &trait,
     }
 }
 
+template<class Trait,
+         class Engine0, class Layout0,
+         class Engine1, class Layout1,
+         class Engine2, class Layout2,
+         class Engine3, class Layout3,
+         class TiledMMA>
+void
+gemm_dQ_slmA(Trait &trait,
+             Tensor<Engine0, Layout0> const& A,         // shape-only gmem ref (M,K)
+             Tensor<Engine1, Layout1>      & sA,        // (M,K)
+             Tensor<Engine2, Layout2> const& B,         // (N,K)
+             Tensor<Engine3, Layout3> const& C,         // (M,N)
+             TiledMMA const & mma) {
+    auto local_id = int(compat::get_nd_item<1>().get_local_id(0));
+    auto tile_mnk = mma.tile_mnk();
+    Tensor cC = make_identity_tensor(C.shape());   // (M,N)
+    Tensor gC = local_tile(cC, select<0, 1>(tile_mnk), make_coord(0, 0));  // (BLK_M,BLK_N)
+    auto thr_mma = mma.get_slice(local_id);
+    auto tCrC = thr_mma.partition_sg_fragment_C(make_identity_tensor(select<0,1>(tile_mnk)));
+    Tensor tCgC = thr_mma.partition_C(gC);
+    gemm_slm_kernel<true>(trait, A, sA, B, tCrC, mma);
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i <  size(tCgC); ++i) {
+        auto [m, n] = tCgC(i);
+        dq_atomic_add(&C(m, n), tCrC(i));
+    }
+}
+
 template<class Trait, class TiledMma,
          class Engine0, class Layout0, class TVLayout0,
          class Engine1, class Layout1>
@@ -641,11 +670,6 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
     const index_t o_offset = bofst.o_offset(bidb, bidh, 0);
     const index_t dq_offset = bofst.dq_offset(bidb, bidh, 0);
     const index_t lse_offset = bofst.lse_offset(bidb, bidh, 0);
-    // buff offset (only dS needs gmem storage; P goes to SLM)
-    const index_t pb_offset = bidb * param.num_head_q * param.seq_len_kv_pad * kBlockM
-                               + bidh * param.seq_len_kv_pad * kBlockM
-                               + n_block * kBlockN * kBlockM;
-    const index_t dsb_offset = pb_offset;
 
     const auto block_n_dim = tail_n == 0 ? Int<kBlockN>{} : ((tail_n + 1) & ~1);
     auto shapeO = make_shape(kBlockM, Int<kHeadDim>{});
@@ -670,7 +694,11 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         shapeKV = make_shape(Int<kHeadDim>{}, tail_n);
     }
 
-    auto smem = compat::local_mem<T[kBlockM * kBlockN]>();
+    // SLM for both P and dS (replaces global pb_ptr for dS)
+    constexpr int slm_tile_size = kBlockM * kBlockN;
+    auto smem = compat::local_mem<T[2 * slm_tile_size]>();
+    T *smem_P  = smem;
+    T *smem_dP = smem + slm_tile_size;
     Tensor mQ = make_tensor(make_gmem_ptr(param.q_ptr + q_offset),
                             make_layout(
                                 shapeQ,
@@ -687,12 +715,11 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                              make_layout(
                                  shapeKtVt,
                                  make_stride(param.v_r_stride, _1{})));
-   // mPt is a shape-only tensor (P is stored in SLM, not gmem)
     Tensor mPt = make_tensor(make_gmem_ptr<T>(nullptr),
                              make_layout(
                                  shapeSPt,
                                  make_stride(Int<kBlockM>{}, _1{})));
-    Tensor sPt = make_tensor(make_smem_ptr(smem),
+    Tensor sPt = make_tensor(make_smem_ptr(smem_P),
                              make_layout(
                                  shapeSPt,
                                  make_stride(Int<kBlockM>{}, _1{})));
@@ -704,7 +731,11 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                             make_layout(
                                 shapeKV,
                                 make_stride(_1{}, param.k_r_stride)));
-    Tensor mdPt = make_tensor(make_gmem_ptr(param.pb_ptr + dsb_offset),
+    Tensor mdPt = make_tensor(make_gmem_ptr<T>(nullptr),
+                              make_layout(
+                                  shapeSPt,
+                                  make_stride(Int<kBlockM>{}, _1{})));
+    Tensor sdPt = make_tensor(make_smem_ptr(smem_dP),
                               make_layout(
                                   shapeSPt,
                                   make_stride(Int<kBlockM>{}, _1{})));
@@ -726,7 +757,11 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                              make_layout(
                                  shapeKtVt,
                                  make_stride(param.dv_r_stride, _1{})));
-    Tensor mdP = make_tensor(make_gmem_ptr(param.pb_ptr + dsb_offset),
+    Tensor mdP = make_tensor(make_gmem_ptr<T>(nullptr),
+                             make_layout(
+                                 shapeSP,
+                                 make_stride(_1{}, Int<kBlockM>{})));
+    Tensor sdP = make_tensor(make_smem_ptr(smem_dP),
                              make_layout(
                                  shapeSP,
                                  make_stride(_1{}, Int<kBlockM>{})));
@@ -748,7 +783,6 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
     Tensor caccSt = make_identity_tensor(Shape<Int<kBlockN>, Int<kBlockM>>{}); // same buffer as accSt
     Tensor taccScSt = thr_mma_sdp.partition_C(caccSt);
     Tensor taccScS_rt = logical_divide(taccScSt, Shape<_1>{});
-// static_assert(size<0>(tSrS) * size<1>(tSrS) == size<0>(lse) && "row of acc and lse not match");
     // misc
 
     const int max_m_block = ceil_div(param.seq_len_q, kBlockM);
@@ -783,11 +817,11 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
                                make_layout(
                                    make_shape(Int<kHeadDim>{}, tail_m),
                                    make_stride(_1{}, param.o_r_stride)));
-            mdPt = make_tensor(make_gmem_ptr(mdPt.data()),
+            mdPt = make_tensor(make_gmem_ptr<T>(nullptr),
                                make_layout(
                                    make_shape(Int<kBlockN>{}, block_m_dim),
                                    make_stride(Int<kBlockM>{}, _1{})));
-            mdP = make_tensor(make_gmem_ptr(mdP.data()),
+            mdP = make_tensor(make_gmem_ptr<T>(nullptr),
                              make_layout(
                                  make_shape(block_m_dim, block_n_dim),
                                  make_stride(_1{}, Int<kBlockM>{})));
@@ -832,15 +866,15 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
             softmax_backward<false>(scores, mdPsum, dS, taccScS_rt, param.scale_softmax, tail_m);
         }
         slm_reorder_save_C(trait, mPt, sPt, rS, tiled_mma_sdp);
-        mha_reorder_copy(trait, tiled_mma_sdp, rdP, mdPt); // copy dP to internal buff
+        slm_reorder_save_C(trait, mdPt, sdPt, rdP, tiled_mma_sdp); // copy dS to SLM
         }
         sycl::group_barrier(group);
         // dV=Pt*dO (A=Pt from SLM)
         gemm_dKV_slmA(trait, mPt, sPt, mdOt, rdV, tiled_mma_dkv);
-        // dK=dPt*Q
-        gemm_dKV(trait, mdPt, mQt, rdK, tiled_mma_dkv);
-        // dQ=dP*K
-        gemm_dQ(trait, mdP, mK, mdQaccum, tiled_mma_dq);
+        // dK=dSt*Q (A=dSt from SLM)
+        gemm_dKV_slmA(trait, mdPt, sdPt, mQt, rdK, tiled_mma_dkv);
+        // dQ=dS*K (A=dS from SLM, col-major view)
+        gemm_dQ_slmA(trait, mdP, sdP, mK, mdQaccum, tiled_mma_dq);
         // update ptr/atom copy
         mQ.data() = mQ.data() + int(kBlockM * param.q_r_stride);
         mdO.data() = mdO.data() + int(kBlockM * param.o_r_stride);

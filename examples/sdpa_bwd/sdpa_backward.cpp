@@ -36,9 +36,8 @@ void launch_mha_backward_headdim(ProblemShape problem_shape,
     const int tail_n = SEQ_LEN_KV % kBlockN;
     const int M_BLOCK = ceil_div(SEQ_LEN_Q, kBlockM);
     const int tail_m = SEQ_LEN_Q % kBlockM;
-    T * pbuff = compat::malloc<T>(BATCH * NUM_HEAD_Q * seq_len_kv_pad * kBlockM);
     auto param = Param<T>(do_d, o_d, q_d, k_d, v_d, lse_d, odo_d,
-                          dqaccum_d, dq_d, dk_d, dv_d, pbuff,
+                          dqaccum_d, dq_d, dk_d, dv_d, nullptr,
                           1 / sqrt(static_cast<float>(kHeadDim)));
     param.batch = BATCH;
     param.num_head_q = NUM_HEAD_Q;
