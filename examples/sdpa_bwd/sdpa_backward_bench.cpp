@@ -222,12 +222,12 @@ launch_mha_backward(ProblemShape problem_shape,
                                         s_d, dp_d,
                                         seq_len_q_pad, seq_len_kv_pad, count);
     } else if (headdim == 128) {
-        constexpr int kBlockM = 64;
-        constexpr int kBlockN = 64;
+        constexpr int kBlockM = 128;
+        constexpr int kBlockN = 128;
         constexpr int kHeadDim = 128;
-        constexpr int kNSGs = 8;
-        constexpr int AtomLayoutMSdP = 2;
-        constexpr int AtomLayoutNdKV = 2;
+        constexpr int kNSGs = 32;
+        constexpr int AtomLayoutMSdP = 4;
+        constexpr int AtomLayoutNdKV = 4;
         constexpr int AtomLayoutMdQ = 4;
         static_assert(kBlockM <=  kMPad, "kBlockM must be less than or equal to kMPad");
         static_assert(kBlockN <=  kNPad, "kBlockN must be less than or equal to kNPad");
