@@ -417,9 +417,10 @@ template<class Tensor0, class Tensor1, class Tensor2>
 CUTLASS_DEVICE void softmax_backward(Tensor0 &P, Tensor1 &dP_sum, Tensor2 &dP, const float scale) {
     CUTLASS_PRAGMA_UNROLL
     for (int mi = 0; mi < size<0>(dP); ++mi) {
+        const float neg_dpsum_scaled = -(dP_sum(mi) * scale);
         CUTLASS_PRAGMA_UNROLL
         for (int mj = 0; mj < size<1>(dP); ++mj) {
-            dP(mi, mj) = P(mi, mj) * (dP(mi, mj) - dP_sum(mi)) * scale;
+            dP(mi, mj) = P(mi, mj) * fmaf(dP(mi, mj), scale, neg_dpsum_scaled);
         }
     }
 }
@@ -705,8 +706,9 @@ mha_backward_seq(T trait,
     const int bidb = BlockIdxZ();
     const int bidhq = BlockIdxY();
     const int bidhkv = bidhq / param.num_qh_per_kvh;
+    const int bidnblk = BLockIdxX();
     // const int max_n_block = ceil_div(param.seq_len_kv, trait.kBlockN);
-    for (int n_block = 0; n_block < param.n_block; ++n_block)
+    for (int n_block = bidnblk; n_block < param.n_block; n_block += GridDimX())
         if (param.tail_n > 0 and n_block == param.n_block - 1)
             dq_dk_dv_1colblock<false, false>(trait, param, bidb, bidhq, bidhkv, param.n_block - 1, param.tail_n);
         else
