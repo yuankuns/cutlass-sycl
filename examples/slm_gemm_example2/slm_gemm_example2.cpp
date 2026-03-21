@@ -201,50 +201,96 @@ gemm_kernel(Trait &trait,
 }
 
 // ============================================================
-// slm_reorder_save: f32 acc -> f16 via CuTe reorder, save to SLM.
-//   SLM layout: S[kBlockN, kBlockM] non-transposed, kBlockM contiguous.
-//   Uses partition_D coords (per-subgroup base) + sg_lane.
-//   addr(m, n+sg_lane) = slm_offset + m * kBlockM * 2 + (n+sg_lane) * 2
+// slm_reorder_save: M-packed VNNI scatter store to SLM.
+//   SLM layout: M-packed VNNI uint32[kBlockN][kBlockM/2].
+//   Each row = one N-value's M-packed VNNI data.
+//   VNNI pair j for N-row n: {S[n, m_2j], S[n, m_2j+1]} as two fp16.
+//   row_stride = (kBlockM/2) * 4 bytes.
+//
+//   Works directly on f32 accumulator r (no CuTe reorder).
+//   Process 2 N-rows per iteration: f32→f16 of 2 GRFs into 1 GRF.
+//   In the resulting d32 SIMD16 view:
+//     Lanes 0-7:  {S[row_even, col_2l], S[row_even, col_2l+1]}
+//     Lanes 8-15: {S[row_odd,  col_2(l-8)], S[row_odd, col_2(l-8)+1]}
+//   d32 scatter store to M-packed VNNI positions.
+//   SubtileM/2 = 8 iterations per col-group × 2 col-groups = 16 d32 stores.
 // ============================================================
 template<class Trait,
          class Engine0, class Layout0,
-         class Engine1, class Layout1,
          class Engine2, class Layout2, class TVLayout2,
          class TiledMMA>
 void
 slm_reorder_save(Trait &trait,
                  Tensor<Engine0, Layout0> &mC,
-                 Tensor<Engine1, Layout1> &sC,
+                 uint32_t slm_offset,
                  SubgroupTensor<Engine2, Layout2, TVLayout2> &r,
                  TiledMMA const &tiled_mma) {
     using T = typename Trait::DType;
 
-    auto r16 = create_reg<T>(trait, mC, tiled_mma);
-    reorder(r, r16);
+#ifdef __SYCL_DEVICE_ONLY__
+    static_assert(sizeof(T) == 2, "Expected fp16/bf16");
+    constexpr int kBlockN  = Trait::kBlockN;
+    constexpr int kBlockM  = Trait::kBlockM;
+    constexpr int SubgroupSize = Trait::SubgroupSize;
+    constexpr int AtomLayoutM1 = Trait::AtomLayoutM1;
+    constexpr int SubtileM = kBlockN / AtomLayoutM1;       // 16 N-rows per SG
 
     auto local_id = int(compat::get_nd_item<1>().get_local_id(0));
-    int sg_lane = compat::get_nd_item<1>().get_sub_group().get_local_id();
+    int sg_idx = local_id / SubgroupSize;
+    int lane   = local_id % SubgroupSize;
+    int sg_m   = sg_idx % AtomLayoutM1;
+    int sg_n   = sg_idx / AtomLayoutM1;
 
-    auto copy_c = make_block_2d_copy_D(tiled_mma, mC);
-    auto thr_copy_c = copy_c.get_slice(local_id);
-    auto tile_mnk = tiled_mma.tile_mnk();
-    Tensor cC = make_identity_tensor(mC.shape());
-    Tensor gC = local_tile(cC, select<0, 1>(tile_mnk), make_coord(0, 0));
-    Tensor tCgC = thr_copy_c.partition_D(gC);
+    // M-packed VNNI: uint32[kBlockN][kBlockM/2]
+    constexpr int AtomLayoutN1 = Trait::kNSGs / AtomLayoutM1;
+    constexpr int SubtileN = kBlockM / AtomLayoutN1;       // 32 M-cols per SG
+    constexpr int col_groups = SubtileN / SubgroupSize;     // 2
+    constexpr uint32_t row_stride = (kBlockM / 2) * 4;     // 128 bytes per N-row
+
+    // Per-lane N-row offset within each 2-row group:
+    //   lanes 0-7:  even N-row (offset 0)
+    //   lanes 8-15: odd  N-row (offset 1)
+    uint32_t n_row_offset = lane >> 3;
 
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < size(tCgC); ++i) {
-        auto [m, n] = tCgC(i);
-        sC(m, n + sg_lane) = r16(i);
+    for (int cg = 0; cg < col_groups; ++cg) {
+        // M-pair for this col-group:
+        //   sg_n * (SubtileN/2) + cg * (SubgroupSize/2) + (lane & 7)
+        uint32_t m_pair = sg_n * (SubtileN / 2) + cg * (SubgroupSize / 2) + (lane & 7);
+        uint32_t addr_col = slm_offset + m_pair * 4;
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < SubtileM / 2; ++i) {
+            auto &src = *recast_ptr<intel::float2>(&r(cg * SubtileM + 2 * i));
+            uint32_t n_row = sg_m * SubtileM + 2 * i + n_row_offset;
+            uint32_t addr = addr_col + n_row * row_stride;
+
+        intel::float2 packed = {};
+        asm volatile(
+            "{\n"
+            ".decl MP_HF v_type=G type=HF num_elts=64 alias=<%0,0>\n"
+            ".decl MP_F  v_type=G type=F  num_elts=32 alias=<%1,0>\n"
+            "mov (M1, 16) MP_HF(0,0)<1>  MP_F(0,0)<1;1,0>\n"
+            "mov (M1, 16) MP_HF(0,16)<1> MP_F(1,0)<1;1,0>\n"
+            "lsc_store.slm (M1, 16) flat[%2]:a32 %0:d32\n"
+            "}\n"
+            : "+rw"(packed)
+            : "rw"(src), "rw"(addr)
+        );
+        }
     }
+#else
+    CUTE_INVALID_CONTROL_PATH("Inline ASM SLM store requires Xe device");
+#endif
 }
 
 // ============================================================
-// load_slm_tn: load one k-tile of A from SLM for TN GEMM2.
-//   SLM stores S[kBlockN, kBlockM] non-transposed, kBlockM contiguous.
-//   GEMM2 reads S^T: proxy(m,k) = S(k,m) = smem[k*kBlockM + m].
-//   Consecutive m at same k: stride sizeof(T) → contiguous → d64 packs 4.
-//   SIMD32 d64: 8 fp16 per instruction. 32/8 = 4 loads per k-tile.
+// load_slm_tn: TN d32x8 load from M-packed VNNI SLM.
+//   SLM layout: M-packed VNNI uint32[kBlockN][kBlockM/2].
+//   Each lane reads its N-row (= K-col of GEMM2 MMA) across M-pairs.
+//   d32x8 reads 8 consecutive M-pairs = 16 M-values.
+//   VnniPairs_2 = SubtileM_2/2 = 16. 16/8 = 2 d32x8 loads per k-tile.
+//   De-VNNI unpack: each d32 = {lo_fp16, hi_fp16} = 2 M-values.
 // ============================================================
 template<class Trait,
          class Engine0, class Layout0,
@@ -257,26 +303,44 @@ load_slm_tn(Trait &trait,
             Tensor<Engine1, Layout1> const& tCgA_tile,
             SubgroupTensor<Engine2, Layout2, TVLayout2> &tCrA) {
     using T = typename Trait::DType;
-    constexpr int kBlockM = Trait::kBlockM;
-    constexpr uint32_t slm_row_stride = kBlockM * sizeof(T);
 
 #ifdef __SYCL_DEVICE_ONLY__
     static_assert(sizeof(T) == 2);
-    // proxy(m,k) = S(k,m) → addr = slm_offset + k * kBlockM * 2 + m * 2
+    constexpr int kBlockM = Trait::kBlockM;
+    constexpr int SubgroupSize = Trait::SubgroupSize;
+    constexpr int AtomLayoutM2 = Trait::AtomLayoutM2;
+    constexpr int SubtileM_2 = kBlockM / AtomLayoutM2;     // 32 M-rows per SG
+    constexpr int VnniPairs_2 = SubtileM_2 / 2;            // 16 VNNI M-pairs
+    constexpr uint32_t row_stride = (kBlockM / 2) * 4;     // 128 bytes per N-row
+    constexpr int D32X8_BURST = 8;
+
+    auto local_id = int(compat::get_nd_item<1>().get_local_id(0));
+    int sg_idx = local_id / SubgroupSize;
+    int sg_m_2 = sg_idx % AtomLayoutM2;
+
+    // partition_A first coord gives the lane's K value (= N-row index)
     auto [m0, k0] = tCgA_tile(0);
-    uint32_t base_addr = slm_offset + uint32_t(k0) * slm_row_stride
-                       + uint32_t(m0) * sizeof(T);
+
+    // Address: N-row = k0, M-pair block = sg_m_2 * VnniPairs_2
+    uint32_t a_addr = slm_offset
+                    + uint32_t(k0) * row_stride
+                    + sg_m_2 * VnniPairs_2 * 4;
+
+    static_assert(VnniPairs_2 % D32X8_BURST == 0);
+    constexpr int TN_BURSTS = VnniPairs_2 / D32X8_BURST;   // 2
 
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < size(tCgA_tile); i += 8) {
-        auto &vals = *recast_ptr<intel::ulong2>(&tCrA(i));
-        uint32_t addr = base_addr + i * sizeof(T);
-        intel::uint2 addrs;
-        addrs[0] = addr;
-        addrs[1] = addr + 4 * sizeof(T);
+    for (int g = 0; g < TN_BURSTS; ++g) {
+        // d32x8 loads 8 VNNI M-pairs directly into tCrA — no unpack needed.
+        // Each d32 = {fp16_m_even, fp16_m_odd} which is exactly how tCrA
+        // stores consecutive fp16 elements (2 per uint32 slot).
+        auto &dst = *recast_ptr<intel::uint8>(&tCrA(g * 16));
+        uint32_t ag = a_addr + g * D32X8_BURST * 4;
+
         asm volatile(
-            "lsc_load.slm (M1_NM, 32) %0:d64 flat[%1]:a32"
-            : "=rw"(vals) : "rw"(addrs)
+            "lsc_load.slm (M1, 16) %0:d32x8 flat[%1]:a32"
+            : "=rw"(dst)
+            : "rw"(ag)
         );
     }
 #else
@@ -463,7 +527,7 @@ slm_gemm2_device(Trait trait,
         {
             auto rS = create_reg<V>(trait, mScratch, tiled_mma1);
             gemm_kernel<true>(trait, mA, mB1, rS, tiled_mma1);
-            slm_reorder_save(trait, mScratch, sC1, rS, tiled_mma1);
+            slm_reorder_save(trait, mScratch, slm_offset, rS, tiled_mma1);
         }
 
         sycl::group_barrier(group);
