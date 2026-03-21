@@ -187,16 +187,16 @@ gemm_kernel(Trait &trait,
 
 // ============================================================
 // slm_reorder_save: reorder f32 acc -> f16 (CuTe reorder),
-//   then store to SLM via lsc_store.slm d64.
+//   then store to SLM via SIMD32 lsc_store.slm d64.
 //
 //   SLM layout: transposed [kBlockM, kBlockN], kBlockN innermost.
 //   GEMM1 output S(row, col) → SLM(col, row).
-//   Consecutive rows at the same col are contiguous in SLM,
-//   enabling d64 stores (4 fp16 = 8 bytes per instruction).
+//   Consecutive rows at the same col are contiguous in SLM.
 //
-//   partition_D coords: per-subgroup base. Elements within each
-//   column-group have consecutive row indices (verified by dump).
-//   16 rows / 4 per d64 = 4 d64 stores per col-group, ×2 = 8 total.
+//   SIMD32 d64: each instruction stores 2 d64 (8 fp16) per lane.
+//   intel::ulong2 for paired d64 data, intel::uint2 for paired addrs.
+//   addrs[0] → first 4 fp16, addrs[1] → next 4 fp16.
+//   16 rows / 8 per SIMD32 d64 = 2 stores per col-group, ×2 = 4 total.
 // ============================================================
 template<class Trait,
          class Engine0, class Layout0,
@@ -231,14 +231,13 @@ slm_reorder_save(Trait &trait,
     constexpr int SubgroupSize = Trait::SubgroupSize;
     constexpr int kBlockM  = Trait::kBlockM;
     constexpr int col_groups = kBlockM / (Trait::kNSGs / AtomLayoutM1) / SubgroupSize;
-    // Transposed SLM row stride: each SLM row = kBlockN fp16 elements
+    // Transposed SLM: each SLM row = kBlockN fp16 elements
     constexpr uint32_t slm_col_stride = kBlockN * sizeof(T);
 
 #ifdef __SYCL_DEVICE_ONLY__
-    static_assert(SubtileM % 4 == 0, "SubtileM must be divisible by 4 for d64");
+    static_assert(SubtileM % 8 == 0, "SubtileM must be divisible by 8 for SIMD32 d64");
     CUTLASS_PRAGMA_UNROLL
     for (int cg = 0; cg < col_groups; ++cg) {
-        // Base coord for this column-group
         auto [m_base, n_base] = tCgC(cg * SubtileM);
         // Transposed: SLM(gemm_col, gemm_row), gemm_col = n_base + sg_lane
         uint32_t col_addr = slm_offset
@@ -246,21 +245,16 @@ slm_reorder_save(Trait &trait,
                           + uint32_t(m_base) * sizeof(T);
 
         CUTLASS_PRAGMA_UNROLL
-        for (int row = 0; row < SubtileM; row += 4) {
+        for (int row = 0; row < SubtileM; row += 8) {
             int i = cg * SubtileM + row;
-            // Pack 4 consecutive fp16 into d64
-            uint16_t h0, h1, h2, h3;
-            T v0 = r16(i), v1 = r16(i+1), v2 = r16(i+2), v3 = r16(i+3);
-            __builtin_memcpy(&h0, &v0, 2);
-            __builtin_memcpy(&h1, &v1, 2);
-            __builtin_memcpy(&h2, &v2, 2);
-            __builtin_memcpy(&h3, &v3, 2);
-            uint64_t packed = uint64_t(h0) | (uint64_t(h1) << 16)
-                            | (uint64_t(h2) << 32) | (uint64_t(h3) << 48);
-            uint32_t addr = col_addr + row * sizeof(T);
+            // r16 elements [i..i+7] are 8 consecutive fp16 = 16 bytes = 2 d64
+            auto &vals = *recast_ptr<intel::ulong2>(&r16(i));
+            intel::uint2 addrs;
+            addrs[0] = col_addr + row * sizeof(T);           // first 4 fp16
+            addrs[1] = col_addr + (row + 4) * sizeof(T);     // next 4 fp16
             asm volatile(
-                "lsc_store.slm (M1_NM, 16) flat[%0]:a32 %1:d64"
-                :: "rw"(addr), "rw"(packed)
+                "lsc_store.slm (M1_NM, 32) flat[%0]:a32 %1:d64"
+                :: "rw"(addrs), "rw"(vals)
             );
         }
     }
@@ -271,15 +265,15 @@ slm_reorder_save(Trait &trait,
 
 // ============================================================
 // load_slm: load one k-tile of A from SLM into MMA fragment
-//   via lsc_load.slm d64.
+//   via SIMD32 lsc_load.slm d64.
 //
 //   SLM layout: transposed [kBlockM, kBlockN], kBlockN innermost.
 //   proxy(m, k) = S(m, k) stored at SLM(k, m).
 //   addr = slm_offset + k * kBlockN * 2 + m * 2
-//   Consecutive m values give consecutive addresses → d64 packs 4.
+//   Consecutive m values give consecutive addresses.
 //
-//   partition_A coords are lane-aware. 32 elements per lane per k-tile,
-//   all with consecutive m. 32/4 = 8 d64 loads per k-tile.
+//   SIMD32 d64: each instruction loads 2 d64 (8 fp16) per lane.
+//   32 elements / 8 per SIMD32 d64 = 4 loads per k-tile.
 // ============================================================
 template<class Trait,
          class Engine0, class Layout0,
@@ -298,30 +292,20 @@ load_slm(Trait &trait,
 #ifdef __SYCL_DEVICE_ONLY__
     static_assert(sizeof(T) == 2);
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < size(tCgA_tile); i += 4) {
+    for (int i = 0; i < size(tCgA_tile); i += 8) {
         auto [m, k] = tCgA_tile(i);
         // Transposed: SLM(k, m)
-        uint32_t addr = slm_offset + uint32_t(k) * slm_col_stride
+        uint32_t base = slm_offset + uint32_t(k) * slm_col_stride
                       + uint32_t(m) * sizeof(T);
-        uint64_t packed;
+        // tCrA elements [i..i+7] are 8 consecutive fp16 = 2 d64
+        auto &vals = *recast_ptr<intel::ulong2>(&tCrA(i));
+        intel::uint2 addrs;
+        addrs[0] = base;                       // first 4 fp16 (m, m+1, m+2, m+3)
+        addrs[1] = base + 4 * sizeof(T);       // next 4 fp16  (m+4, m+5, m+6, m+7)
         asm volatile(
-            "lsc_load.slm (M1_NM, 16) %0:d64 flat[%1]:a32"
-            : "=rw"(packed) : "rw"(addr)
+            "lsc_load.slm (M1_NM, 32) %0:d64 flat[%1]:a32"
+            : "=rw"(vals) : "rw"(addrs)
         );
-        // Unpack 4 fp16 from d64
-        uint16_t h0 = packed & 0xFFFF;
-        uint16_t h1 = (packed >> 16) & 0xFFFF;
-        uint16_t h2 = (packed >> 32) & 0xFFFF;
-        uint16_t h3 = (packed >> 48) & 0xFFFF;
-        T v0, v1, v2, v3;
-        __builtin_memcpy(&v0, &h0, 2);
-        __builtin_memcpy(&v1, &h1, 2);
-        __builtin_memcpy(&v2, &h2, 2);
-        __builtin_memcpy(&v3, &h3, 2);
-        tCrA(i)   = v0;
-        tCrA(i+1) = v1;
-        tCrA(i+2) = v2;
-        tCrA(i+3) = v3;
     }
 #else
     CUTE_INVALID_CONTROL_PATH("Inline ASM SLM load requires Xe device");
