@@ -298,8 +298,8 @@ launch_mha_wrapper(ProblemShape problem_shape, bool is_causal, bool is_bhsd, int
     const int HEAD_SIZE_QK = get<5>(problem_shape);
     const int HEAD_SIZE_VO = get<6>(problem_shape);
 
-    constexpr int kBlockN = 64;
-    constexpr int kBlockM = 64;
+    constexpr int kBlockN = 128;
+    constexpr int kBlockM = 128;
     int64_t SEQ_LEN_QO_PAD = ceil_div(SEQ_LEN_QO, kBlockM) * kBlockM;
     int64_t SEQ_LEN_KV_PAD = ceil_div(SEQ_LEN_KV, kBlockN) * kBlockN;
 
@@ -577,8 +577,8 @@ int main(int argc, const char**argv) {
     int64_t HEAD_SIZE_VO = options.head_size_vo;
     bool is_causal = options.is_causal;
     bool is_bhsd = options.is_bhsd;
-    constexpr int kBlockN = 64;
-    constexpr int kBlockM = 64;
+    constexpr int kBlockN = 128;
+    constexpr int kBlockM = 128;
     int64_t SEQ_LEN_QO_PAD = ceil_div(SEQ_LEN_QO, kBlockM) * kBlockM;
     int64_t SEQ_LEN_KV_PAD = ceil_div(SEQ_LEN_KV, kBlockN) * kBlockN;
     assert(HEAD_SIZE_QK == HEAD_SIZE_VO && "only support head_size_qk==head_size_vo");
