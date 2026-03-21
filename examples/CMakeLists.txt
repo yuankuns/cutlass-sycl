@@ -118,6 +118,8 @@ if(CUTLASS_ENABLE_SYCL)
       11_xe20_cutlass_library
       12_bmg_moe_gemm_cute_interface
       sdpa_bwd
+      sdpa_bwd_slm_reproducer
+      slm_gemm_example
       )
       add_subdirectory(${EXAMPLE})
     endforeach()

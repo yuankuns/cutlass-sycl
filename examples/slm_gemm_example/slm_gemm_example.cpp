@@ -65,6 +65,8 @@ struct SlmGemmTrait {
     static constexpr int kHeadDim = kHeadDim_;
     static constexpr int kNSGs    = kNSGs_;
     static constexpr int SubgroupSize = 16;
+    static constexpr int AtomLayoutM1 = AtomLayoutM1_;
+    static constexpr int AtomLayoutM2 = AtomLayoutM2_;
 
     using MMA_Atom_ARCH = XE_DPAS_TT<8, VType, DType>;
     using _K = Int<MMA_Atom_ARCH::K>;
@@ -184,27 +186,38 @@ gemm_kernel(Trait &trait,
 }
 
 // ============================================================
-// slm_reorder_save: reorder f32 acc -> f16, save to SLM
-//   partition_D with local_id gives per-subgroup base coords;
-//   add sg lane id explicitly for per-lane SLM addressing.
+// slm_reorder_save: reorder f32 acc -> f16 (CuTe reorder),
+//   then store to SLM via lsc_store.slm d64.
+//
+//   SLM layout: transposed [kBlockM, kBlockN], kBlockN innermost.
+//   GEMM1 output S(row, col) → SLM(col, row).
+//   Consecutive rows at the same col are contiguous in SLM,
+//   enabling d64 stores (4 fp16 = 8 bytes per instruction).
+//
+//   partition_D coords: per-subgroup base. Elements within each
+//   column-group have consecutive row indices (verified by dump).
+//   16 rows / 4 per d64 = 4 d64 stores per col-group, ×2 = 8 total.
 // ============================================================
 template<class Trait,
          class Engine0, class Layout0,
-         class Engine1, class Layout1,
          class Engine2, class Layout2, class TVLayout2,
          class TiledMMA>
 void
 slm_reorder_save(Trait &trait,
                  Tensor<Engine0, Layout0> &mC,
-                 Tensor<Engine1, Layout1> &sC,
+                 uint32_t slm_offset,
                  SubgroupTensor<Engine2, Layout2, TVLayout2> &r,
                  TiledMMA const &tiled_mma) {
-    auto r16 = create_reg<typename Trait::DType>(trait, mC, tiled_mma);
+    using T = typename Trait::DType;
+
+    // CuTe reorder: f32 MMA layout -> f16 Copy layout
+    auto r16 = create_reg<T>(trait, mC, tiled_mma);
     reorder(r, r16);
 
     auto local_id = int(compat::get_nd_item<1>().get_local_id(0));
     int sg_lane = compat::get_nd_item<1>().get_sub_group().get_local_id();
 
+    // Get partition_D coords (per-subgroup base)
     auto copy_c = make_block_2d_copy_D(tiled_mma, mC);
     auto thr_copy_c = copy_c.get_slice(local_id);
     auto tile_mnk = tiled_mma.tile_mnk();
@@ -212,30 +225,107 @@ slm_reorder_save(Trait &trait,
     Tensor gC = local_tile(cC, select<0, 1>(tile_mnk), make_coord(0, 0));
     Tensor tCgC = thr_copy_c.partition_D(gC);
 
+    constexpr int kBlockN  = Trait::kBlockN;
+    constexpr int AtomLayoutM1 = Trait::AtomLayoutM1;
+    constexpr int SubtileM = kBlockN / AtomLayoutM1;
+    constexpr int SubgroupSize = Trait::SubgroupSize;
+    constexpr int kBlockM  = Trait::kBlockM;
+    constexpr int col_groups = kBlockM / (Trait::kNSGs / AtomLayoutM1) / SubgroupSize;
+    // Transposed SLM row stride: each SLM row = kBlockN fp16 elements
+    constexpr uint32_t slm_col_stride = kBlockN * sizeof(T);
+
+#ifdef __SYCL_DEVICE_ONLY__
+    static_assert(SubtileM % 4 == 0, "SubtileM must be divisible by 4 for d64");
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < size(tCgC); ++i) {
-        auto [m, n] = tCgC(i);
-        sC(m, n + sg_lane) = r16(i);
+    for (int cg = 0; cg < col_groups; ++cg) {
+        // Base coord for this column-group
+        auto [m_base, n_base] = tCgC(cg * SubtileM);
+        // Transposed: SLM(gemm_col, gemm_row), gemm_col = n_base + sg_lane
+        uint32_t col_addr = slm_offset
+                          + uint32_t(n_base + sg_lane) * slm_col_stride
+                          + uint32_t(m_base) * sizeof(T);
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int row = 0; row < SubtileM; row += 4) {
+            int i = cg * SubtileM + row;
+            // Pack 4 consecutive fp16 into d64
+            uint16_t h0, h1, h2, h3;
+            T v0 = r16(i), v1 = r16(i+1), v2 = r16(i+2), v3 = r16(i+3);
+            __builtin_memcpy(&h0, &v0, 2);
+            __builtin_memcpy(&h1, &v1, 2);
+            __builtin_memcpy(&h2, &v2, 2);
+            __builtin_memcpy(&h3, &v3, 2);
+            uint64_t packed = uint64_t(h0) | (uint64_t(h1) << 16)
+                            | (uint64_t(h2) << 32) | (uint64_t(h3) << 48);
+            uint32_t addr = col_addr + row * sizeof(T);
+            asm volatile(
+                "lsc_store.slm (M1_NM, 16) flat[%0]:a32 %1:d64"
+                :: "rw"(addr), "rw"(packed)
+            );
+        }
     }
+#else
+    CUTE_INVALID_CONTROL_PATH("Inline ASM SLM store requires Xe device");
+#endif
 }
 
 // ============================================================
 // load_slm: load one k-tile of A from SLM into MMA fragment
-//   partition_A with local_id is lane-aware — coords include
-//   per-lane offset, so sA(m, k) addresses correctly.
+//   via lsc_load.slm d64.
+//
+//   SLM layout: transposed [kBlockM, kBlockN], kBlockN innermost.
+//   proxy(m, k) = S(m, k) stored at SLM(k, m).
+//   addr = slm_offset + k * kBlockN * 2 + m * 2
+//   Consecutive m values give consecutive addresses → d64 packs 4.
+//
+//   partition_A coords are lane-aware. 32 elements per lane per k-tile,
+//   all with consecutive m. 32/4 = 8 d64 loads per k-tile.
 // ============================================================
-template<class Engine0, class Layout0,
+template<class Trait,
+         class Engine0, class Layout0,
          class Engine1, class Layout1,
          class Engine2, class Layout2, class TVLayout2>
 CUTLASS_DEVICE void
-load_slm(Tensor<Engine0, Layout0> const& sA,
+load_slm(Trait &trait,
+         uint32_t slm_offset,
+         Tensor<Engine0, Layout0> const& sA,
          Tensor<Engine1, Layout1> const& tCgA_tile,
          SubgroupTensor<Engine2, Layout2, TVLayout2> &tCrA) {
+    using T = typename Trait::DType;
+    constexpr int kBlockN = Trait::kBlockN;
+    constexpr uint32_t slm_col_stride = kBlockN * sizeof(T);
+
+#ifdef __SYCL_DEVICE_ONLY__
+    static_assert(sizeof(T) == 2);
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < size(tCgA_tile); ++i) {
+    for (int i = 0; i < size(tCgA_tile); i += 4) {
         auto [m, k] = tCgA_tile(i);
-        tCrA(i) = sA(m, k);
+        // Transposed: SLM(k, m)
+        uint32_t addr = slm_offset + uint32_t(k) * slm_col_stride
+                      + uint32_t(m) * sizeof(T);
+        uint64_t packed;
+        asm volatile(
+            "lsc_load.slm (M1_NM, 16) %0:d64 flat[%1]:a32"
+            : "=rw"(packed) : "rw"(addr)
+        );
+        // Unpack 4 fp16 from d64
+        uint16_t h0 = packed & 0xFFFF;
+        uint16_t h1 = (packed >> 16) & 0xFFFF;
+        uint16_t h2 = (packed >> 32) & 0xFFFF;
+        uint16_t h3 = (packed >> 48) & 0xFFFF;
+        T v0, v1, v2, v3;
+        __builtin_memcpy(&v0, &h0, 2);
+        __builtin_memcpy(&v1, &h1, 2);
+        __builtin_memcpy(&v2, &h2, 2);
+        __builtin_memcpy(&v3, &h3, 2);
+        tCrA(i)   = v0;
+        tCrA(i+1) = v1;
+        tCrA(i+2) = v2;
+        tCrA(i+3) = v3;
     }
+#else
+    CUTE_INVALID_CONTROL_PATH("Inline ASM SLM load requires Xe device");
+#endif
 }
 
 // ============================================================
@@ -250,6 +340,7 @@ template<bool clear_acc, class Trait,
 void
 gemm_slm_kernel(Trait &trait,
                 Tensor<Engine0, Layout0> const& A,
+                uint32_t slm_offset,
                 Tensor<Engine1, Layout1> &sA,
                 Tensor<Engine2, Layout2> const& B,
                 SubgroupTensor<Engine3, Layout3, TVLayout3> &acc,
@@ -295,7 +386,7 @@ gemm_slm_kernel(Trait &trait,
     for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
         barrier_arrive(barrier_scope);
 
-        load_slm(sA, tCgA(_,_,_,k_tile), tCrA);
+        load_slm(trait, slm_offset, sA, tCgA(_,_,_,k_tile), tCrA);
 
         copy(copy_b, tBgB(_,_,_,k_tile), tBrB);
         prefetch(prefetch_b, pBgB(_,_,_,k_tile_prefetch));
@@ -353,6 +444,8 @@ slm_gemm_device(Trait trait,
     const int n_block = BlockIdxX();
     auto group = compat::get_nd_item<1>().get_group();
     auto smem  = compat::local_mem<T[kBlockN * kBlockM]>();
+    // SLM byte offset for inline ASM addressing
+    uint32_t slm_offset = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(smem));
 
     // A (K-like): [kBlockN, kHeadDim] row-major — fixed for this n_block
     Tensor mA = make_tensor(make_gmem_ptr(A_ptr + n_block * kBlockN * kHeadDim),
@@ -366,7 +459,8 @@ slm_gemm_device(Trait trait,
                                       make_shape(Int<kBlockN>{}, Int<kBlockM>{}),
                                       make_stride(Int<kBlockM>{}, _1{})));
 
-    // SLM tensor: [kBlockN, kBlockM]
+    // SLM tensor: [kBlockN, kBlockM] — same shape as proxy mScratch
+    // ASM uses slm_offset for addressing; CuTe tensor used as fallback
     Tensor sC1 = make_tensor(make_smem_ptr(smem),
                              make_layout(
                                  make_shape(Int<kBlockN>{}, Int<kBlockM>{}),
@@ -402,13 +496,13 @@ slm_gemm_device(Trait trait,
         {
             auto rS = create_reg<V>(trait, mScratch, tiled_mma1);
             gemm_kernel<true>(trait, mA, mB1, rS, tiled_mma1);
-            slm_reorder_save(trait, mScratch, sC1, rS, tiled_mma1);
+            slm_reorder_save(trait, mScratch, slm_offset, rS, tiled_mma1);
         }
 
         sycl::group_barrier(group);
 
         // GEMM2: rdC[kBlockN, D] += SLM[kBlockN, kBlockM] * B2t[D, kBlockM]
-        gemm_slm_kernel<false>(trait, mScratch, sC1, mB2t, rdC, tiled_mma2);
+        gemm_slm_kernel<false>(trait, mScratch, slm_offset, sC1, mB2t, rdC, tiled_mma2);
 
         sycl::group_barrier(group);
 
