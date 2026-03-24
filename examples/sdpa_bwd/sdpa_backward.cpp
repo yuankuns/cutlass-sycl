@@ -162,9 +162,7 @@ gemm_kernel(Trait &trait,
             Tensor<Engine0, Layout0> const& A,         // (M,K)
             Tensor<Engine1, Layout1> const& B,         // (N,K)
             SubgroupTensor<Engine2, Layout2, TVLayout2> & acc,
-            TiledMMA const & mma,
-            const int m_block = 0,
-            const int n_block = 0) {
+            TiledMMA const & mma) {
     // -----
     // Setup
     // -----
@@ -179,8 +177,8 @@ gemm_kernel(Trait &trait,
 
     auto tile_mnk = mma.tile_mnk();
 
-    Tensor gA = local_tile(cA, select<0,2>(tile_mnk), make_coord(m_block,_));  // (BLK_M,BLK_K,k)
-    Tensor gB = local_tile(cB, select<1,2>(tile_mnk), make_coord(n_block,_));  // (BLK_N,BLK_K,k)
+    Tensor gA = local_tile(cA, select<0,2>(tile_mnk), make_coord(0,_));  // (BLK_M,BLK_K,k)
+    Tensor gB = local_tile(cB, select<1,2>(tile_mnk), make_coord(0,_));  // (BLK_N,BLK_K,k)
 
     /* Create block 2D TiledCopies */
     auto copy_a = make_block_2d_copy_A(mma, A);
@@ -302,18 +300,16 @@ gemm_dQ(Trait &trait,
         Tensor<Engine0, Layout0> const& A,         // (M,K)
         Tensor<Engine1, Layout1> const& B,         // (N,K)
         Tensor<Engine2, Layout2> const& C,         // (M,N)
-        TiledMMA const & mma,
-        const int m_block = 0,
-        const int n_block = 0) {
+        TiledMMA const & mma) {
     auto sg = compat::get_nd_item<1>().get_sub_group();
     auto first_thread_in_sg_idx = sg.get_group_linear_id() * trait.SubgroupSize;
     auto tile_mnk = mma.tile_mnk();
     Tensor cC = make_identity_tensor(C.shape());   // (M,N)
-    Tensor gC = local_tile(cC, select<0, 1>(tile_mnk), make_coord(m_block, n_block));  // (BLK_M,BLK_N)
+    Tensor gC = local_tile(cC, select<0, 1>(tile_mnk), make_coord(0, 0));  // (BLK_M,BLK_N)
     auto thr_mma = mma.get_slice(first_thread_in_sg_idx);
     auto tCrC = thr_mma.partition_sg_fragment_C(make_identity_tensor(select<0,1>(tile_mnk))); // allocate C fragment storage
     Tensor tCgC = thr_mma.partition_C(gC);
-    gemm_kernel<true>(trait, A, B, tCrC, mma, m_block, n_block);
+    gemm_kernel<true>(trait, A, B, tCrC, mma);
     int local_id = sg.get_local_id();
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i <  size(tCgC); ++i) {
