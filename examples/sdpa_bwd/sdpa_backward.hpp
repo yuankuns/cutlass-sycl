@@ -312,68 +312,132 @@ CUTLASS_DEVICE auto convert_layout_acc_layout(Layout acc_layout) {
     return l2;
 }
 
-template<class Engine0, class Layout0, class Engine1, class Layout1>
-CUTLASS_DEVICE void scale_apply_exp2(Tensor<Engine0, Layout0> &tensor, Tensor<Engine1, Layout1> &max, const float scale) {
+// Cooperative load + broadcast for a 1D column vector.
+// Each thread in the subgroup loads one element; operator() uses
+// group_broadcast to distribute to all threads for a given row.
+template<bool Is_even_M, int NumRows, int SubgroupSize = 16>
+struct RowBroadcast {
+    static constexpr int NumLoads = (NumRows + SubgroupSize - 1) / SubgroupSize;
+    float loaded[NumLoads];
+    sycl::sub_group sg;
+
+    template<class Engine, class Layout, class CoordRow>
+    CUTLASS_DEVICE
+    RowBroadcast(Tensor<Engine, Layout> &vec, CoordRow &coord_row,
+                 int tail_m = 0)
+        : sg(compat::get_nd_item<1>().get_sub_group()) {
+        int lane = sg.get_local_id();
+        int base = get<0>(coord_row(0));
+        CUTLASS_PRAGMA_UNROLL
+        for (int l = 0; l < NumLoads; ++l) {
+            int idx = base + l * SubgroupSize + lane;
+            if constexpr (Is_even_M) {
+                loaded[l] = float(vec(idx));
+            } else {
+                loaded[l] = idx < tail_m ? float(vec(idx)) : 0.f;
+            }
+        }
+    }
+
+    CUTLASS_DEVICE float operator()(int mi) const {
+        return group_broadcast(sg, loaded[mi / SubgroupSize], mi % SubgroupSize);
+    }
+};
+
+template<bool Is_even_M,
+         class Engine0, class Layout0,
+         class Engine1, class Layout1,
+         class Engine2, class Layout2>
+CUTLASS_DEVICE void
+scale_apply_exp2(Tensor<Engine0, Layout0> &tensor,
+                 Tensor<Engine1, Layout1> &max,
+                 Tensor<Engine2, Layout2> &coord_row,
+                 const float scale,
+                 const int tail_m = 0) {
     static_assert(Layout0::rank == 2, "Only support 2D Tensor");
-    static_assert(Layout1::rank == 1, "Only support 1D Tensor");
-    CUTE_STATIC_ASSERT_V(size<0>(max) == size<0>(tensor));
-    CUTLASS_PRAGMA_UNROLL
-    for (int mi = 0; mi < size<0>(tensor); ++mi) {
-        const float max_scaled = max(mi) == -INFINITY ? 0.f : max(mi) * M_LOG2E;
+    constexpr int NumRows = decltype(size<0>(tensor))::value;
+    RowBroadcast<Is_even_M, NumRows> lse(max, coord_row, tail_m);
+    if constexpr(Is_even_M) {
         CUTLASS_PRAGMA_UNROLL
-        for (int ni = 0; ni < size<1>(tensor); ++ni)  {
-            tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
+        for (int mi = 0; mi < NumRows; ++mi) {
+            const float max_val = lse(mi);
+            const float max_scaled = max_val == -INFINITY ? 0.f : max_val * M_LOG2E;
+            CUTLASS_PRAGMA_UNROLL
+            for (int ni = 0; ni < size<1>(tensor); ++ni) {
+                tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
+            }
+        }
+    } else {
+        CUTLASS_PRAGMA_UNROLL
+        for (int mi = 0; mi < NumRows; ++mi) {
+            const float max_val = lse(mi);
+            int row = get<0>(coord_row(mi));
+            const float max_scaled = ((max_val == -INFINITY) or (row >= tail_m)) ? 0.f : max_val * M_LOG2E;
+            CUTLASS_PRAGMA_UNROLL
+            for (int ni = 0; ni < size<1>(tensor); ++ni) {
+                tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
+            }
         }
     }
 }
 
-template<class Tensor0, class Tensor1, class Tensor2>
-CUTLASS_DEVICE void softmax_backward(Tensor0 &P, Tensor1 &dP_sum, Tensor2 &dP, const float scale) {
-    CUTLASS_PRAGMA_UNROLL
-    for (int mi = 0; mi < size<0>(dP); ++mi) {
+template<bool Is_even_M,
+         class Engine0, class Layout0,
+         class Engine1, class Layout1,
+         class Engine2, class Layout2,
+         class Engine3, class Layout3>
+CUTLASS_DEVICE void
+softmax_backward(Tensor<Engine0, Layout0> &P,
+                 Tensor<Engine1, Layout1> &dP_sum,
+                 Tensor<Engine2, Layout2> &dP,
+                 Tensor<Engine3, Layout3> &coord_row,
+                 const float scale,
+                 const int tail_m = 0) {
+    constexpr int NumRows = decltype(size<0>(dP))::value;
+    RowBroadcast<Is_even_M, NumRows> dpsum(dP_sum, coord_row, tail_m);
+    if constexpr(Is_even_M) {
         CUTLASS_PRAGMA_UNROLL
-        for (int mj = 0; mj < size<1>(dP); ++mj) {
-            dP(mi, mj) = P(mi, mj) * (dP(mi, mj) - dP_sum(mi)) * scale;
+        for (int mi = 0; mi < NumRows; ++mi) {
+            const float neg_dpsum_scaled = -(dpsum(mi) * scale);
+            CUTLASS_PRAGMA_UNROLL
+            for (int ni = 0; ni < size<1>(dP); ++ni) {
+                dP(mi, ni) = P(mi, ni) * fmaf(dP(mi, ni), scale, neg_dpsum_scaled);
+            }
+        }
+    } else {
+        CUTLASS_PRAGMA_UNROLL
+        for (int mi = 0; mi < NumRows; ++mi) {
+            int row = get<0>(coord_row(mi));
+            if (row < tail_m) {
+                const float neg_dpsum_scaled = -(dpsum(mi) * scale);
+                CUTLASS_PRAGMA_UNROLL
+                for (int ni = 0; ni < size<1>(dP); ++ni) {
+                    dP(mi, ni) = P(mi, ni) * fmaf(dP(mi, ni), scale, neg_dpsum_scaled);
+                }
+            }
         }
     }
 }
 
-template<bool is_causal, bool Is_even_N,
-         typename T, typename V,
-         int kBlockM, int kBlockN,
+template<class Trait,
          class Tensor0, class Tensor1,
-         class Tensor2, class Tensor3,
-         class Tensor4, class Tensor5,
-         class TilesaveP, class Param>
-CUTLASS_DEVICE auto
-softmax_forward(Tensor0 &scores, Tensor1 &tSrS,
-                Tensor2 &taccScS, Tensor3 &mLSE,
-                Tensor4 & mdPsum, Tensor5 &tPgP,
-                TilesaveP &tilesaveP, Param &param,
+         class Tensor2, class Tensor3>
+CUTLASS_DEVICE void
+softmax_forward(Tensor0 &scores, Tensor1 &taccScS_rc,
+                Tensor2 &mLSE, Tensor3 &taccScS_row,
+                Param<typename Trait::DType> &param,
                 int m_block, int n_block,
                 bool Is_even_M, int tail_m = 0) {
-    if constexpr(is_causal) {
-        Tensor taccScS_rc = logical_divide(taccScS, Shape<_1>{});
+    if constexpr(Trait::is_causal) {
         apply_mask_causal(scores, taccScS_rc,
-                          m_block * kBlockM, n_block * kBlockN,
+                          m_block * Trait::kBlockM, n_block * Trait::kBlockN,
                           param.seq_len_kv - param.seq_len_q);
     }
-    Tensor taccScS_row = logical_divide(taccScS, Shape<_1>{})(make_coord(0, _), _, 0);
-    Tensor lse = make_tensor<V>(Shape<Int<decltype(size(taccScS_row))::value>>{});
-
     if (Is_even_M) {
-        load_1colvec<true>(lse, mLSE, taccScS_row);
+        scale_apply_exp2<true>(scores, mLSE, taccScS_row, param.scale_softmax_log2);
     } else {
-        load_1colvec<false>(lse, mLSE, taccScS_row, tail_m);
+        scale_apply_exp2<false>(scores, mLSE, taccScS_row, param.scale_softmax_log2, tail_m);
     }
-
-    // P=softmax(S,lse)
-    scale_apply_exp2(scores, lse, param.scale_softmax_log2);
-    if (Is_even_M)
-        load_1colvec<true>(lse, mdPsum, taccScS_row);
-    else
-        load_1colvec<false>(lse, mdPsum, taccScS_row, tail_m);
-    return lse;
 }
 
 template<bool Is_even_N, bool Seq_parallel, class Trait>
@@ -507,13 +571,12 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
 
     auto thr_mma_sdp = tiled_mma_sdp.get_slice(first_thread_in_sg_idx);
 
-    // for lse read
+    // for coordinate lookup
     Tensor caccS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{}); // same buffer as accS
     Tensor taccScS = thr_mma_sdp.partition_C(caccS);
     static_assert(decltype(size<0>(taccScS))::value == 8);
     Tensor taccScS_rc = logical_divide(taccScS, Shape<_1>{});
     Tensor taccScS_row = logical_divide(taccScS, Shape<_1>{})(make_coord(0, _), _, 0);
-    Tensor lse = make_tensor<V>(Shape<Int<decltype(size(taccScS_row))::value>>{});
     // static_assert(size<0>(tSrS) * size<1>(tSrS) == size<0>(lse) && "row of acc and lse not match");
     // misc
 
@@ -562,36 +625,24 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
         gemm_SdP(trait, mQ, mKt, rS,
                  tiled_mma_sdp);
         Tensor scores = make_tensor(rS.data(), convert_layout_acc_layout(rS.layout()));
-        if constexpr(is_causal) {
-            apply_mask_causal(scores, taccScS_rc, m_block * kBlockM, n_block * kBlockN, param.seq_len_kv - param.seq_len_q);
-        }
-
-        if (Is_even_M) {
-            load_1colvec<true>(lse, mLSE, taccScS_row);
-        } else {
-            load_1colvec<false>(lse, mLSE, taccScS_row, tail_m);
-        }
-
-        Tensor dP_sum = make_fragment_like(lse);
-
-        if (Is_even_M)
-            load_1colvec<true>(dP_sum, mdPsum, taccScS_row);
-        else
-            load_1colvec<false>(dP_sum, mdPsum, taccScS_row, tail_m);
-
         // P=softmax(S,lse)
-        scale_apply_exp2(scores, lse, param.scale_softmax_log2);
+        softmax_forward<Trait>(
+            scores, taccScS_rc, mLSE, taccScS_row,
+            param, m_block, n_block, Is_even_M, tail_m);
         mha_reorder_copy(trait, tiled_mma_sdp, rS, mP);
         auto rdP = create_reg<V>(trait,
                                  mdPt,
                                  tiled_mma_sdp);
-        clear(rdP);
         // dP=dO*Vt
         gemm_SdP(trait, mdO, mV, rdP,
                  tiled_mma_sdp);
         Tensor dS = make_tensor(rdP.data(), scores.layout());
         // dS=P(dP-sum_row(P))*scale
-        softmax_backward(scores, dP_sum, dS, param.scale_softmax);
+        if (Is_even_M) {
+            softmax_backward<true>(scores, mdPsum, dS, taccScS_row, param.scale_softmax);
+        } else {
+            softmax_backward<false>(scores, mdPsum, dS, taccScS_row, param.scale_softmax, tail_m);
+        }
         mha_reorder_copy(trait, tiled_mma_sdp, rdP, mdP); // copy dP to internal buff
         }
         // dV=Pt*dO
