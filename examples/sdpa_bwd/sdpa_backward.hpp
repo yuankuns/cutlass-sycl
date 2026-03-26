@@ -22,10 +22,6 @@ CUTLASS_DEVICE void
 apply_mask_causal(Tensor<Engine0, Layout0> &tensor,
                   Tensor<Engine1, Layout1> &rC,
                   int m_offset, int n_offset, int diagonal_offset = 0) {
-    auto sg = compat::get_nd_item<1>().get_sub_group();
-    auto group = compat::get_nd_item<1>().get_group();
-    int sg_local_id = sg.get_local_id();
-    int sg_group_id = sg.get_group_id();
     Tensor rC_2d = make_tensor(
         rC.data(),
         convert_layout_2d_layout(rC.layout()));
@@ -33,7 +29,7 @@ apply_mask_causal(Tensor<Engine0, Layout0> &tensor,
     for (int n = 0; n < size<1>(tensor); ++n) {
         CUTLASS_PRAGMA_UNROLL
         for (int m = 0; m < size<0>(tensor); ++m) {
-            int x = n_offset + get<1>(rC_2d(m, n)) + sg_local_id;
+            int x = n_offset + get<1>(rC_2d(m, n));
             int y = m_offset + get<0>(rC_2d(m, n)) + diagonal_offset;
             if (x > y) {
                 tensor(m, n) = -INFINITY;
@@ -48,15 +44,14 @@ auto
 create_reg(Trait const &trait,
            MTensor const &C,
            TiledMMA const &tiled_mma) {
-    auto sg = compat::get_nd_item<1>().get_sub_group();
-    auto first_thread_in_sg_idx = sg.get_group_linear_id() * Trait::SubgroupSize;
-    auto thr_mma = tiled_mma.get_slice(first_thread_in_sg_idx);
+    auto local_id = int(compat::get_nd_item<1>().get_local_id(0));
+    auto thr_mma = tiled_mma.get_slice(local_id);
 
     Tensor cC = make_identity_tensor(C.shape());   // (M,N)
     auto tile_mnk = tiled_mma.tile_mnk();
     Tensor gC = local_tile(cC, select<0, 1>(tile_mnk), make_coord(0, 0));  // (BLK_M,BLK_N)
     auto copy_c = make_block_2d_copy_D(tiled_mma, C);
-    auto thr_copy_c = copy_c.get_slice(first_thread_in_sg_idx);
+    auto thr_copy_c = copy_c.get_slice(local_id);
     if constexpr(is_same_v<T, float>) {
         auto r32 = thr_mma.partition_sg_fragment_C(make_identity_tensor(select<0,1>(tile_mnk))); // allocate C fragment storage
         return r32;
@@ -82,8 +77,7 @@ gemm_kernel(Trait &trait,
     // -----
 
     /* Get workgroup and local IDs */
-    auto sg = compat::get_nd_item<1>().get_sub_group();
-    auto first_thread_in_sg_idx = sg.get_group_linear_id() * Trait::SubgroupSize;
+    auto local_id = int(compat::get_nd_item<1>().get_local_id(0));
 
     /* Create proxy coordinate tensors for each global tensor */
     Tensor cA = make_identity_tensor(A.shape());   // (M,K)
@@ -99,9 +93,9 @@ gemm_kernel(Trait &trait,
     auto copy_b = make_block_2d_copy_B(mma, B);
 
     /* Slice TiledCopy/TiledMMA operations to thread (work-item) level */
-    auto thr_mma    =    mma.get_slice(first_thread_in_sg_idx);
-    auto thr_copy_a = copy_a.get_slice(first_thread_in_sg_idx);
-    auto thr_copy_b = copy_b.get_slice(first_thread_in_sg_idx);
+    auto thr_mma    =    mma.get_slice(local_id);
+    auto thr_copy_a = copy_a.get_slice(local_id);
+    auto thr_copy_b = copy_b.get_slice(local_id);
 
     /* Register fragments for MMA */
     auto tCrA = thr_mma.partition_sg_fragment_A(gA(_,_,0));
@@ -122,8 +116,8 @@ gemm_kernel(Trait &trait,
     auto prefetch_a = make_block_2d_prefetch(copy_a);
     auto prefetch_b = make_block_2d_prefetch(copy_b);
 
-    auto thr_prefetch_A = prefetch_a.get_slice(first_thread_in_sg_idx);
-    auto thr_prefetch_B = prefetch_b.get_slice(first_thread_in_sg_idx);
+    auto thr_prefetch_A = prefetch_a.get_slice(local_id);
+    auto thr_prefetch_B = prefetch_b.get_slice(local_id);
 
     /* Partition global tensor (proxies) for prefetch */
     auto pAgA = thr_prefetch_A.partition_S(gA);
@@ -215,20 +209,19 @@ gemm_dQ(Trait &trait,
         Tensor<Engine1, Layout1> const& B,         // (N,K)
         Tensor<Engine2, Layout2> const& C,         // (M,N)
         TiledMMA const & mma) {
-    auto sg = compat::get_nd_item<1>().get_sub_group();
-    auto first_thread_in_sg_idx = sg.get_group_linear_id() * trait.SubgroupSize;
+    auto local_id = int(compat::get_nd_item<1>().get_local_id(0));
     auto tile_mnk = mma.tile_mnk();
     Tensor cC = make_identity_tensor(C.shape());   // (M,N)
     Tensor gC = local_tile(cC, select<0, 1>(tile_mnk), make_coord(0, 0));  // (BLK_M,BLK_N)
-    auto thr_mma = mma.get_slice(first_thread_in_sg_idx);
+    auto thr_mma = mma.get_slice(local_id);
     auto tCrC = thr_mma.partition_sg_fragment_C(make_identity_tensor(select<0,1>(tile_mnk))); // allocate C fragment storage
     Tensor tCgC = thr_mma.partition_C(gC);
     gemm_kernel<true>(trait, A, B, tCrC, mma);
-    int local_id = sg.get_local_id();
+
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i <  size(tCgC); ++i) {
         auto [m, n] = tCgC(i);
-        cutlass::atomicAdd(&C(m, n + local_id), tCrC(i));
+        cutlass::atomicAdd(&C(m, n), tCrC(i));
     }
 }
 
@@ -240,10 +233,9 @@ mha_copy(Trait & trait, TiledMma &tiled_mma,
          SubgroupTensor<Engine0, Layout0, TVLayout0> &r,
          Tensor<Engine1, Layout1> &m,
          int m_block = 0, int n_block = 0) {
-    auto sg = compat::get_nd_item<1>().get_sub_group();
-    auto first_thread_in_sg_idx = sg.get_group_linear_id() * trait.SubgroupSize;
+    auto local_id = int(compat::get_nd_item<1>().get_local_id(0));
     auto copy_c = make_block_2d_copy_D(tiled_mma, m);
-    auto thr_copy_c = copy_c.get_slice(first_thread_in_sg_idx);
+    auto thr_copy_c = copy_c.get_slice(local_id);
     auto tile_mnk = tiled_mma.tile_mnk();
     Tensor cC = make_identity_tensor(m.shape());
     Tensor gC = local_tile(cC, select<0, 1>(tile_mnk), make_coord(m_block, n_block));
@@ -454,10 +446,8 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
     constexpr int SubgroupSize = Trait::SubgroupSize;
     constexpr int AtomLayoutMdQ = Trait::AtomLayoutMdQ;
     constexpr bool is_causal = Trait::is_causal;
-    auto sg = compat::get_nd_item<1>().get_sub_group();
+    auto local_id = int(compat::get_nd_item<1>().get_local_id(0));
     auto group = compat::get_nd_item<1>().get_group();
-    const int local_id = sg.get_local_id();
-    auto first_thread_in_sg_idx = sg.get_group_linear_id() * trait.SubgroupSize;
     auto bofst = Boffset(param);
 
     const index_t q_offset = bofst.q_offset(bidb, bidh, 0);
@@ -569,7 +559,7 @@ dq_dk_dv_1colblock(Trait &trait, Param<typename Trait::DType> &param,
     typename Trait::TiledMmadKV tiled_mma_dkv;
     typename Trait::TiledMmadQ tiled_mma_dq;
 
-    auto thr_mma_sdp = tiled_mma_sdp.get_slice(first_thread_in_sg_idx);
+    auto thr_mma_sdp = tiled_mma_sdp.get_slice(local_id);
 
     // for coordinate lookup
     Tensor caccS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{}); // same buffer as accS
