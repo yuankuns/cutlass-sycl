@@ -169,10 +169,10 @@ void launch_mha_backward(ProblemShape problem_shape,
             dqaccum_d, dq_d, dk_d, dv_d,
             seq_len_q_pad, seq_len_kv_pad);
     } else if (headdim == 128) {
-        constexpr int kBlockM = 64;
-        constexpr int kBlockN = 64;
+        constexpr int kBlockM = 128;
+        constexpr int kBlockN = 128;
         constexpr int kHeadDim = 128;
-        constexpr int kNSGs = 8;
+        constexpr int kNSGs = 32;
         constexpr int AtomLayoutMSdP = 4;
         constexpr int AtomLayoutNdKV = 4;
         constexpr int AtomLayoutMdQ = 4;
