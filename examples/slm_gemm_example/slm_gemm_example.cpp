@@ -71,9 +71,9 @@ struct SlmGemmTrait {
     using MMA_Atom_ARCH = XE_DPAS_TT<8, VType, DType>;
     using _K = Int<MMA_Atom_ARCH::K>;
 
-    // GEMM1: S[kBlockN, kBlockM] = B1[kBlockN, D] * A_blk[kBlockM, D]
+    // GEMM1: S[kBlockM, kBlockN] = B1[kBlockM, D] * A_blk[kBlockN, D]^T
     using SubgroupLayout1 = Layout<Shape<Int<AtomLayoutM1_>, Int<kNSGs / AtomLayoutM1_>, _1>>;
-    using TileShape1      = Layout<Shape<Int<kBlockN>, Int<kBlockM>, _K>>;
+    using TileShape1      = Layout<Shape<Int<kBlockM>, Int<kBlockN>, _K>>;
     using TiledMma1 = typename TiledMMAHelper<MMA_Atom<MMA_Atom_ARCH>,
                                               TileShape1,
                                               SubgroupLayout1>::TiledMMA;
@@ -186,15 +186,14 @@ gemm_kernel(Trait &trait,
 }
 
 // ============================================================
-// slm_reorder_save: f32 acc -> f16 via CuTe reorder, then
-//   SIMD32 d64x4 store to transposed SLM — 1 instruction total.
+// slm_reorder_save: f32 acc → fp16 dual-half → SIMD32 d64 SLM store.
+//   Skips CuTe reorder. Converts f32 directly into dual-half GRF layout:
+//     GRF_i.lower = fp16(r[2i])   (M_even row)
+//     GRF_i.upper = fp16(r[2i+1]) (M_odd row)
+//   4 GRFs = 8 rows per SIMD32 d64 store. Enables zero reorder movs on load.
 //
 //   SLM layout: transposed [kBlockM, kBlockN], kBlockN innermost.
-//   S(row, col) → SLM(col, row). Consecutive rows contiguous.
-//
-//   SIMD32 d64x4: each half stores 4 d64 (16 fp16) per lane.
-//   Half 0 = col-group 0, half 1 = col-group 1.
-//   32 fp16 per lane in 1 instruction.
+//   SLM(k, m) = slm_base + k * kBlockM * sizeof(T) + m * sizeof(T).
 // ============================================================
 template<class Trait,
          class Engine0, class Layout0,
@@ -203,14 +202,10 @@ template<class Trait,
 void
 slm_reorder_save(Trait &trait,
                  Tensor<Engine0, Layout0> &mC,
-                 uint32_t slm_offset,
+                 typename Trait::DType *smem,
                  SubgroupTensor<Engine2, Layout2, TVLayout2> &r,
                  TiledMMA const &tiled_mma) {
     using T = typename Trait::DType;
-
-    // CuTe reorder: f32 MMA layout -> f16 Copy layout
-    auto r16 = create_reg<T>(trait, mC, tiled_mma);
-    reorder(r, r16);
 
 #ifdef __SYCL_DEVICE_ONLY__
     static_assert(sizeof(T) == 2, "Expected fp16/bf16");
@@ -219,13 +214,10 @@ slm_reorder_save(Trait &trait,
     constexpr int SubgroupSize = Trait::SubgroupSize;
     constexpr int AtomLayoutM1 = Trait::AtomLayoutM1;
     constexpr int AtomLayoutN1 = Trait::kNSGs / AtomLayoutM1;
-    constexpr int SubtileM = kBlockN / AtomLayoutM1;   // 16 rows per SG
-    constexpr int SubtileN = kBlockM / AtomLayoutN1;   // 32 cols per SG
-    constexpr int col_groups = SubtileN / SubgroupSize; // 2
-    constexpr uint32_t slm_col_stride = kBlockN * sizeof(T);
-
-    static_assert(SubtileM == 16, "d64x4 pattern expects SubtileM=16");
-    static_assert(col_groups == 2, "d64x4 pattern expects 2 col-groups");
+    constexpr int SubtileM = kBlockM / AtomLayoutM1;  // M-elements per subgroup
+    constexpr int SubtileN = kBlockN / AtomLayoutN1;  // N-columns per subgroup
+    constexpr int col_groups = SubtileN / SubgroupSize;
+    constexpr int ROWS_PER_STORE = 8;  // 4 GRFs × 2 rows/GRF per SIMD32 d64 store
 
     auto local_id = int(compat::get_nd_item<1>().get_local_id(0));
     int sg_idx = local_id / SubgroupSize;
@@ -233,23 +225,45 @@ slm_reorder_save(Trait &trait,
     int sg_m   = sg_idx % AtomLayoutM1;
     int sg_n   = sg_idx / AtomLayoutM1;
 
-    uint32_t row_base = sg_m * SubtileM * sizeof(T);
+    uint32_t slm_base = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(smem));
 
     CUTLASS_PRAGMA_UNROLL
     for (int cg = 0; cg < col_groups; ++cg) {
-        uint32_t col = sg_n * SubtileN + cg * SubgroupSize + lane;
-        uint32_t base_addr = slm_offset + col * slm_col_stride + row_base;
+        uint32_t n_col = sg_n * SubtileN + cg * SubgroupSize + lane;
 
         CUTLASS_PRAGMA_UNROLL
-        for (int row = 0; row < SubtileM; row += 8) {
-            int i = cg * SubtileM + row;
-            auto &vals = *recast_ptr<intel::ulong2>(&r16(i));
+        for (int s = 0; s < SubtileM; s += ROWS_PER_STORE) {
+            int base_elem = cg * SubtileM + s;
+            auto &src = *recast_ptr<intel::uint16>(&r(base_elem));
+
+            // f32→fp16 directly into dual-half layout: 8 movs for 8 rows
+            intel::ulong2 packed;
+            asm volatile(
+                "{\n"
+                ".decl PACK_HF v_type=G type=HF num_elts=256 alias=<%0,0>\n"
+                ".decl PACK_F  v_type=G type=F  num_elts=128 alias=<%2,0>\n"
+                "mov (M1, 16) PACK_HF(0,0)<1>  PACK_F(0,0)<1;1,0>\n"
+                "mov (M1, 16) PACK_HF(0,16)<1> PACK_F(1,0)<1;1,0>\n"
+                "mov (M1, 16) PACK_HF(1,0)<1>  PACK_F(2,0)<1;1,0>\n"
+                "mov (M1, 16) PACK_HF(1,16)<1> PACK_F(3,0)<1;1,0>\n"
+                "mov (M1, 16) PACK_HF(2,0)<1>  PACK_F(4,0)<1;1,0>\n"
+                "mov (M1, 16) PACK_HF(2,16)<1> PACK_F(5,0)<1;1,0>\n"
+                "mov (M1, 16) PACK_HF(3,0)<1>  PACK_F(6,0)<1;1,0>\n"
+                "mov (M1, 16) PACK_HF(3,16)<1> PACK_F(7,0)<1;1,0>\n"
+                "}\n"
+                : "=rw"(packed)
+                : "rw"(packed), "rw"(src)
+            );
+
+            // SIMD32 d64 store: lo16 → rows s..s+3, hi16 → rows s+4..s+7
+            uint32_t m_base = sg_m * SubtileM + s;
             intel::uint2 addrs;
-            addrs[0] = base_addr + row * sizeof(T);
-            addrs[1] = base_addr + (row + 4) * sizeof(T);
+            addrs[0] = slm_base + n_col * kBlockM * sizeof(T) + m_base * sizeof(T);
+            addrs[1] = addrs[0] + 4 * sizeof(T);
+
             asm volatile(
                 "lsc_store.slm (M1_NM, 32) flat[%0]:a32 %1:d64"
-                :: "rw"(addrs), "rw"(vals)
+                :: "rw"(addrs), "rw"(packed)
             );
         }
     }
@@ -259,15 +273,13 @@ slm_reorder_save(Trait &trait,
 }
 
 // ============================================================
-// load_slm: load one k-tile of A from SLM into MMA fragment
-//   via SIMD32 lsc_load.slm d64 — 4 instructions per k-tile.
+// load_slm: load one k-tile of A from SLM into tCrA register fragment.
+//   SIMD32 d64 load with AVector output typing for zero reorder movs.
+//   SLM contains dual-half VNNI data from slm_reorder_save.
+//   lo16 loads rows 0-3, hi16 loads rows 4-7 (matching the store pattern).
 //
 //   SLM layout: transposed [kBlockM, kBlockN], kBlockN innermost.
-//   S(m, k) stored at SLM(k, m).
-//   addr = slm_offset + k * kBlockN * 2 + m * 2.
-//   Consecutive m gives consecutive addresses → d64 packs 4.
-//
-//   Note: lsc_load.slm does not support d64x4, only d64.
+//   SLM(k, m) = slm_base + k * kBlockM * sizeof(T) + m * sizeof(T).
 // ============================================================
 template<class Trait,
          class Engine0, class Layout0,
@@ -275,30 +287,42 @@ template<class Trait,
          class Engine2, class Layout2, class TVLayout2>
 CUTLASS_DEVICE void
 load_slm(Trait &trait,
-         uint32_t slm_offset,
+         typename Trait::DType *smem,
          Tensor<Engine0, Layout0> const& sA,
          Tensor<Engine1, Layout1> const& tCgA_tile,
-         SubgroupTensor<Engine2, Layout2, TVLayout2> &tCrA) {
+         SubgroupTensor<Engine2, Layout2, TVLayout2> &tCrA,
+         int k_tile) {
     using T = typename Trait::DType;
-    constexpr int kBlockN = Trait::kBlockN;
-    constexpr uint32_t slm_col_stride = kBlockN * sizeof(T);
+    using AVector = intel::vector_t<T, 8>;
+    constexpr int kBlockM = Trait::kBlockM;
 
 #ifdef __SYCL_DEVICE_ONLY__
     static_assert(sizeof(T) == 2);
-    auto [m0, k0] = tCgA_tile(0);
-    uint32_t base_addr = slm_offset + uint32_t(k0) * slm_col_stride
-                       + uint32_t(m0) * sizeof(T);
+    uint32_t slm_base = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(smem));
+
+    constexpr int N = decltype(tCrA.size())::value;
+    // 8 fp16 per AVector = 4 GRFs = 1 SIMD32 d64 load
+    constexpr int FP16_PER_LOAD = 8;
+    constexpr int NUM_LOADS = N / FP16_PER_LOAD;
 
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < size(tCgA_tile); i += 8) {
-        auto &vals = *recast_ptr<intel::ulong2>(&tCrA(i));
-        uint32_t addr = base_addr + i * sizeof(T);
+    for (int g = 0; g < NUM_LOADS; g++) {
+        // Use tCgA coordinates for first element of this group
+        auto [m_coord, k_coord] = tCgA_tile(g * FP16_PER_LOAD);
+        uint32_t base_addr = slm_base
+                           + uint32_t(k_coord) * kBlockM * sizeof(T)
+                           + uint32_t(m_coord) * sizeof(T);
+
+        // lo16: rows m..m+3, hi16: rows m+4..m+7
         intel::uint2 addrs;
-        addrs[0] = addr;
-        addrs[1] = addr + 4 * sizeof(T);
+        addrs[0] = base_addr;
+        addrs[1] = base_addr + 4 * sizeof(T);
+
+        auto &data = *reinterpret_cast<AVector*>(&tCrA(g * FP16_PER_LOAD));
         asm volatile(
             "lsc_load.slm (M1_NM, 32) %0:d64 flat[%1]:a32"
-            : "=rw"(vals) : "rw"(addrs)
+            : "=rw"(data)
+            : "rw"(addrs)
         );
     }
 #else
@@ -318,7 +342,7 @@ template<bool clear_acc, class Trait,
 void
 gemm_slm_kernel(Trait &trait,
                 Tensor<Engine0, Layout0> const& A,
-                uint32_t slm_offset,
+                typename Trait::DType *smem,
                 Tensor<Engine1, Layout1> &sA,
                 Tensor<Engine2, Layout2> const& B,
                 SubgroupTensor<Engine3, Layout3, TVLayout3> &acc,
@@ -364,7 +388,7 @@ gemm_slm_kernel(Trait &trait,
     for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
         barrier_arrive(barrier_scope);
 
-        load_slm(trait, slm_offset, sA, tCgA(_,_,_,k_tile), tCrA);
+        load_slm(trait, smem, sA, tCgA(_,_,_,k_tile), tCrA, k_tile);
 
         copy(copy_b, tBgB(_,_,_,k_tile), tBrB);
         prefetch(prefetch_b, pBgB(_,_,_,k_tile_prefetch));
@@ -431,18 +455,17 @@ slm_gemm_device(Trait trait,
                                 make_shape(Int<kBlockN>{}, Int<kHeadDim>{}),
                                 make_stride(Int<kHeadDim>{}, _1{})));
 
-    // Scratch proxy: same shape/stride as SLM
+    // Scratch proxy: [kBlockM, kBlockN] row-major (matching TileShape1)
     Tensor mScratch = make_tensor(make_gmem_ptr(scratch_ptr),
                                   make_layout(
-                                      make_shape(Int<kBlockN>{}, Int<kBlockM>{}),
-                                      make_stride(Int<kBlockM>{}, _1{})));
+                                      make_shape(Int<kBlockM>{}, Int<kBlockN>{}),
+                                      make_stride(Int<kBlockN>{}, _1{})));
 
-    // SLM tensor: [kBlockN, kBlockM] — same shape as proxy mScratch
-    // ASM uses slm_offset for addressing; CuTe tensor used as fallback
+    // SLM tensor: [kBlockM, kBlockN] — same shape as proxy mScratch
     Tensor sC1 = make_tensor(make_smem_ptr(smem),
                              make_layout(
-                                 make_shape(Int<kBlockN>{}, Int<kBlockM>{}),
-                                 make_stride(Int<kBlockM>{}, _1{})));
+                                 make_shape(Int<kBlockM>{}, Int<kBlockN>{}),
+                                 make_stride(Int<kBlockN>{}, _1{})));
 
     // Output C (dV-like): [kBlockN, kHeadDim] row-major — for this n_block
     Tensor mC = make_tensor(make_gmem_ptr(C_ptr + n_block * kBlockN * kHeadDim),
@@ -469,18 +492,20 @@ slm_gemm_device(Trait trait,
                                   make_shape(Int<kHeadDim>{}, Int<kBlockM>{}),
                                   make_stride(_1{}, Int<kHeadDim>{})));
 
+
+
     for (int m_block = 0; m_block < max_m_block; ++m_block) {
         // GEMM1: rS[kBlockN, kBlockM] = A[kBlockN, D] * B1_blk[kBlockM, D]
         {
             auto rS = create_reg<V>(trait, mScratch, tiled_mma1);
             gemm_kernel<true>(trait, mA, mB1, rS, tiled_mma1);
-            slm_reorder_save(trait, mScratch, slm_offset, rS, tiled_mma1);
+            slm_reorder_save(trait, mScratch, smem, rS, tiled_mma1);
         }
 
         sycl::group_barrier(group);
 
         // GEMM2: rdC[kBlockN, D] += SLM[kBlockN, kBlockM] * B2t[D, kBlockM]
-        gemm_slm_kernel<false>(trait, mScratch, slm_offset, sC1, mB2t, rdC, tiled_mma2);
+        gemm_slm_kernel<false>(trait, mScratch, smem, sC1, mB2t, rdC, tiled_mma2);
 
         sycl::group_barrier(group);
 
