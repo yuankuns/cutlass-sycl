@@ -120,6 +120,7 @@ if(CUTLASS_ENABLE_SYCL)
       sdpa_bwd
       sdpa_bwd_slm_reproducer
       slm_gemm_example
+      slm_gemm_example2
       )
       add_subdirectory(${EXAMPLE})
     endforeach()
