@@ -141,6 +141,7 @@ if (CUTLASS_ENABLE_SYCL)
     intel_gpu_bmg_g31
     bmg
     pvc
+    cri
   )
 
   foreach(ITEM IN LISTS DPCPP_SYCL_TARGET_LIST)
@@ -159,6 +160,9 @@ if (CUTLASS_ENABLE_SYCL)
 
   if(SYCL_INTEL_TARGET)
       add_compile_definitions(SYCL_INTEL_TARGET)
+      if("cri" IN_LIST DPCPP_SYCL_TARGET_LIST)
+        add_compile_definitions(__SYCL_TARGET_INTEL_GPU_CRI__)
+      endif()
       add_compile_options(
         -Wall
         -Wno-unused-variable
@@ -1334,4 +1338,3 @@ install(
 ################################################################################
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/NvidiaCutlassPackageConfig.cmake)
-
