@@ -121,6 +121,7 @@ if(CUTLASS_ENABLE_SYCL)
       11_xe20_cutlass_library
       12_xe20_moe_gemm_cute_interface
       13_bmg_gemm_bias
+      14_fmha_prefill_kvcache
       )
       add_subdirectory(${EXAMPLE})
     endforeach()
@@ -132,4 +133,3 @@ else()
   message(STATUS "CUTLASS_ENABLE_SYCL is OFF - no examples will be built")
   message(STATUS "Enable SYCL support to build CUTLASS examples")
 endif()
-
