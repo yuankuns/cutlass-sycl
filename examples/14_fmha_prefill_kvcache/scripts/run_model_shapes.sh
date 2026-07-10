@@ -437,6 +437,43 @@ run_case "chunk.hetero_paged_hd128_lists" \
 run_case "chunk.hetero_nonpaged_hd128_lists" \
   --batch 3 --seqlen-q 128 --seqlen-k 257 --seqlen-q-list 1,32,255 --past-kv-list 0,64,130 \
   --heads-q 2 --heads-kv 1 --head-dim 128 --head-dim-v 128 --paged 0 --causal 1
+
+# Generalized chunk-prefill coverage derived from vLLM/SGLang test patterns:
+# mixed query/context lengths, decode-like q=1, page/block tails, GQA/MQA,
+# local windows, and multi-request batches.
+run_case "chunk.generalized_paged_batch2_q1024_k1024" \
+  --batch 2 --seqlen-q 1024 --seqlen-k 1024 --seqlen-q-list 1024,1024 --past-kv-list 0,0 \
+  --heads-q 2 --heads-kv 1 --head-dim 128 --head-dim-v 128 --paged 1 --page-size 128 --causal 1
+
+run_case "chunk.generalized_paged_mixed_decode_extend" \
+  --batch 6 --seqlen-q 255 --seqlen-k 1024 --seqlen-q-list 1,16,33,64,128,255 \
+  --past-kv-list 1023,17,64,0,129,257 \
+  --heads-q 4 --heads-kv 1 --head-dim 128 --head-dim-v 128 --paged 1 --page-size 64 --causal 1
+
+run_case "chunk.generalized_paged_page128_tails" \
+  --batch 4 --seqlen-q 129 --seqlen-k 384 --seqlen-q-list 1,31,127,129 \
+  --past-kv-list 127,128,129,255 \
+  --heads-q 4 --heads-kv 1 --head-dim 128 --head-dim-v 128 --paged 1 --page-size 128 --causal 1
+
+run_case "chunk.generalized_paged_gqa_mixed_prefix" \
+  --batch 4 --seqlen-q 128 --seqlen-k 320 --seqlen-q-list 17,64,96,128 \
+  --past-kv-list 15,96,127,192 \
+  --heads-q 8 --heads-kv 2 --head-dim 128 --head-dim-v 128 --paged 1 --page-size 64 --causal 1
+
+run_case "chunk.generalized_paged_sglang_prefix_lens" \
+  --batch 4 --seqlen-q 64 --seqlen-k 128 --seqlen-q-list 64,64,64,64 \
+  --past-kv-list 16,32,48,64 \
+  --heads-q 4 --heads-kv 1 --head-dim 128 --head-dim-v 128 --paged 1 --page-size 64 --causal 1
+
+run_case "chunk.generalized_paged_local_window_offsets" \
+  --batch 3 --seqlen-q 10 --seqlen-k 17 --seqlen-q-list 4,10,5 --past-kv-list 2,7,4 \
+  --heads-q 4 --heads-kv 1 --head-dim 128 --head-dim-v 128 --paged 1 --page-size 64 \
+  --causal 0 --window-left 4 --window-right 0
+
+run_case "chunk.generalized_nonpaged_mixed_prefix" \
+  --batch 4 --seqlen-q 129 --seqlen-k 193 --seqlen-q-list 1,17,64,129 \
+  --past-kv-list 16,32,48,64 \
+  --heads-q 2 --heads-kv 1 --head-dim 128 --head-dim-v 128 --paged 0 --causal 1
 fi
 
 # Large-seqlen performance checks.  These skip the CPU reference intentionally:

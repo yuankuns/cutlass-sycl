@@ -406,3 +406,47 @@ fmha_prefill_add_case(chunk.hetero_nonpaged_hd128_lists
   CHUNK CAUSAL
   BATCH 3 SEQLEN_Q 128 SEQLEN_K 257 SEQLEN_Q_LIST 1,32,255 PAST_KV_LIST 0,64,130
   HEADS_Q 2 HEADS_KV 1 HEAD_DIM 128)
+
+# Generalized chunk-prefill accuracy cases, following the coverage dimensions
+# used by vLLM/SGLang tests: mixed query/context lengths, decode-like q=1,
+# page/block tails, GQA/MQA, local windows, and multi-request batches.
+fmha_prefill_add_case(chunk.generalized_paged_batch2_q1024_k1024
+  CHUNK PAGED CAUSAL
+  BATCH 2 SEQLEN_Q 1024 SEQLEN_K 1024 SEQLEN_Q_LIST 1024,1024 PAST_KV_LIST 0,0
+  HEADS_Q 2 HEADS_KV 1 HEAD_DIM 128 PAGE_SIZE 128)
+
+fmha_prefill_add_case(chunk.generalized_paged_mixed_decode_extend
+  CHUNK PAGED CAUSAL
+  BATCH 6 SEQLEN_Q 255 SEQLEN_K 1024 SEQLEN_Q_LIST 1,16,33,64,128,255
+  PAST_KV_LIST 1023,17,64,0,129,257
+  HEADS_Q 4 HEADS_KV 1 HEAD_DIM 128 PAGE_SIZE 64)
+
+fmha_prefill_add_case(chunk.generalized_paged_page128_tails
+  CHUNK PAGED CAUSAL
+  BATCH 4 SEQLEN_Q 129 SEQLEN_K 384 SEQLEN_Q_LIST 1,31,127,129
+  PAST_KV_LIST 127,128,129,255
+  HEADS_Q 4 HEADS_KV 1 HEAD_DIM 128 PAGE_SIZE 128)
+
+fmha_prefill_add_case(chunk.generalized_paged_gqa_mixed_prefix
+  CHUNK PAGED CAUSAL
+  BATCH 4 SEQLEN_Q 128 SEQLEN_K 320 SEQLEN_Q_LIST 17,64,96,128
+  PAST_KV_LIST 15,96,127,192
+  HEADS_Q 8 HEADS_KV 2 HEAD_DIM 128 PAGE_SIZE 64)
+
+fmha_prefill_add_case(chunk.generalized_paged_sglang_prefix_lens
+  CHUNK PAGED CAUSAL
+  BATCH 4 SEQLEN_Q 64 SEQLEN_K 128 SEQLEN_Q_LIST 64,64,64,64
+  PAST_KV_LIST 16,32,48,64
+  HEADS_Q 4 HEADS_KV 1 HEAD_DIM 128 PAGE_SIZE 64)
+
+fmha_prefill_add_case(chunk.generalized_paged_local_window_offsets
+  CHUNK PAGED
+  BATCH 3 SEQLEN_Q 10 SEQLEN_K 17 SEQLEN_Q_LIST 4,10,5 PAST_KV_LIST 2,7,4
+  HEADS_Q 4 HEADS_KV 1 HEAD_DIM 128 PAGE_SIZE 64
+  WINDOW_LEFT 4 WINDOW_RIGHT 0)
+
+fmha_prefill_add_case(chunk.generalized_nonpaged_mixed_prefix
+  CHUNK CAUSAL
+  BATCH 4 SEQLEN_Q 129 SEQLEN_K 193 SEQLEN_Q_LIST 1,17,64,129
+  PAST_KV_LIST 16,32,48,64
+  HEADS_Q 2 HEADS_KV 1 HEAD_DIM 128)
