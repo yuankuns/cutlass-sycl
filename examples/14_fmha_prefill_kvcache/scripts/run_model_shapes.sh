@@ -523,6 +523,11 @@ run_perf_case "perf.saturate.batch2_tail_h8_hd128_sq512_sk4097" \
 run_perf_case "perf.chunk.qwen3_32b.paged_sq512_past7680_sk8192" \
   --batch 1 --seqlen-q 512 --seqlen-k 8192 --past-kv 7680 --heads-q 16 --heads-kv 4 \
   --head-dim 128 --head-dim-v 128 --paged 1 --page-size 128 --causal 1
+
+# Decode-like means q_len=1 with a long KV cache, not kv_len=1.
+run_perf_case "perf.chunk.mixed_decode_prefill.paged_q1_q512_past8191_7680_sk8192" \
+  --batch 2 --seqlen-q 512 --seqlen-k 8192 --seqlen-q-list 1,512 --past-kv-list 8191,7680 \
+  --heads-q 16 --heads-kv 4 --head-dim 128 --head-dim-v 128 --paged 1 --page-size 128 --causal 1
 fi
 
 echo "summary: passed=$passed failed=$failed total=$total"
