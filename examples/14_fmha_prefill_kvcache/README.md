@@ -30,6 +30,12 @@ cmake -S . -B build/fmha_prefill_kvcache \
 cmake --build build/fmha_prefill_kvcache --target fmha_prefill_kvcache -j
 ```
 
+Paged `head_dim=128` keeps the q128/k64 base tile for smaller requests and,
+by default, enables a q256/k32 path for model-sized requests with
+`seqlen_q >= 512`.  The large-shape path can be disabled with
+`-DFMHA_STANDALONE_PAGED_HD128_LARGE_TILE=OFF`; its threshold and tile sizes are
+exposed as `FMHA_STANDALONE_PAGED_HD128_LARGE_TILE_*` CMake cache variables.
+
 Tests are enabled by default.  They are registered through CTest and remain
 C++/SYCL-only:
 

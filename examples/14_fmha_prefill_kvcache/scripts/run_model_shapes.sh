@@ -11,6 +11,8 @@ ATOL="${FMHA_PREFILL_ATOL:-0.08}"
 RTOL="${FMHA_PREFILL_RTOL:-0.08}"
 FILTER="${FMHA_PREFILL_FILTER:-}"
 SUITE="${FMHA_PREFILL_SUITE:-tile,perf}"
+PAGED_HD128_TILE_Q="${FMHA_PREFILL_PAGED_HD128_TILE_Q:-128}"
+PAGED_HD128_TILE_KV="${FMHA_PREFILL_PAGED_HD128_TILE_KV:-64}"
 
 usage() {
   cat <<EOF
@@ -337,8 +339,8 @@ fi
 # underlying Q/KV tile size: exact multiples, non-multiples, +/-1, +/-2,
 # half-tile, and half-tile+1 tails.
 if suite_enabled tile; then
-run_tile_boundary_family "tile.paged_hd128_q128_k64" \
-  1 64 1 4 1 128 128 128 64
+run_tile_boundary_family "tile.paged_hd128_q${PAGED_HD128_TILE_Q}_k${PAGED_HD128_TILE_KV}" \
+  1 64 1 4 1 128 128 "$PAGED_HD128_TILE_Q" "$PAGED_HD128_TILE_KV"
 
 run_tile_boundary_family "tile.nonpaged_hd128_q256_k32" \
   0 64 1 2 1 128 128 256 32
