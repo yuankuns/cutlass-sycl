@@ -9,6 +9,7 @@
 #include <iostream>
 #include <limits>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -25,6 +26,7 @@ struct Config {
   int batch = 4;
   int seqlen_q = 128;
   int seqlen_k = 1024;
+  int past_kv = 0;
   int heads_q = 16;
   int heads_kv = 4;
   int head_dim = 64;
@@ -41,6 +43,24 @@ struct Config {
   double atol = 5e-2;
   double rtol = 5e-2;
   bool verify = true;
+  bool past_kv_set = false;
+  std::vector<int> past_kv_list;
+  std::vector<int> seqlen_q_list;
+};
+
+struct LengthInfo {
+  std::vector<int32_t> q_lens;
+  std::vector<int32_t> k_lens;
+  std::vector<int32_t> past_lens;
+  std::vector<int32_t> cu_q;
+  std::vector<int32_t> cu_k;
+  std::vector<int32_t> page_table;
+  int max_q = 0;
+  int max_k = 0;
+  int total_q = 0;
+  int total_k = 0;
+  int total_pages = 0;
+  int page_table_stride = 0;
 };
 
 uint32_t float_bits(float x) {
@@ -82,6 +102,24 @@ bool parse_bool(const std::string& v) {
   throw std::runtime_error("invalid bool value: " + v);
 }
 
+std::vector<int> parse_int_list(const std::string& text, const char* name) {
+  std::vector<int> values;
+  std::stringstream ss(text);
+  std::string item;
+  while (std::getline(ss, item, ',')) {
+    const auto first = item.find_first_not_of(" \t");
+    const auto last = item.find_last_not_of(" \t");
+    if (first == std::string::npos) {
+      throw std::runtime_error(std::string("empty value in --") + name);
+    }
+    values.push_back(std::stoi(item.substr(first, last - first + 1)));
+  }
+  if (values.empty()) {
+    throw std::runtime_error(std::string("--") + name + " must contain at least one value");
+  }
+  return values;
+}
+
 Config parse_args(int argc, char** argv) {
   Config cfg;
   std::unordered_map<std::string, std::string> kv;
@@ -91,6 +129,7 @@ Config parse_args(int argc, char** argv) {
       std::cout
           << "Usage: fmha_prefill_kvcache [options]\n"
           << "  --batch N --seqlen-q N --seqlen-k N --heads-q N --heads-kv N\n"
+          << "  --past-kv N --past-kv-list a,b,... --seqlen-q-list a,b,...\n"
           << "  --head-dim N --head-dim-v N --paged 0|1 --page-size N\n"
           << "  --causal 0|1 --window-left N --window-right N --sink 0|1\n"
           << "  --warmup N --iters N --seed N --verify 0|1 --atol F --rtol F\n";
@@ -118,6 +157,19 @@ Config parse_args(int argc, char** argv) {
   get_int("batch", cfg.batch);
   get_int("seqlen-q", cfg.seqlen_q);
   get_int("seqlen-k", cfg.seqlen_k);
+  auto past_it = kv.find("past-kv");
+  if (past_it != kv.end()) {
+    cfg.past_kv = std::stoi(past_it->second);
+    cfg.past_kv_set = true;
+  }
+  auto past_list_it = kv.find("past-kv-list");
+  if (past_list_it != kv.end()) {
+    cfg.past_kv_list = parse_int_list(past_list_it->second, "past-kv-list");
+  }
+  auto q_list_it = kv.find("seqlen-q-list");
+  if (q_list_it != kv.end()) {
+    cfg.seqlen_q_list = parse_int_list(q_list_it->second, "seqlen-q-list");
+  }
   get_int("heads-q", cfg.heads_q);
   get_int("heads-kv", cfg.heads_kv);
   get_int("head-dim", cfg.head_dim);
@@ -137,6 +189,24 @@ Config parse_args(int argc, char** argv) {
 
   if (cfg.batch <= 0 || cfg.seqlen_q <= 0 || cfg.seqlen_k <= 0) {
     throw std::runtime_error("batch, seqlen_q, and seqlen_k must be positive");
+  }
+  if (cfg.past_kv_set && !cfg.past_kv_list.empty()) {
+    throw std::runtime_error("--past-kv and --past-kv-list are mutually exclusive");
+  }
+  if (cfg.past_kv_set && cfg.past_kv < 0) {
+    throw std::runtime_error("--past-kv must be non-negative");
+  }
+  if (!cfg.past_kv_list.empty() && static_cast<int>(cfg.past_kv_list.size()) != cfg.batch) {
+    throw std::runtime_error("--past-kv-list must have exactly batch entries");
+  }
+  if (!cfg.seqlen_q_list.empty() && static_cast<int>(cfg.seqlen_q_list.size()) != cfg.batch) {
+    throw std::runtime_error("--seqlen-q-list must have exactly batch entries");
+  }
+  for (int v : cfg.past_kv_list) {
+    if (v < 0) throw std::runtime_error("--past-kv-list entries must be non-negative");
+  }
+  for (int v : cfg.seqlen_q_list) {
+    if (v <= 0) throw std::runtime_error("--seqlen-q-list entries must be positive");
   }
   if (cfg.heads_q <= 0 || cfg.heads_kv <= 0 || cfg.heads_q % cfg.heads_kv != 0) {
     throw std::runtime_error("heads_q must be positive and divisible by heads_kv");
@@ -159,6 +229,65 @@ Config parse_args(int argc, char** argv) {
     throw std::runtime_error("paged standalone prefill supports head_dim in {64,96,128,192,256,512}");
   }
   return cfg;
+}
+
+LengthInfo make_lengths(const Config& cfg) {
+  LengthInfo lengths;
+  lengths.q_lens.resize(cfg.batch);
+  lengths.k_lens.resize(cfg.batch);
+  lengths.past_lens.resize(cfg.batch);
+  lengths.cu_q.assign(cfg.batch + 1, 0);
+  lengths.cu_k.assign(cfg.batch + 1, 0);
+
+  const bool chunk_lengths = cfg.past_kv_set || !cfg.past_kv_list.empty();
+  for (int b = 0; b < cfg.batch; ++b) {
+    lengths.q_lens[b] = cfg.seqlen_q_list.empty() ? cfg.seqlen_q : cfg.seqlen_q_list[b];
+    if (chunk_lengths) {
+      lengths.past_lens[b] = cfg.past_kv_list.empty() ? cfg.past_kv : cfg.past_kv_list[b];
+      lengths.k_lens[b] = lengths.past_lens[b] + lengths.q_lens[b];
+    } else {
+      lengths.k_lens[b] = cfg.seqlen_k;
+      lengths.past_lens[b] = lengths.k_lens[b] - lengths.q_lens[b];
+    }
+    if (lengths.k_lens[b] <= 0) {
+      throw std::runtime_error("resolved per-batch seqlen_k must be positive");
+    }
+    lengths.max_q = std::max(lengths.max_q, lengths.q_lens[b]);
+    lengths.max_k = std::max(lengths.max_k, lengths.k_lens[b]);
+    lengths.cu_q[b + 1] = lengths.cu_q[b] + lengths.q_lens[b];
+    lengths.cu_k[b + 1] = lengths.cu_k[b] + lengths.k_lens[b];
+  }
+  lengths.total_q = lengths.cu_q.back();
+
+  if (cfg.paged) {
+    std::vector<int32_t> pages_per_batch(cfg.batch);
+    int max_pages = 0;
+    for (int b = 0; b < cfg.batch; ++b) {
+      pages_per_batch[b] = (lengths.k_lens[b] + cfg.page_size - 1) / cfg.page_size;
+      max_pages = std::max(max_pages, pages_per_batch[b]);
+    }
+    // The mainloop uses max_num_pages_per_seq as the page-table row stride and
+    // may prefetch the next logical page at the end of a sequence. Keep one
+    // valid guard entry per row while only allocating physical pages actually
+    // needed by each batch.
+    lengths.page_table_stride = max_pages + 1;
+    lengths.page_table.assign(static_cast<std::size_t>(cfg.batch) * lengths.page_table_stride, 0);
+    for (int b = 0; b < cfg.batch; ++b) {
+      int32_t last_page = lengths.total_pages;
+      for (int p = 0; p < pages_per_batch[b]; ++p) {
+        last_page = lengths.total_pages++;
+        lengths.page_table[static_cast<std::size_t>(b) * lengths.page_table_stride + p] = last_page;
+      }
+      for (int p = pages_per_batch[b]; p < lengths.page_table_stride; ++p) {
+        lengths.page_table[static_cast<std::size_t>(b) * lengths.page_table_stride + p] = last_page;
+      }
+    }
+    lengths.total_k = lengths.total_pages * cfg.page_size;
+  } else {
+    lengths.total_k = lengths.cu_k.back();
+  }
+
+  return lengths;
 }
 
 template <typename T>
@@ -221,26 +350,6 @@ class DeviceBuffer {
   T* ptr_ = nullptr;
   std::size_t n_ = 0;
 };
-
-std::vector<int32_t> make_prefix_lengths(int batch, int seqlen) {
-  std::vector<int32_t> host(batch + 1);
-  for (int i = 0; i <= batch; ++i) host[i] = i * seqlen;
-  return host;
-}
-
-std::vector<int32_t> make_cache_lengths(int batch, int seqlen) {
-  return std::vector<int32_t>(batch, seqlen);
-}
-
-std::vector<int32_t> make_identity_page_table(int batch, int pages_per_seq) {
-  std::vector<int32_t> table(batch * pages_per_seq);
-  for (int b = 0; b < batch; ++b) {
-    for (int p = 0; p < pages_per_seq; ++p) {
-      table[b * pages_per_seq + p] = b * pages_per_seq + p;
-    }
-  }
-  return table;
-}
 
 std::vector<bf16_t> make_random_bf16(std::size_t n, std::mt19937& rng) {
   std::normal_distribution<float> dist(0.0f, 1.0f);
@@ -384,6 +493,7 @@ void dispatch_prefill(const prefill::Arguments& params) {
 
 void run_prefill(
     const Config& cfg,
+    const LengthInfo& lengths,
     bf16_t* q,
     bf16_t* k,
     bf16_t* v,
@@ -392,15 +502,10 @@ void run_prefill(
     int32_t* cu_k_or_cache_lens,
     int32_t* page_table,
     bf16_t* sinks) {
-  const int total_q = cfg.batch * cfg.seqlen_q;
-  const int pages_per_seq = cfg.paged ? (cfg.seqlen_k + cfg.page_size - 1) / cfg.page_size : 0;
-  const int num_pages = cfg.paged ? cfg.batch * pages_per_seq : 0;
-  const int seqlen_k_extent = cfg.paged ? pages_per_seq * cfg.page_size : cfg.seqlen_k;
-
   int window_left = cfg.window_left;
   int window_right = cfg.window_right;
-  if (window_left >= seqlen_k_extent - 1) window_left = -1;
-  window_right = std::min(window_right, cfg.seqlen_q);
+  if (window_left >= lengths.max_k - 1) window_left = -1;
+  window_right = std::min(window_right, lengths.max_q);
   if (cfg.causal) window_right = 0;
 
   prefill::Arguments params{};
@@ -418,11 +523,11 @@ void run_prefill(
   params.h = cfg.heads_q;
   params.h_k = cfg.heads_kv;
   params.q_group_size = 1;
-  params.seqlen_q = cfg.seqlen_q;
-  params.seqlen_k = seqlen_k_extent;
+  params.seqlen_q = lengths.max_q;
+  params.seqlen_k = lengths.max_k;
   params.seqlen_knew = 0;
-  params.total_q = total_q;
-  params.total_k = cfg.paged ? num_pages * cfg.page_size : cfg.batch * cfg.seqlen_k;
+  params.total_q = lengths.total_q;
+  params.total_k = lengths.total_k;
   params.total_knew = 0;
   params.b_k = cfg.batch;
   params.d = cfg.head_dim;
@@ -434,15 +539,15 @@ void run_prefill(
   params.p_dropout = 1.0f;
   params.is_causal = window_left < 0 && window_right == 0;
   params.is_local = (window_left >= 0 || window_right >= 0) && !params.is_causal;
-  if (window_left < 0) window_left = seqlen_k_extent - 1;
-  if (window_right < 0) window_right = cfg.seqlen_q - 1;
+  if (window_left < 0) window_left = lengths.max_k - 1;
+  if (window_right < 0) window_right = lengths.max_q - 1;
   params.window_size_left = window_left;
   params.window_size_right = window_right;
   params.page_table = cfg.paged ? reinterpret_cast<int*>(page_table) : nullptr;
-  params.page_table_batch_stride = cfg.paged ? pages_per_seq : 0;
-  params.max_num_pages_per_seq = pages_per_seq;
+  params.page_table_batch_stride = cfg.paged ? lengths.page_table_stride : 0;
+  params.max_num_pages_per_seq = cfg.paged ? lengths.page_table_stride : 0;
   params.page_size = cfg.paged ? cfg.page_size : 0;
-  params.num_pages = num_pages;
+  params.num_pages = cfg.paged ? lengths.total_pages : 0;
   params.rotary_dim = 0;
 
   dispatch_prefill(params);
@@ -450,50 +555,53 @@ void run_prefill(
 
 std::vector<float> reference_prefill(
     const Config& cfg,
+    const LengthInfo& lengths,
     const std::vector<bf16_t>& q,
     const std::vector<bf16_t>& k,
     const std::vector<bf16_t>& v,
     const std::vector<int32_t>& page_table,
     const std::vector<bf16_t>& sinks) {
-  std::vector<float> ref(static_cast<std::size_t>(cfg.batch) * cfg.seqlen_q * cfg.heads_q * cfg.head_dim_v, 0.0f);
+  std::vector<float> ref(static_cast<std::size_t>(lengths.total_q) * cfg.heads_q * cfg.head_dim_v, 0.0f);
   const int head_group = cfg.heads_q / cfg.heads_kv;
   const float scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim));
-  const int pages_per_seq = cfg.paged ? (cfg.seqlen_k + cfg.page_size - 1) / cfg.page_size : 0;
 
   auto q_at = [&](int row, int h, int d) -> float {
     return bf16_to_float(q[(static_cast<std::size_t>(row) * cfg.heads_q + h) * cfg.head_dim + d]);
   };
   auto k_at = [&](int b, int ck, int h, int d) -> float {
     if (cfg.paged) {
-      const int page = page_table[b * pages_per_seq + ck / cfg.page_size];
+      const int page = page_table[static_cast<std::size_t>(b) * lengths.page_table_stride + ck / cfg.page_size];
       const int offset = ck % cfg.page_size;
       return bf16_to_float(k[((static_cast<std::size_t>(page) * cfg.page_size + offset) * cfg.heads_kv + h) *
                              cfg.head_dim +
                              d]);
     }
-    return bf16_to_float(k[(static_cast<std::size_t>(b * cfg.seqlen_k + ck) * cfg.heads_kv + h) * cfg.head_dim + d]);
+    return bf16_to_float(
+        k[(static_cast<std::size_t>(lengths.cu_k[b] + ck) * cfg.heads_kv + h) * cfg.head_dim + d]);
   };
   auto v_at = [&](int b, int ck, int h, int d) -> float {
     if (cfg.paged) {
-      const int page = page_table[b * pages_per_seq + ck / cfg.page_size];
+      const int page = page_table[static_cast<std::size_t>(b) * lengths.page_table_stride + ck / cfg.page_size];
       const int offset = ck % cfg.page_size;
       return bf16_to_float(v[((static_cast<std::size_t>(page) * cfg.page_size + offset) * cfg.heads_kv + h) *
                              cfg.head_dim_v +
                              d]);
     }
     return bf16_to_float(
-        v[(static_cast<std::size_t>(b * cfg.seqlen_k + ck) * cfg.heads_kv + h) * cfg.head_dim_v + d]);
+        v[(static_cast<std::size_t>(lengths.cu_k[b] + ck) * cfg.heads_kv + h) * cfg.head_dim_v + d]);
   };
 
   for (int b = 0; b < cfg.batch; ++b) {
-    for (int rq = 0; rq < cfg.seqlen_q; ++rq) {
-      const int q_row = b * cfg.seqlen_q + rq;
-      const int row_kv = cfg.seqlen_k - cfg.seqlen_q + rq;
+    const int q_len = lengths.q_lens[b];
+    const int k_len = lengths.k_lens[b];
+    for (int rq = 0; rq < q_len; ++rq) {
+      const int q_row = lengths.cu_q[b] + rq;
+      const int row_kv = lengths.past_lens[b] + rq;
       for (int hq = 0; hq < cfg.heads_q; ++hq) {
         const int hk = hq / head_group;
-        std::vector<float> scores(cfg.seqlen_k, -std::numeric_limits<float>::infinity());
+        std::vector<float> scores(k_len, -std::numeric_limits<float>::infinity());
         float max_score = -std::numeric_limits<float>::infinity();
-        for (int ck = 0; ck < cfg.seqlen_k; ++ck) {
+        for (int ck = 0; ck < k_len; ++ck) {
           bool keep = true;
           if (cfg.causal && ck > row_kv) keep = false;
           if (cfg.window_left >= 0 && ck < row_kv - cfg.window_left) keep = false;
@@ -517,8 +625,8 @@ std::vector<float> reference_prefill(
         if (cfg.sink) {
           denom += std::exp(bf16_to_float(sinks[hq]) - max_score);
         }
-        std::vector<float> probs(cfg.seqlen_k, 0.0f);
-        for (int ck = 0; ck < cfg.seqlen_k; ++ck) {
+        std::vector<float> probs(k_len, 0.0f);
+        for (int ck = 0; ck < k_len; ++ck) {
           if (std::isfinite(scores[ck])) {
             probs[ck] = std::exp(scores[ck] - max_score);
             denom += probs[ck];
@@ -528,7 +636,7 @@ std::vector<float> reference_prefill(
 
         for (int dv = 0; dv < cfg.head_dim_v; ++dv) {
           float acc = 0.0f;
-          for (int ck = 0; ck < cfg.seqlen_k; ++ck) {
+          for (int ck = 0; ck < k_len; ++ck) {
             if (probs[ck] != 0.0f) {
               acc += (probs[ck] / denom) * v_at(b, ck, hk, dv);
             }
@@ -560,9 +668,13 @@ bool verify_output(const Config& cfg, const std::vector<bf16_t>& out, const std:
   return bad_count == 0;
 }
 
-double estimate_tflops(const Config& cfg, double ms) {
-  const double flops_qk = 2.0 * cfg.batch * cfg.heads_q * cfg.seqlen_q * cfg.seqlen_k * cfg.head_dim;
-  const double flops_pv = 2.0 * cfg.batch * cfg.heads_q * cfg.seqlen_q * cfg.seqlen_k * cfg.head_dim_v;
+double estimate_tflops(const Config& cfg, const LengthInfo& lengths, double ms) {
+  int64_t qk_tokens = 0;
+  for (int b = 0; b < cfg.batch; ++b) {
+    qk_tokens += static_cast<int64_t>(lengths.q_lens[b]) * lengths.k_lens[b];
+  }
+  const double flops_qk = 2.0 * cfg.heads_q * qk_tokens * cfg.head_dim;
+  const double flops_pv = 2.0 * cfg.heads_q * qk_tokens * cfg.head_dim_v;
   return (flops_qk + flops_pv) / (ms * 1.0e9);
 }
 
@@ -592,36 +704,29 @@ int main(int argc, char** argv) {
     sgl_standalone::set_queue(&q);
 
     std::mt19937 rng(cfg.seed);
-    const int total_q = cfg.batch * cfg.seqlen_q;
-    const int pages_per_seq = cfg.paged ? (cfg.seqlen_k + cfg.page_size - 1) / cfg.page_size : 0;
-    const int num_pages = cfg.paged ? cfg.batch * pages_per_seq : 0;
+    const LengthInfo lengths = make_lengths(cfg);
 
-    std::vector<bf16_t> q_host = make_random_bf16(static_cast<std::size_t>(total_q) * cfg.heads_q * cfg.head_dim, rng);
+    std::vector<bf16_t> q_host =
+        make_random_bf16(static_cast<std::size_t>(lengths.total_q) * cfg.heads_q * cfg.head_dim, rng);
     std::vector<bf16_t> k_host;
     std::vector<bf16_t> v_host;
-    std::vector<int32_t> page_table_host;
     std::vector<int32_t> cu_k_or_cache_lens_host;
     if (cfg.paged) {
-      k_host = make_random_bf16(static_cast<std::size_t>(num_pages) * cfg.page_size * cfg.heads_kv * cfg.head_dim, rng);
-      v_host =
-          make_random_bf16(static_cast<std::size_t>(num_pages) * cfg.page_size * cfg.heads_kv * cfg.head_dim_v, rng);
-      page_table_host = make_identity_page_table(cfg.batch, pages_per_seq);
-      cu_k_or_cache_lens_host = make_cache_lengths(cfg.batch, cfg.seqlen_k);
+      k_host = make_random_bf16(static_cast<std::size_t>(lengths.total_k) * cfg.heads_kv * cfg.head_dim, rng);
+      v_host = make_random_bf16(static_cast<std::size_t>(lengths.total_k) * cfg.heads_kv * cfg.head_dim_v, rng);
+      cu_k_or_cache_lens_host = lengths.k_lens;
     } else {
-      k_host =
-          make_random_bf16(static_cast<std::size_t>(cfg.batch) * cfg.seqlen_k * cfg.heads_kv * cfg.head_dim, rng);
-      v_host =
-          make_random_bf16(static_cast<std::size_t>(cfg.batch) * cfg.seqlen_k * cfg.heads_kv * cfg.head_dim_v, rng);
-      cu_k_or_cache_lens_host = make_prefix_lengths(cfg.batch, cfg.seqlen_k);
+      k_host = make_random_bf16(static_cast<std::size_t>(lengths.total_k) * cfg.heads_kv * cfg.head_dim, rng);
+      v_host = make_random_bf16(static_cast<std::size_t>(lengths.total_k) * cfg.heads_kv * cfg.head_dim_v, rng);
+      cu_k_or_cache_lens_host = lengths.cu_k;
     }
-    std::vector<int32_t> cu_q_host = make_prefix_lengths(cfg.batch, cfg.seqlen_q);
     std::vector<bf16_t> sinks_host = cfg.sink ? make_random_bf16(cfg.heads_q, rng) : std::vector<bf16_t>{};
 
     DeviceBuffer<bf16_t> q_dev(q, q_host.size());
     DeviceBuffer<bf16_t> k_dev(q, k_host.size());
     DeviceBuffer<bf16_t> v_dev(q, v_host.size());
-    DeviceBuffer<bf16_t> out_dev(q, static_cast<std::size_t>(total_q) * cfg.heads_q * cfg.head_dim_v);
-    DeviceBuffer<int32_t> cu_q_dev(q, cu_q_host.size());
+    DeviceBuffer<bf16_t> out_dev(q, static_cast<std::size_t>(lengths.total_q) * cfg.heads_q * cfg.head_dim_v);
+    DeviceBuffer<int32_t> cu_q_dev(q, lengths.cu_q.size());
     DeviceBuffer<int32_t> cu_k_dev(q, cu_k_or_cache_lens_host.size());
     DeviceBuffer<int32_t> page_table_dev;
     DeviceBuffer<bf16_t> sinks_dev;
@@ -629,11 +734,11 @@ int main(int argc, char** argv) {
     q_dev.copy_from_host(q_host);
     k_dev.copy_from_host(k_host);
     v_dev.copy_from_host(v_host);
-    cu_q_dev.copy_from_host(cu_q_host);
+    cu_q_dev.copy_from_host(lengths.cu_q);
     cu_k_dev.copy_from_host(cu_k_or_cache_lens_host);
     if (cfg.paged) {
-      page_table_dev = DeviceBuffer<int32_t>(q, page_table_host.size());
-      page_table_dev.copy_from_host(page_table_host);
+      page_table_dev = DeviceBuffer<int32_t>(q, lengths.page_table.size());
+      page_table_dev.copy_from_host(lengths.page_table);
     }
     if (cfg.sink) {
       sinks_dev = DeviceBuffer<bf16_t>(q, sinks_host.size());
@@ -641,15 +746,18 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "device: " << q.get_device().get_info<sycl::info::device::name>() << "\n";
-    std::cout << "shape: batch=" << cfg.batch << " sq=" << cfg.seqlen_q << " sk=" << cfg.seqlen_k
+    std::cout << "shape: batch=" << cfg.batch << " sq=" << lengths.max_q << " sk=" << lengths.max_k
+              << " total_q=" << lengths.total_q << " total_k=" << lengths.total_k
               << " hq=" << cfg.heads_q << " hkv=" << cfg.heads_kv << " d=" << cfg.head_dim
               << " dv=" << cfg.head_dim_v << " paged=" << cfg.paged << " page_size=" << cfg.page_size
+              << " page_stride=" << lengths.page_table_stride
               << " causal=" << cfg.causal << " window=(" << cfg.window_left << "," << cfg.window_right
               << ") sink=" << cfg.sink << "\n";
 
     auto launch_once = [&] {
       run_prefill(
           cfg,
+          lengths,
           q_dev.data(),
           k_dev.data(),
           v_dev.data(),
@@ -666,7 +774,7 @@ int main(int argc, char** argv) {
     q.wait();
 
     if (cfg.verify) {
-      std::vector<float> ref = reference_prefill(cfg, q_host, k_host, v_host, page_table_host, sinks_host);
+      std::vector<float> ref = reference_prefill(cfg, lengths, q_host, k_host, v_host, lengths.page_table, sinks_host);
       std::vector<bf16_t> out_host = out_dev.copy_to_host();
       if (!verify_output(cfg, out_host, ref)) {
         sgl_standalone::release_workspace();
@@ -695,7 +803,8 @@ int main(int argc, char** argv) {
     const double host_avg_ms = total_ms / std::max(cfg.iters, 1);
     const double kernel_avg_ms = kernel_total_ms / std::max(cfg.iters, 1);
     std::cout << "profile: kernel_avg_ms=" << kernel_avg_ms << " host_avg_ms=" << host_avg_ms
-              << " iters=" << cfg.iters << " estimated_tflops=" << estimate_tflops(cfg, kernel_avg_ms) << "\n";
+              << " iters=" << cfg.iters << " estimated_tflops=" << estimate_tflops(cfg, lengths, kernel_avg_ms)
+              << "\n";
 
     sgl_standalone::release_workspace();
     return 0;

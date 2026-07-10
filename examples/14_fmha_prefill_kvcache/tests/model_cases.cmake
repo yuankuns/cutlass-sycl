@@ -1,9 +1,12 @@
 function(fmha_prefill_add_case NAME)
-  set(options PAGED CAUSAL SINK MAIN STRETCH COVERAGE BOUNDARY)
+  set(options PAGED CAUSAL SINK MAIN STRETCH COVERAGE BOUNDARY CHUNK)
   set(one_value_args
       BATCH
       SEQLEN_Q
       SEQLEN_K
+      SEQLEN_Q_LIST
+      PAST_KV
+      PAST_KV_LIST
       HEADS_Q
       HEADS_KV
       HEAD_DIM
@@ -103,9 +106,7 @@ function(fmha_prefill_add_case NAME)
   endif()
 
   set(_test_name "fmha_prefill.${NAME}")
-  add_test(
-    NAME ${_test_name}
-    COMMAND
+  set(_test_command
       $<TARGET_FILE:fmha_prefill_kvcache>
       --batch ${CASE_BATCH}
       --seqlen-q ${CASE_SEQLEN_Q}
@@ -126,6 +127,20 @@ function(fmha_prefill_add_case NAME)
       --atol ${_atol}
       --rtol ${_rtol})
 
+  if(DEFINED CASE_SEQLEN_Q_LIST)
+    list(APPEND _test_command --seqlen-q-list ${CASE_SEQLEN_Q_LIST})
+  endif()
+  if(DEFINED CASE_PAST_KV)
+    list(APPEND _test_command --past-kv ${CASE_PAST_KV})
+  endif()
+  if(DEFINED CASE_PAST_KV_LIST)
+    list(APPEND _test_command --past-kv-list ${CASE_PAST_KV_LIST})
+  endif()
+
+  add_test(
+    NAME ${_test_name}
+    COMMAND ${_test_command})
+
   set(_labels fmha_prefill)
   if(CASE_MAIN)
     list(APPEND _labels main model)
@@ -138,6 +153,9 @@ function(fmha_prefill_add_case NAME)
   endif()
   if(CASE_BOUNDARY)
     list(APPEND _labels boundary coverage)
+  endif()
+  if(CASE_CHUNK)
+    list(APPEND _labels chunk coverage)
   endif()
   if(CASE_PAGED)
     list(APPEND _labels paged)
@@ -158,6 +176,50 @@ function(fmha_prefill_add_case NAME)
     PROPERTIES
       LABELS "${_labels}"
       TIMEOUT ${FMHA_STANDALONE_TEST_TIMEOUT})
+endfunction()
+
+function(fmha_prefill_add_chunk_family NAME)
+  set(options PAGED)
+  set(one_value_args HEAD_DIM TILE_Q HEADS_Q HEADS_KV PAGE_SIZE)
+  cmake_parse_arguments(CHUNK_CASE "${options}" "${one_value_args}" "" ${ARGN})
+
+  foreach(required_arg HEAD_DIM TILE_Q HEADS_Q HEADS_KV)
+    if(NOT DEFINED CHUNK_CASE_${required_arg})
+      message(FATAL_ERROR "fmha_prefill_add_chunk_family(${NAME}) missing ${required_arg}")
+    endif()
+  endforeach()
+
+  if(DEFINED CHUNK_CASE_PAGE_SIZE)
+    set(_chunk_page_size ${CHUNK_CASE_PAGE_SIZE})
+  else()
+    set(_chunk_page_size 64)
+  endif()
+
+  math(EXPR _tile_minus1 "${CHUNK_CASE_TILE_Q} - 1")
+  math(EXPR _tile_plus1 "${CHUNK_CASE_TILE_Q} + 1")
+  set(_past_values 0 64 129 ${_tile_minus1} ${CHUNK_CASE_TILE_Q} ${_tile_plus1})
+  set(_q_values 1 32 128 ${_tile_minus1})
+  list(REMOVE_DUPLICATES _past_values)
+  list(REMOVE_DUPLICATES _q_values)
+
+  foreach(_past IN LISTS _past_values)
+    foreach(_q IN LISTS _q_values)
+      math(EXPR _k "${_past} + ${_q}")
+      if(CHUNK_CASE_PAGED)
+        fmha_prefill_add_case(chunk.${NAME}_past${_past}_q${_q}
+          CHUNK PAGED CAUSAL
+          BATCH 1 SEQLEN_Q ${_q} SEQLEN_K ${_k} PAST_KV ${_past}
+          HEADS_Q ${CHUNK_CASE_HEADS_Q} HEADS_KV ${CHUNK_CASE_HEADS_KV}
+          HEAD_DIM ${CHUNK_CASE_HEAD_DIM} PAGE_SIZE ${_chunk_page_size})
+      else()
+        fmha_prefill_add_case(chunk.${NAME}_past${_past}_q${_q}
+          CHUNK CAUSAL
+          BATCH 1 SEQLEN_Q ${_q} SEQLEN_K ${_k} PAST_KV ${_past}
+          HEADS_Q ${CHUNK_CASE_HEADS_Q} HEADS_KV ${CHUNK_CASE_HEADS_KV}
+          HEAD_DIM ${CHUNK_CASE_HEAD_DIM})
+      endif()
+    endforeach()
+  endforeach()
 endfunction()
 
 # Model-named regression scenarios. Shapes are intentionally scaled down for
@@ -320,3 +382,27 @@ fmha_prefill_add_case(boundary.page128_k_page_plus1
 fmha_prefill_add_case(boundary.batch3_paged_q_plus1_k_plus1
   BOUNDARY PAGED CAUSAL
   BATCH 3 SEQLEN_Q 129 SEQLEN_K 257 HEADS_Q 4 HEADS_KV 1 HEAD_DIM 128 PAGE_SIZE 64)
+
+# Chunk-prefill coverage: Q is only the new chunk while KV contains non-empty
+# history plus Q. The list cases exercise heterogeneous per-batch lengths.
+fmha_prefill_add_chunk_family(paged_hd64
+  PAGED HEAD_DIM 64 TILE_Q 128 HEADS_Q 4 HEADS_KV 1 PAGE_SIZE 64)
+
+fmha_prefill_add_chunk_family(paged_hd128
+  PAGED HEAD_DIM 128 TILE_Q ${FMHA_PREFILL_TILED_Q_128} HEADS_Q 4 HEADS_KV 1 PAGE_SIZE 64)
+
+fmha_prefill_add_chunk_family(paged_hd256
+  PAGED HEAD_DIM 256 TILE_Q ${FMHA_PREFILL_TILED_Q_256} HEADS_Q 2 HEADS_KV 1 PAGE_SIZE 64)
+
+fmha_prefill_add_chunk_family(nonpaged_hd128
+  HEAD_DIM 128 TILE_Q ${FMHA_PREFILL_TILED_Q_NP_128} HEADS_Q 2 HEADS_KV 1)
+
+fmha_prefill_add_case(chunk.hetero_paged_hd128_lists
+  CHUNK PAGED CAUSAL
+  BATCH 3 SEQLEN_Q 128 SEQLEN_K 257 SEQLEN_Q_LIST 1,32,127 PAST_KV_LIST 0,64,130
+  HEADS_Q 4 HEADS_KV 1 HEAD_DIM 128 PAGE_SIZE 64)
+
+fmha_prefill_add_case(chunk.hetero_nonpaged_hd128_lists
+  CHUNK CAUSAL
+  BATCH 3 SEQLEN_Q 128 SEQLEN_K 257 SEQLEN_Q_LIST 1,32,255 PAST_KV_LIST 0,64,130
+  HEADS_Q 2 HEADS_KV 1 HEAD_DIM 128)

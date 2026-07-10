@@ -499,12 +499,26 @@ struct FMHAConfig {
 
   // Paged KV cache: the page table encodes absolute KV positions.
   static int run_paged(const Arguments& params) {
+    TORCH_CHECK(params.cu_seqlens_q != nullptr, "paged prefill requires cu_seqlens_q");
+    TORCH_CHECK(params.cu_seqlens_k != nullptr, "paged prefill requires per-batch cache lengths in cu_seqlens_k");
+    TORCH_CHECK(params.page_table != nullptr, "paged prefill requires page_table");
+    TORCH_CHECK(params.page_size > 0, "paged prefill requires a positive page_size");
+    TORCH_CHECK(params.max_num_pages_per_seq > 0, "paged prefill requires max_num_pages_per_seq");
+    TORCH_CHECK(params.seqlen_q > 0 && params.seqlen_k > 0, "paged prefill requires positive max sequence lengths");
+    TORCH_CHECK(params.total_q > 0 && params.total_k > 0, "paged prefill requires positive total sequence lengths");
     // template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
     return run<true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
   }
 
   // Non-paged (contiguous ragged) KV cache: addressed via cu_seqlens_k offsets.
   static int run_nopaged(const Arguments& params) {
+    TORCH_CHECK(params.cu_seqlens_q != nullptr, "non-paged prefill requires cu_seqlens_q");
+    TORCH_CHECK(params.cu_seqlens_k != nullptr, "non-paged prefill requires cumulative cu_seqlens_k");
+    TORCH_CHECK(params.page_table == nullptr, "non-paged prefill expects page_table to be null");
+    TORCH_CHECK(
+        params.seqlen_q > 0 && params.seqlen_k > 0, "non-paged prefill requires positive max sequence lengths");
+    TORCH_CHECK(
+        params.total_q > 0 && params.total_k > 0, "non-paged prefill requires positive total sequence lengths");
     // template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
     return run<true, true, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
   }
