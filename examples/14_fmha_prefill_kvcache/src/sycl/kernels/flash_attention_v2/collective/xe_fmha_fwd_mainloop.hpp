@@ -370,14 +370,17 @@ struct FMHAFwdMainloop<
     int kblocks_cache = ceil_div(seq_len_kv_cache, get<1>(TileShapeQK{}));
     int page_idx = blk_k0;
     int next_page_idx = blk_k0;
-    if constexpr (PagedKV) {
-      next_page_idx = get_physical_k_tile(blk_k0, l_coord, seq_len_kv_cache);
-    }
     for (int D = 0; D < size<3>(pQgQ); D++) {
       prefetch(prefetch_q, pQgQ(_, _, _, D));
     }
-    for (int D = 0; D < size<4>(pKgK); D++) {
-      prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
+    bool has_prefetch_k = blk_k0 < blk_k1 && blk_k0 < kblocks_cache;
+    if (has_prefetch_k) {
+      if constexpr (PagedKV) {
+        next_page_idx = get_physical_k_tile(blk_k0, l_coord, seq_len_kv_cache);
+      }
+      for (int D = 0; D < size<4>(pKgK); D++) {
+        prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
+      }
     }
     // Always initialize the per-WG accumulators: the caller (kernel) may pass
     // blk_k0 > 0 when sliding-window pruning skips leading K blocks, so we can
@@ -409,9 +412,13 @@ struct FMHAFwdMainloop<
       }
 
       page_idx = next_page_idx;
-      next_page_idx = K + 1;
+      int next_k = K + 1;
+      bool has_next_k = next_k < blk_k1 && next_k < kblocks_cache;
+      next_page_idx = next_k;
       if constexpr (PagedKV) {
-        next_page_idx = get_physical_k_tile(next_page_idx, l_coord, seq_len_kv_cache);
+        if (has_next_k) {
+          next_page_idx = get_physical_k_tile(next_k, l_coord, seq_len_kv_cache);
+        }
       }
 
       /* GEMM 1: S = K * Q */
@@ -513,8 +520,10 @@ struct FMHAFwdMainloop<
       }
 
       /* K prefetch */
-      for (int D = 0; D < size<4>(pKgK); D++) {
-        prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
+      if (has_next_k) {
+        for (int D = 0; D < size<4>(pKgK); D++) {
+          prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
+        }
       }
 
       barrier_wait(ScopeWorkgroup);

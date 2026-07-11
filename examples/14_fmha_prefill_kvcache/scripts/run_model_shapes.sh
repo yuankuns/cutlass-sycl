@@ -455,6 +455,12 @@ run_case "chunk.generalized_paged_page128_tails" \
   --past-kv-list 127,128,129,255 \
   --heads-q 4 --heads-kv 1 --head-dim 128 --head-dim-v 128 --paged 1 --page-size 128 --causal 1
 
+run_case "chunk.generalized_paged_random_page_table" \
+  --batch 4 --seqlen-q 96 --seqlen-k 320 --seqlen-q-list 1,32,64,96 \
+  --past-kv-list 63,64,129,224 \
+  --heads-q 4 --heads-kv 1 --head-dim 128 --head-dim-v 128 --paged 1 --page-size 64 \
+  --page-table-random 1 --causal 1
+
 run_case "chunk.generalized_paged_gqa_mixed_prefix" \
   --batch 4 --seqlen-q 128 --seqlen-k 320 --seqlen-q-list 17,64,96,128 \
   --past-kv-list 15,96,127,192 \

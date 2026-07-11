@@ -1,5 +1,5 @@
 function(fmha_prefill_add_case NAME)
-  set(options PAGED CAUSAL SINK MAIN STRETCH COVERAGE BOUNDARY CHUNK)
+  set(options PAGED CAUSAL SINK MAIN STRETCH COVERAGE BOUNDARY CHUNK PAGE_TABLE_RANDOM)
   set(one_value_args
       BATCH
       SEQLEN_Q
@@ -127,6 +127,10 @@ function(fmha_prefill_add_case NAME)
       --atol ${_atol}
       --rtol ${_rtol})
 
+  if(CASE_PAGE_TABLE_RANDOM)
+    list(APPEND _test_command --page-table-random 1)
+  endif()
+
   if(DEFINED CASE_SEQLEN_Q_LIST)
     list(APPEND _test_command --seqlen-q-list ${CASE_SEQLEN_Q_LIST})
   endif()
@@ -169,6 +173,9 @@ function(fmha_prefill_add_case NAME)
   endif()
   if(CASE_SINK)
     list(APPEND _labels sink)
+  endif()
+  if(CASE_PAGE_TABLE_RANDOM)
+    list(APPEND _labels pagetable_random)
   endif()
 
   set_tests_properties(
@@ -426,6 +433,12 @@ fmha_prefill_add_case(chunk.generalized_paged_page128_tails
   BATCH 4 SEQLEN_Q 129 SEQLEN_K 384 SEQLEN_Q_LIST 1,31,127,129
   PAST_KV_LIST 127,128,129,255
   HEADS_Q 4 HEADS_KV 1 HEAD_DIM 128 PAGE_SIZE 128)
+
+fmha_prefill_add_case(chunk.generalized_paged_random_page_table
+  CHUNK PAGED CAUSAL PAGE_TABLE_RANDOM
+  BATCH 4 SEQLEN_Q 96 SEQLEN_K 320 SEQLEN_Q_LIST 1,32,64,96
+  PAST_KV_LIST 63,64,129,224
+  HEADS_Q 4 HEADS_KV 1 HEAD_DIM 128 PAGE_SIZE 64)
 
 fmha_prefill_add_case(chunk.generalized_paged_gqa_mixed_prefix
   CHUNK PAGED CAUSAL

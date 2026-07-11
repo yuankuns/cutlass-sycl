@@ -8,6 +8,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -32,6 +33,7 @@ struct Config {
   int head_dim = 64;
   int head_dim_v = 64;
   int page_size = 64;
+  bool page_table_random = false;
   bool paged = true;
   bool causal = true;
   int window_left = -1;
@@ -131,6 +133,7 @@ Config parse_args(int argc, char** argv) {
           << "  --batch N --seqlen-q N --seqlen-k N --heads-q N --heads-kv N\n"
           << "  --past-kv N --past-kv-list a,b,... --seqlen-q-list a,b,...\n"
           << "  --head-dim N --head-dim-v N --paged 0|1 --page-size N\n"
+          << "  --page-table-random 0|1\n"
           << "  --causal 0|1 --window-left N --window-right N --sink 0|1\n"
           << "  --warmup N --iters N --seed N --verify 0|1 --atol F --rtol F\n";
       std::exit(0);
@@ -175,6 +178,7 @@ Config parse_args(int argc, char** argv) {
   get_int("head-dim", cfg.head_dim);
   get_int("head-dim-v", cfg.head_dim_v);
   get_int("page-size", cfg.page_size);
+  get_bool("page-table-random", cfg.page_table_random);
   get_bool("paged", cfg.paged);
   get_bool("causal", cfg.causal);
   get_int("window-left", cfg.window_left);
@@ -216,6 +220,9 @@ Config parse_args(int argc, char** argv) {
   }
   if (cfg.paged && (cfg.page_size <= 0 || cfg.page_size % 64 != 0)) {
     throw std::runtime_error("paged prefill requires page_size to be a positive multiple of 64");
+  }
+  if (cfg.page_table_random && !cfg.paged) {
+    throw std::runtime_error("--page-table-random requires --paged 1");
   }
   if (cfg.sink && (!cfg.paged || cfg.head_dim != 64)) {
     throw std::runtime_error("the current SGL prefill runner supports sink only on paged head_dim=64");
@@ -265,21 +272,24 @@ LengthInfo make_lengths(const Config& cfg) {
     for (int b = 0; b < cfg.batch; ++b) {
       pages_per_batch[b] = (lengths.k_lens[b] + cfg.page_size - 1) / cfg.page_size;
       max_pages = std::max(max_pages, pages_per_batch[b]);
+      lengths.total_pages += pages_per_batch[b];
     }
-    // The mainloop uses max_num_pages_per_seq as the page-table row stride and
-    // may prefetch the next logical page at the end of a sequence. Keep one
-    // valid guard entry per row while only allocating physical pages actually
-    // needed by each batch.
-    lengths.page_table_stride = max_pages + 1;
+    std::vector<int32_t> physical_pages(lengths.total_pages);
+    std::iota(physical_pages.begin(), physical_pages.end(), 0);
+    if (cfg.page_table_random) {
+      std::mt19937 page_rng(static_cast<uint32_t>(cfg.seed) + 42u);
+      std::shuffle(physical_pages.begin(), physical_pages.end(), page_rng);
+    }
+    // The mainloop uses max_num_pages_per_seq as the page-table row stride.
+    // Keep the stride equal to the real number of logical pages per row so the
+    // standalone ABI matches the FA3/FA4-style paged cache contract.
+    lengths.page_table_stride = max_pages;
     lengths.page_table.assign(static_cast<std::size_t>(cfg.batch) * lengths.page_table_stride, 0);
+    int logical_page = 0;
     for (int b = 0; b < cfg.batch; ++b) {
-      int32_t last_page = lengths.total_pages;
       for (int p = 0; p < pages_per_batch[b]; ++p) {
-        last_page = lengths.total_pages++;
-        lengths.page_table[static_cast<std::size_t>(b) * lengths.page_table_stride + p] = last_page;
-      }
-      for (int p = pages_per_batch[b]; p < lengths.page_table_stride; ++p) {
-        lengths.page_table[static_cast<std::size_t>(b) * lengths.page_table_stride + p] = last_page;
+        lengths.page_table[static_cast<std::size_t>(b) * lengths.page_table_stride + p] =
+            physical_pages[logical_page++];
       }
     }
     lengths.total_k = lengths.total_pages * cfg.page_size;
@@ -750,7 +760,7 @@ int main(int argc, char** argv) {
               << " total_q=" << lengths.total_q << " total_k=" << lengths.total_k
               << " hq=" << cfg.heads_q << " hkv=" << cfg.heads_kv << " d=" << cfg.head_dim
               << " dv=" << cfg.head_dim_v << " paged=" << cfg.paged << " page_size=" << cfg.page_size
-              << " page_stride=" << lengths.page_table_stride
+              << " page_stride=" << lengths.page_table_stride << " page_table_random=" << cfg.page_table_random
               << " causal=" << cfg.causal << " window=(" << cfg.window_left << "," << cfg.window_right
               << ") sink=" << cfg.sink << "\n";
 
