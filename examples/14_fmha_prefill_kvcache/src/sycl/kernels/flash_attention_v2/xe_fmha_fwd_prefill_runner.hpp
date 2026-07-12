@@ -518,7 +518,13 @@ struct FMHAConfig {
     TORCH_CHECK(params.max_num_pages_per_seq > 0, "paged prefill requires max_num_pages_per_seq");
     TORCH_CHECK(params.seqlen_q > 0 && params.seqlen_k > 0, "paged prefill requires positive max sequence lengths");
     TORCH_CHECK(params.total_q > 0 && params.total_k > 0, "paged prefill requires positive total sequence lengths");
+    bool const has_append =
+        params.total_knew > 0 && params.knew_ptr != nullptr && params.vnew_ptr != nullptr &&
+        params.cache_seqlens_old != nullptr;
     // template <bool isVarLen, bool CachedKV, bool PagedKV, bool AppendKV, class Scheduler>
+    if (has_append) {
+      return run<true, true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+    }
     return run<true, true, true, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
   }
 
@@ -531,7 +537,13 @@ struct FMHAConfig {
         params.seqlen_q > 0 && params.seqlen_k > 0, "non-paged prefill requires positive max sequence lengths");
     TORCH_CHECK(
         params.total_q > 0 && params.total_k > 0, "non-paged prefill requires positive total sequence lengths");
+    bool const has_append =
+        params.total_knew > 0 && params.knew_ptr != nullptr && params.vnew_ptr != nullptr &&
+        params.cache_seqlens_old != nullptr;
     // template <bool isVarLen, bool CachedKV, bool PagedKV, bool AppendKV, class Scheduler>
+    if (has_append) {
+      return run<true, true, false, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+    }
     return run<true, true, false, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
   }
 

@@ -1,5 +1,5 @@
 function(fmha_prefill_add_case NAME)
-  set(options PAGED CAUSAL SINK MAIN STRETCH COVERAGE BOUNDARY CHUNK PAGE_TABLE_RANDOM)
+  set(options PAGED CAUSAL SINK MAIN STRETCH COVERAGE BOUNDARY CHUNK APPENDKV PAGE_TABLE_RANDOM)
   set(one_value_args
       BATCH
       SEQLEN_Q
@@ -7,6 +7,9 @@ function(fmha_prefill_add_case NAME)
       SEQLEN_Q_LIST
       PAST_KV
       PAST_KV_LIST
+      K_NEW_SEQLENS
+      CU_SEQLENS_K_NEW
+      CACHE_SEQLENS_OLD
       HEADS_Q
       HEADS_KV
       HEAD_DIM
@@ -140,6 +143,15 @@ function(fmha_prefill_add_case NAME)
   if(DEFINED CASE_PAST_KV_LIST)
     list(APPEND _test_command --past-kv-list ${CASE_PAST_KV_LIST})
   endif()
+  if(DEFINED CASE_K_NEW_SEQLENS)
+    list(APPEND _test_command --k-new-seqlens ${CASE_K_NEW_SEQLENS})
+  endif()
+  if(DEFINED CASE_CU_SEQLENS_K_NEW)
+    list(APPEND _test_command --cu-seqlens-k-new ${CASE_CU_SEQLENS_K_NEW})
+  endif()
+  if(DEFINED CASE_CACHE_SEQLENS_OLD)
+    list(APPEND _test_command --cache-seqlens-old ${CASE_CACHE_SEQLENS_OLD})
+  endif()
 
   add_test(
     NAME ${_test_name}
@@ -160,6 +172,9 @@ function(fmha_prefill_add_case NAME)
   endif()
   if(CASE_CHUNK)
     list(APPEND _labels chunk coverage)
+  endif()
+  if(CASE_APPENDKV)
+    list(APPEND _labels appendkv coverage)
   endif()
   if(CASE_PAGED)
     list(APPEND _labels paged)
@@ -413,6 +428,68 @@ fmha_prefill_add_case(chunk.hetero_nonpaged_hd128_lists
   CHUNK CAUSAL
   BATCH 3 SEQLEN_Q 128 SEQLEN_K 257 SEQLEN_Q_LIST 1,32,255 PAST_KV_LIST 0,64,130
   HEADS_Q 2 HEADS_KV 1 HEAD_DIM 128)
+
+# AppendKV coverage: cache contains the old prefix; k_new/v_new are appended
+# inside the FMHA kernel before attention reads the final KV length.
+fmha_prefill_add_case(append.paged.hd64_zero_page
+  APPENDKV PAGED CAUSAL
+  BATCH 2 SEQLEN_Q 32 SEQLEN_K 96 SEQLEN_Q_LIST 1,32
+  CACHE_SEQLENS_OLD 0,64 K_NEW_SEQLENS 1,32
+  HEADS_Q 8 HEADS_KV 2 HEAD_DIM 64 PAGE_SIZE 64)
+
+fmha_prefill_add_case(append.paged.hd64_tile_edge
+  APPENDKV PAGED CAUSAL
+  BATCH 2 SEQLEN_Q 128 SEQLEN_K 257 SEQLEN_Q_LIST 128,127
+  CACHE_SEQLENS_OLD 129,127 K_NEW_SEQLENS 128,127
+  HEADS_Q 8 HEADS_KV 2 HEAD_DIM 64 PAGE_SIZE 64)
+
+fmha_prefill_add_case(append.paged.hd128_decode_boundary
+  APPENDKV PAGED CAUSAL
+  BATCH 2 SEQLEN_Q 1 SEQLEN_K 66 SEQLEN_Q_LIST 1,1
+  CACHE_SEQLENS_OLD 63,65 K_NEW_SEQLENS 1
+  HEADS_Q 8 HEADS_KV 2 HEAD_DIM 128 PAGE_SIZE 64)
+
+fmha_prefill_add_case(append.paged.hd128_chunk_random_pt
+  APPENDKV PAGED CAUSAL PAGE_TABLE_RANDOM
+  BATCH 2 SEQLEN_Q 127 SEQLEN_K 254 SEQLEN_Q_LIST 32,127
+  CACHE_SEQLENS_OLD 64,127 K_NEW_SEQLENS 32,127
+  HEADS_Q 8 HEADS_KV 2 HEAD_DIM 128 PAGE_SIZE 64)
+
+fmha_prefill_add_case(append.paged.hd128_mixed_general
+  APPENDKV PAGED CAUSAL
+  BATCH 2 SEQLEN_Q 128 SEQLEN_K 192 SEQLEN_Q_LIST 1,128
+  CACHE_SEQLENS_OLD 128,64 K_NEW_SEQLENS 1,128
+  HEADS_Q 8 HEADS_KV 2 HEAD_DIM 128 PAGE_SIZE 64)
+
+fmha_prefill_add_case(append.nopaged.hd128_zero
+  APPENDKV CAUSAL
+  BATCH 2 SEQLEN_Q 32 SEQLEN_K 96 SEQLEN_Q_LIST 1,32
+  CACHE_SEQLENS_OLD 0,64 K_NEW_SEQLENS 1,32
+  HEADS_Q 8 HEADS_KV 2 HEAD_DIM 128)
+
+fmha_prefill_add_case(append.nopaged.hd128_tile_edge
+  APPENDKV CAUSAL
+  BATCH 2 SEQLEN_Q 128 SEQLEN_K 257 SEQLEN_Q_LIST 128,127
+  CACHE_SEQLENS_OLD 129,127 K_NEW_SEQLENS 128,127
+  HEADS_Q 8 HEADS_KV 2 HEAD_DIM 128)
+
+fmha_prefill_add_case(append.nopaged.hd128_boundary
+  APPENDKV CAUSAL
+  BATCH 2 SEQLEN_Q 1 SEQLEN_K 66 SEQLEN_Q_LIST 1,1
+  CACHE_SEQLENS_OLD 63,65 K_NEW_SEQLENS 1
+  HEADS_Q 8 HEADS_KV 2 HEAD_DIM 128)
+
+fmha_prefill_add_case(append.nopaged.hd128_cu_new
+  APPENDKV CAUSAL
+  BATCH 2 SEQLEN_Q 127 SEQLEN_K 254 SEQLEN_Q_LIST 32,127
+  CACHE_SEQLENS_OLD 64,127 CU_SEQLENS_K_NEW 0,32,159
+  HEADS_Q 8 HEADS_KV 2 HEAD_DIM 128)
+
+fmha_prefill_add_case(append.nopaged.hd128_mixed_general
+  APPENDKV CAUSAL
+  BATCH 2 SEQLEN_Q 128 SEQLEN_K 192 SEQLEN_Q_LIST 1,128
+  CACHE_SEQLENS_OLD 128,64 K_NEW_SEQLENS 1,128
+  HEADS_Q 8 HEADS_KV 2 HEAD_DIM 128)
 
 # Generalized chunk-prefill accuracy cases, following the coverage dimensions
 # used by vLLM/SGLang tests: mixed query/context lengths, decode-like q=1,
