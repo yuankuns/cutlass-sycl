@@ -243,6 +243,26 @@ class XeFMHAFwdKernel {
   }
 
   CUTLASS_DEVICE
+  int get_k_new_len(MainloopParams const& mainloop, int batch) {
+    if constexpr (CollectiveMainloop::AppendKV) {
+      if (mainloop.append.ptr_K_new == nullptr || mainloop.append.ptr_V_new == nullptr ||
+          mainloop.append.ptr_cache_seqlens == nullptr || mainloop.append.total_k_new <= 0 ||
+          (mainloop.append.ptr_cu_seqlens_k_new == nullptr && mainloop.append.seq_len_kv_new <= 0)) {
+        return 0;
+      }
+      if (mainloop.append.ptr_cu_seqlens_k_new != nullptr) {
+        return mainloop.append.ptr_cu_seqlens_k_new[batch + 1] -
+               mainloop.append.ptr_cu_seqlens_k_new[batch];
+      }
+      return mainloop.append.seq_len_kv_new;
+    } else {
+      (void)mainloop;
+      (void)batch;
+      return 0;
+    }
+  }
+
+  CUTLASS_DEVICE
   void operator()(Params const& params, char* smem_buf) {
     using namespace sycl::ext::oneapi::this_work_item;
 
@@ -275,6 +295,13 @@ class XeFMHAFwdKernel {
 
       auto sequence_length_shape = get_sequence_length_shape(s, idx_b);
       auto [seq_len_qo, seq_len_kv, seq_len_kv_cache] = sequence_length_shape;
+      int seq_k_eff = seq_len_kv_cache;
+      if constexpr (CollectiveMainloop::AppendKV) {
+        int const seq_k_new = get_k_new_len(params.mainloop, idx_b);
+        if (seq_k_new > 0) {
+          seq_k_eff = params.mainloop.append.ptr_cache_seqlens[idx_b] + seq_k_new;
+        }
+      }
       // M extent of the Q/O tile: the packed GQA group for decode, otherwise the
       // query sequence length. Masking below still uses the real seq_len_qo so
       // the decode KV position (seq_len_kv_cache - seq_len_qo) stays correct.
@@ -286,7 +313,7 @@ class XeFMHAFwdKernel {
       // auto offset = cute::min(seq_len_qo, seq_len_kv_cache);
       auto offset = seq_len_qo;
       auto discard_seq_coord = seq_len_qo - offset;
-      auto full_tile_offset = seq_len_kv_cache - offset;
+      auto full_tile_offset = seq_k_eff - offset;
       int seq_coord = cute::min(seq_len_qo, (blk_q * get<0>(TileShapeQK{}) + q_offset_sg));
 
       // if (CollectiveMainloop::CausalMask && seq_coord < discard_seq_coord) continue;
@@ -298,8 +325,8 @@ class XeFMHAFwdKernel {
       // const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
 
       const int seq_len = CollectiveMainloop::CausalMask
-                              ? cute::min(seq_len_kv_cache, full_tile_offset + seq_coord + q_sg_tile)
-                              : seq_len_kv_cache;
+                              ? cute::min(seq_k_eff, full_tile_offset + seq_coord + q_sg_tile)
+                              : seq_k_eff;
       const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
       const int k_blocks_causal =
           CollectiveMainloop::CausalMask ? (seq_coord + full_tile_offset) / get<1>(TileShapeQK{}) : 0;
@@ -410,8 +437,10 @@ class XeFMHAFwdKernel {
           k_blocks_causal,
           thr_id,
           seq_len,
-          seq_len_kv_cache,
+          seq_k_eff,
           idx_b,
+          head,
+          s.num_heads_kv,
           full_tile_offset,
           discard_seq_coord,
           K_cache(_, _, head, l_coord),

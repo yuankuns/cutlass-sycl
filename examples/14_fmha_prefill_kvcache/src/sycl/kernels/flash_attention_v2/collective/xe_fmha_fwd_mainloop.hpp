@@ -52,6 +52,21 @@ using namespace cute;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+template <bool AppendKV_, class ElementK_, class ElementV_>
+struct AppendKVParams {};
+
+template <class ElementK_, class ElementV_>
+struct AppendKVParams<true, ElementK_, ElementV_> {
+  ElementK_ const* ptr_K_new = nullptr;
+  ElementV_ const* ptr_V_new = nullptr;
+  int const* ptr_cu_seqlens_k_new = nullptr;
+  int const* ptr_cache_seqlens = nullptr;
+  int seq_len_kv_new = 0;
+  int total_k_new = 0;
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <
     class DispatchPolicy_,
     bool CausalMask_,
@@ -75,7 +90,8 @@ template <
     // (decode only, seq_len_qo == 1). All packed rows share the single decode
     // KV position, so per-row masking must use a fixed decode row. Default
     // false keeps prefill (and non-packed decode) unaffected.
-    bool PackGQA_ = false>
+    bool PackGQA_ = false,
+    bool AppendKV_ = false>
 struct FMHAFwdMainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
@@ -101,7 +117,8 @@ template <
     class TiledCopyK_cache_,
     class TiledCopyV_cache_,
     bool LocalMask_,
-    bool PackGQA_>
+    bool PackGQA_,
+    bool AppendKV_>
 struct FMHAFwdMainloop<
     XeDefault<Stages>,
     CausalMask_,
@@ -121,7 +138,8 @@ struct FMHAFwdMainloop<
     TiledCopyK_cache_,
     TiledCopyV_cache_,
     LocalMask_,
-    PackGQA_> {
+    PackGQA_,
+    AppendKV_> {
   //
   // Type Aliases
   //
@@ -194,6 +212,8 @@ struct FMHAFwdMainloop<
   static constexpr bool PagedKV = PagedKV_;
   static constexpr bool LocalMask = LocalMask_;
   static constexpr bool PackGQA = PackGQA_;
+  static constexpr bool AppendKV = AppendKV_;
+  using AppendKVStorage = AppendKVParams<AppendKV, typename TensorK_cache::element_type, typename TensorV_cache::element_type>;
 
   // FP8 KV cache: enabled when the K element type is an 8-bit float. The fp8
   // K/V are dequantized (cast to ElementQ and multiplied by the per-tensor
@@ -208,6 +228,7 @@ struct FMHAFwdMainloop<
     int max_num_pages_per_seq = 0;
     int window_size_left = -1;
     int window_size_right = -1;
+    AppendKVStorage append{};
   };
 
   // Kernel-facing parameters
@@ -233,7 +254,8 @@ struct FMHAFwdMainloop<
         args.page_size,
         args.max_num_pages_per_seq,
         args.window_size_left,
-        args.window_size_right};
+        args.window_size_right,
+        args.append};
   }
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
@@ -254,6 +276,94 @@ struct FMHAFwdMainloop<
     return params.ptr_page_table[batch_offset + next_page_logical_idx] * tiles_per_page + K % tiles_per_page;
   }
 
+  CUTLASS_DEVICE
+  int get_k_new_len(int batch) const {
+    if constexpr (AppendKV) {
+      if (params.append.ptr_K_new == nullptr || params.append.ptr_V_new == nullptr ||
+          params.append.ptr_cache_seqlens == nullptr || params.append.total_k_new <= 0 ||
+          (params.append.ptr_cu_seqlens_k_new == nullptr && params.append.seq_len_kv_new <= 0)) {
+        return 0;
+      }
+      if (params.append.ptr_cu_seqlens_k_new != nullptr) {
+        return params.append.ptr_cu_seqlens_k_new[batch + 1] -
+               params.append.ptr_cu_seqlens_k_new[batch];
+      }
+      return params.append.seq_len_kv_new;
+    } else {
+      (void)batch;
+      return 0;
+    }
+  }
+
+  CUTLASS_DEVICE
+  void store_kv_new(
+      TensorK_cache2D const& K_cache_2D,
+      TensorV_cache2D const& V_cache_2D,
+      int batch,
+      int kv_head,
+      int num_heads_kv,
+      int thr_id) const {
+    if constexpr (AppendKV) {
+      int const new_len = get_k_new_len(batch);
+      if (new_len <= 0) {
+        return;
+      }
+
+      auto& K_dst = const_cast<TensorK_cache2D&>(K_cache_2D);
+      auto& V_dst = const_cast<TensorV_cache2D&>(V_cache_2D);
+      int const lane_idx = thr_id % intel::sg_size;
+      int const new_begin = params.append.ptr_cu_seqlens_k_new != nullptr
+          ? params.append.ptr_cu_seqlens_k_new[batch]
+          : batch * params.append.seq_len_kv_new;
+      int const cache_len_old = params.append.ptr_cache_seqlens[batch];
+      int const head_size_qk = size<1>(K_cache_2D);
+      int const head_size_vo = size<0>(V_cache_2D);
+      int const max_hd = head_size_qk > head_size_vo ? head_size_qk : head_size_vo;
+
+      // Every WG that can read this appended KV range scatters the same source
+      // k_new/v_new values before loading K/V. Multiple WGs, including GQA
+      // query heads that map to one kv_head, therefore overwrite identical bit
+      // patterns at the same cache address; the append is intentionally
+      // idempotent and does not rely on a grid-wide producer.
+      for (int linear = lane_idx; linear < new_len * max_hd; linear += intel::sg_size) {
+        int const d = linear % max_hd;
+        int const new_tok = linear / max_hd;
+        int const new_abs_tok = new_begin + new_tok;
+        int const dst_tok = cache_len_old + new_tok;
+        int dst_row = dst_tok;
+        if constexpr (PagedKV) {
+          int const page = dst_tok / params.page_size;
+          int const tok_in_page = dst_tok - page * params.page_size;
+          int const logical_page = batch * params.max_num_pages_per_seq + page;
+          int const phys_page = params.ptr_page_table[logical_page];
+          dst_row = phys_page * params.page_size + tok_in_page;
+        }
+
+        if (d < head_size_qk) {
+          size_t const src =
+              ((size_t)new_abs_tok * (size_t)num_heads_kv + (size_t)kv_head) *
+                  (size_t)head_size_qk +
+              (size_t)d;
+          K_dst(dst_row, d) = params.append.ptr_K_new[src];
+        }
+        if (d < head_size_vo) {
+          size_t const src =
+              ((size_t)new_abs_tok * (size_t)num_heads_kv + (size_t)kv_head) *
+                  (size_t)head_size_vo +
+              (size_t)d;
+          V_dst(d, dst_row) = params.append.ptr_V_new[src];
+        }
+      }
+    } else {
+      (void)K_cache_2D;
+      (void)V_cache_2D;
+      (void)batch;
+      (void)kv_head;
+      (void)num_heads_kv;
+      (void)thr_id;
+    }
+  }
+
   template <typename QVCoord>
   CUTLASS_DEVICE void operator()(
       TensorQ2D const& Q_2D,  // (q,d)
@@ -271,6 +381,8 @@ struct FMHAFwdMainloop<
       int seq_len,
       int seq_len_kv_cache,
       int l_coord,
+      int kv_head,
+      int num_heads_kv,
       int full_tile_offset,
       int discard_seq_coord,
       TensorK_cache2D const& K_cache_2D = TensorK_cache2D{},
@@ -364,6 +476,12 @@ struct FMHAFwdMainloop<
     // ------
     // Kernel
     // ------
+
+    if constexpr (AppendKV) {
+      store_kv_new(K_cache_2D, V_cache_2D, l_coord, kv_head, num_heads_kv, thr_id);
+      sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+      sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::device);
+    }
 
     /* Initialization steps for first block: Q/K prefetch, O init */
     /* TODO: limit D prefetch for large head size, and reorder K prefetches */
