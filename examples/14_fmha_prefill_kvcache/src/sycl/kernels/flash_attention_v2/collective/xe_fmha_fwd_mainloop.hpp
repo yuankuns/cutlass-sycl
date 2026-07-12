@@ -339,7 +339,11 @@ struct FMHAFwdMainloop<
         constexpr int kVecElems = 8;
         using StoreVec = cutlass::ulonglong2;
         if (head_size_qk == head_size_vo && (head_size_qk % kVecElems) == 0) {
-          if (sub_group_id != 0) {
+          // Large appends are bandwidth-bound, so split tokens across SGs;
+          // small appends keep the old single-SG path to avoid control overhead.
+          constexpr int kMinMultiSgTokens = 64;
+          int const active_sg_count = new_len >= kMinMultiSgTokens ? int(SGPerWG::value) : 1;
+          if (sub_group_id >= active_sg_count) {
             return;
           }
           int const head_size = head_size_qk;
@@ -377,17 +381,17 @@ struct FMHAFwdMainloop<
                     (size_t)head_size;
                 size_t const token_stride = (size_t)num_heads_kv * (size_t)head_size;
 
-                for (int page_tok = 0; page_tok < page_len; ++page_tok) {
+                for (int page_tok = sub_group_id; page_tok < page_len; page_tok += active_sg_count) {
                   int const dst_row = row_base + page_tok;
+                  size_t const token_src_base = src_base + (size_t)page_tok * token_stride;
                   for (int d_vec = lane_idx; d_vec < vecs_per_token; d_vec += intel::sg_size) {
                     int const d = d_vec * kVecElems;
-                    size_t const src = src_base + (size_t)d;
+                    size_t const src = token_src_base + (size_t)d;
                     StoreVec const k_value = *reinterpret_cast<StoreVec const*>(params.append.ptr_K_new + src);
                     StoreVec const v_value = *reinterpret_cast<StoreVec const*>(params.append.ptr_V_new + src);
                     *reinterpret_cast<StoreVec*>(&K_dst(dst_row, d)) = k_value;
                     *reinterpret_cast<StoreVec*>(&V_dst(d, dst_row)) = v_value;
                   }
-                  src_base += token_stride;
                 }
                 new_tok0 += page_len;
               }
@@ -395,7 +399,7 @@ struct FMHAFwdMainloop<
             }
           }
 
-          for (int new_tok = 0; new_tok < new_len; ++new_tok) {
+          for (int new_tok = sub_group_id; new_tok < new_len; new_tok += active_sg_count) {
             int const new_abs_tok = new_begin + new_tok;
             int dst_row = single_row_base + new_tok;
             if constexpr (PagedKV) {
