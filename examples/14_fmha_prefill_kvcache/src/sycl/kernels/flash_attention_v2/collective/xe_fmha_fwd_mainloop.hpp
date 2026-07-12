@@ -369,13 +369,13 @@ struct FMHAFwdMainloop<
                 int const logical_page = batch * params.max_num_pages_per_seq + page;
                 int const phys_page = params.ptr_page_table[logical_page];
                 int const row_base = phys_page * params.page_size + tok_in_page0;
+                size_t src_base =
+                    ((size_t)(new_begin + new_tok0) * (size_t)num_heads_kv + (size_t)kv_head) *
+                    (size_t)head_size;
+                size_t const token_stride = (size_t)num_heads_kv * (size_t)head_size;
 
                 for (int page_tok = 0; page_tok < page_len; ++page_tok) {
-                  int const new_tok = new_tok0 + page_tok;
-                  int const new_abs_tok = new_begin + new_tok;
                   int const dst_row = row_base + page_tok;
-                  size_t const src_base =
-                      ((size_t)new_abs_tok * (size_t)num_heads_kv + (size_t)kv_head) * (size_t)head_size;
                   for (int d_vec = lane_idx; d_vec < vecs_per_token; d_vec += intel::sg_size) {
                     int const d = d_vec * kVecElems;
                     size_t const src = src_base + (size_t)d;
@@ -384,6 +384,7 @@ struct FMHAFwdMainloop<
                     *reinterpret_cast<uint64_t*>(&K_dst(dst_row, d)) = k_value;
                     *reinterpret_cast<uint64_t*>(&V_dst(d, dst_row)) = v_value;
                   }
+                  src_base += token_stride;
                 }
                 new_tok0 += page_len;
               }
