@@ -330,6 +330,23 @@ class XeFMHAFwdKernel {
       const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
       const int k_blocks_causal =
           CollectiveMainloop::CausalMask ? (seq_coord + full_tile_offset) / get<1>(TileShapeQK{}) : 0;
+      int append_store_len = -1;
+      if constexpr (CollectiveMainloop::AppendKV) {
+        int const seq_k_new = get_k_new_len(params.mainloop, idx_b);
+        if (seq_k_new > 0) {
+          append_store_len = seq_k_new;
+          if constexpr (CollectiveMainloop::CausalMask && !PackGQA_) {
+            // Without a grid-wide barrier, each WG must write every appended
+            // token it may read; causal tiles only need the visible prefix.
+            int const cache_len_old = params.mainloop.append.ptr_cache_seqlens[idx_b];
+            int const tile_q = get<0>(TileShapeQK{});
+            int const q_tile_end = cute::min(seq_len_qo, (blk_q + 1) * tile_q);
+            int const visible_k_end = cute::min(seq_k_eff, full_tile_offset + q_tile_end);
+            append_store_len = cute::max(0, visible_k_end - cache_len_old);
+            append_store_len = cute::min(append_store_len, seq_k_new);
+          }
+        }
+      }
 
       // Sliding-window pruning: skip K blocks that are entirely outside the
       // [row - window_size_left, row + window_size_right] band for all rows in
@@ -443,6 +460,7 @@ class XeFMHAFwdKernel {
           s.num_heads_kv,
           full_tile_offset,
           discard_seq_coord,
+          append_store_len,
           K_cache(_, _, head, l_coord),
           V_cache(_, _, head, l_coord),
           scale_k);

@@ -31,6 +31,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include "cute/algorithm/functional.hpp"
 #include "cute/algorithm/gemm.hpp"
 #include "cute/algorithm/subgroup_algorithms.hpp"
@@ -302,9 +304,13 @@ struct FMHAFwdMainloop<
       int batch,
       int kv_head,
       int num_heads_kv,
-      int thr_id) const {
+      int thr_id,
+      int append_store_len = -1) const {
     if constexpr (AppendKV) {
-      int const new_len = get_k_new_len(batch);
+      int const new_len_total = get_k_new_len(batch);
+      int const new_len = append_store_len < 0
+          ? new_len_total
+          : (append_store_len < new_len_total ? append_store_len : new_len_total);
       if (new_len <= 0) {
         return;
       }
@@ -312,6 +318,7 @@ struct FMHAFwdMainloop<
       auto& K_dst = const_cast<TensorK_cache2D&>(K_cache_2D);
       auto& V_dst = const_cast<TensorV_cache2D&>(V_cache_2D);
       int const lane_idx = thr_id % intel::sg_size;
+      int const sub_group_id = thr_id / intel::sg_size;
       int const new_begin = params.append.ptr_cu_seqlens_k_new != nullptr
           ? params.append.ptr_cu_seqlens_k_new[batch]
           : batch * params.append.seq_len_kv_new;
@@ -325,6 +332,58 @@ struct FMHAFwdMainloop<
       // query heads that map to one kv_head, therefore overwrite identical bit
       // patterns at the same cache address; the append is intentionally
       // idempotent and does not rely on a grid-wide producer.
+      if constexpr (sizeof(typename TensorK_cache::element_type) == 2 &&
+                    sizeof(typename TensorV_cache::element_type) == 2) {
+        constexpr int kVecElems = 4;
+        if (head_size_qk == head_size_vo && (head_size_qk % kVecElems) == 0) {
+          if (sub_group_id != 0) {
+            return;
+          }
+          int const head_size = head_size_qk;
+          int const vecs_per_token = head_size / kVecElems;
+          bool single_dst_page = true;
+          int single_row_base = cache_len_old;
+          if constexpr (PagedKV) {
+            int const first_dst_page = cache_len_old / params.page_size;
+            int const last_dst_page = (cache_len_old + new_len - 1) / params.page_size;
+            single_dst_page = first_dst_page == last_dst_page;
+            if (single_dst_page) {
+              int const first_page_token = first_dst_page * params.page_size;
+              int const logical_page = batch * params.max_num_pages_per_seq + first_dst_page;
+              int const phys_page = params.ptr_page_table[logical_page];
+              single_row_base = phys_page * params.page_size + (cache_len_old - first_page_token);
+            }
+          }
+
+          for (int new_tok = 0; new_tok < new_len; ++new_tok) {
+            int const new_abs_tok = new_begin + new_tok;
+            int dst_row = single_row_base + new_tok;
+            if constexpr (PagedKV) {
+              if (!single_dst_page) {
+                int const dst_tok = cache_len_old + new_tok;
+                int const page = dst_tok / params.page_size;
+                int const tok_in_page = dst_tok - page * params.page_size;
+                int const logical_page = batch * params.max_num_pages_per_seq + page;
+                int const phys_page = params.ptr_page_table[logical_page];
+                dst_row = phys_page * params.page_size + tok_in_page;
+              }
+            }
+
+            size_t const src_base =
+                ((size_t)new_abs_tok * (size_t)num_heads_kv + (size_t)kv_head) * (size_t)head_size;
+            for (int d_vec = lane_idx; d_vec < vecs_per_token; d_vec += intel::sg_size) {
+              int const d = d_vec * kVecElems;
+              size_t const src = src_base + (size_t)d;
+              uint64_t const k_value = *reinterpret_cast<uint64_t const*>(params.append.ptr_K_new + src);
+              uint64_t const v_value = *reinterpret_cast<uint64_t const*>(params.append.ptr_V_new + src);
+              *reinterpret_cast<uint64_t*>(&K_dst(dst_row, d)) = k_value;
+              *reinterpret_cast<uint64_t*>(&V_dst(d, dst_row)) = v_value;
+            }
+          }
+          return;
+        }
+      }
+
       for (int linear = lane_idx; linear < new_len * max_hd; linear += intel::sg_size) {
         int const d = linear % max_hd;
         int const new_tok = linear / max_hd;
@@ -361,6 +420,7 @@ struct FMHAFwdMainloop<
       (void)kv_head;
       (void)num_heads_kv;
       (void)thr_id;
+      (void)append_store_len;
     }
   }
 
@@ -385,6 +445,7 @@ struct FMHAFwdMainloop<
       int num_heads_kv,
       int full_tile_offset,
       int discard_seq_coord,
+      int append_store_len = -1,
       TensorK_cache2D const& K_cache_2D = TensorK_cache2D{},
       TensorV_cache2D const& V_cache_2D = TensorV_cache2D{},
       float scale_k = 1.0f) {  // FP8 K per-tensor dequant scale
@@ -478,9 +539,9 @@ struct FMHAFwdMainloop<
     // ------
 
     if constexpr (AppendKV) {
-      store_kv_new(K_cache_2D, V_cache_2D, l_coord, kv_head, num_heads_kv, thr_id);
-      sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+      store_kv_new(K_cache_2D, V_cache_2D, l_coord, kv_head, num_heads_kv, thr_id, append_store_len);
       sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::device);
+      ::barrier();
     }
 
     /* Initialization steps for first block: Q/K prefetch, O init */
