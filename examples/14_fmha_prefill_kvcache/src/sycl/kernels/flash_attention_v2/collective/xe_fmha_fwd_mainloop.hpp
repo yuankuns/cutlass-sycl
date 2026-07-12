@@ -39,6 +39,7 @@
 #include "cute/atom/mma_atom.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
+#include "cutlass/sycl_vector_types.h"
 #include "fmha_fusion.hpp"
 
 namespace cutlass::fmha {
@@ -334,7 +335,9 @@ struct FMHAFwdMainloop<
       // idempotent and does not rely on a grid-wide producer.
       if constexpr (sizeof(typename TensorK_cache::element_type) == 2 &&
                     sizeof(typename TensorV_cache::element_type) == 2) {
-        constexpr int kVecElems = 4;
+        // NHD bf16 rows are 16B-aligned when head_size is divisible by 8.
+        constexpr int kVecElems = 8;
+        using StoreVec = cutlass::ulonglong2;
         if (head_size_qk == head_size_vo && (head_size_qk % kVecElems) == 0) {
           if (sub_group_id != 0) {
             return;
@@ -379,10 +382,10 @@ struct FMHAFwdMainloop<
                   for (int d_vec = lane_idx; d_vec < vecs_per_token; d_vec += intel::sg_size) {
                     int const d = d_vec * kVecElems;
                     size_t const src = src_base + (size_t)d;
-                    uint64_t const k_value = *reinterpret_cast<uint64_t const*>(params.append.ptr_K_new + src);
-                    uint64_t const v_value = *reinterpret_cast<uint64_t const*>(params.append.ptr_V_new + src);
-                    *reinterpret_cast<uint64_t*>(&K_dst(dst_row, d)) = k_value;
-                    *reinterpret_cast<uint64_t*>(&V_dst(d, dst_row)) = v_value;
+                    StoreVec const k_value = *reinterpret_cast<StoreVec const*>(params.append.ptr_K_new + src);
+                    StoreVec const v_value = *reinterpret_cast<StoreVec const*>(params.append.ptr_V_new + src);
+                    *reinterpret_cast<StoreVec*>(&K_dst(dst_row, d)) = k_value;
+                    *reinterpret_cast<StoreVec*>(&V_dst(d, dst_row)) = v_value;
                   }
                   src_base += token_stride;
                 }
@@ -411,10 +414,10 @@ struct FMHAFwdMainloop<
             for (int d_vec = lane_idx; d_vec < vecs_per_token; d_vec += intel::sg_size) {
               int const d = d_vec * kVecElems;
               size_t const src = src_base + (size_t)d;
-              uint64_t const k_value = *reinterpret_cast<uint64_t const*>(params.append.ptr_K_new + src);
-              uint64_t const v_value = *reinterpret_cast<uint64_t const*>(params.append.ptr_V_new + src);
-              *reinterpret_cast<uint64_t*>(&K_dst(dst_row, d)) = k_value;
-              *reinterpret_cast<uint64_t*>(&V_dst(d, dst_row)) = v_value;
+              StoreVec const k_value = *reinterpret_cast<StoreVec const*>(params.append.ptr_K_new + src);
+              StoreVec const v_value = *reinterpret_cast<StoreVec const*>(params.append.ptr_V_new + src);
+              *reinterpret_cast<StoreVec*>(&K_dst(dst_row, d)) = k_value;
+              *reinterpret_cast<StoreVec*>(&V_dst(d, dst_row)) = v_value;
             }
           }
           return;
