@@ -536,6 +536,24 @@ run_perf_case "perf.chunk.mixed_decode_prefill.paged_q1_q512_past8191_7680_sk819
   --heads-q 16 --heads-kv 4 --head-dim 128 --head-dim-v 128 --paged 1 --page-size 128 --causal 1
 fi
 
+if suite_enabled perf || suite_enabled append; then
+run_perf_case "perf.append.paged.hd64_sq512_old7680_new512_sk8192" \
+  --batch 1 --seqlen-q 512 --seqlen-k 8192 --cache-seqlens-old 7680 --k-new-seqlens 512 \
+  --heads-q 64 --heads-kv 1 --head-dim 64 --head-dim-v 64 --paged 1 --page-size 128 --causal 1
+
+run_perf_case "perf.append.paged.hd128_sq512_old7680_new512_sk8192" \
+  --batch 1 --seqlen-q 512 --seqlen-k 8192 --cache-seqlens-old 7680 --k-new-seqlens 512 \
+  --heads-q 16 --heads-kv 4 --head-dim 128 --head-dim-v 128 --paged 1 --page-size 128 --causal 1
+
+run_perf_case "perf.append.paged.hd256_sq512_old7680_new512_sk8192" \
+  --batch 1 --seqlen-q 512 --seqlen-k 8192 --cache-seqlens-old 7680 --k-new-seqlens 512 \
+  --heads-q 16 --heads-kv 4 --head-dim 256 --head-dim-v 256 --paged 1 --page-size 128 --causal 1
+
+run_perf_case "perf.append.nopaged.hd128_sq512_old7680_new512_sk8192" \
+  --batch 1 --seqlen-q 512 --seqlen-k 8192 --cache-seqlens-old 7680 --k-new-seqlens 512 \
+  --heads-q 8 --heads-kv 8 --head-dim 128 --head-dim-v 128 --paged 0 --causal 1
+fi
+
 echo "summary: passed=$passed failed=$failed total=$total"
 if [[ $failed -ne 0 ]]; then
   exit 1
