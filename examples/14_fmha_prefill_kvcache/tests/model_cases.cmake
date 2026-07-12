@@ -461,6 +461,24 @@ fmha_prefill_add_case(append.paged.hd128_mixed_general
   CACHE_SEQLENS_OLD 128,64 K_NEW_SEQLENS 1,128
   HEADS_Q 8 HEADS_KV 2 HEAD_DIM 128 PAGE_SIZE 64)
 
+fmha_prefill_add_case(append.paged.hd128_new65_page_tail
+  APPENDKV PAGED CAUSAL
+  BATCH 1 SEQLEN_Q 65 SEQLEN_K 128
+  CACHE_SEQLENS_OLD 63 K_NEW_SEQLENS 65
+  HEADS_Q 8 HEADS_KV 2 HEAD_DIM 128 PAGE_SIZE 64)
+
+fmha_prefill_add_case(append.paged.hd128_new129_cross_page
+  APPENDKV PAGED CAUSAL
+  BATCH 1 SEQLEN_Q 129 SEQLEN_K 256
+  CACHE_SEQLENS_OLD 127 K_NEW_SEQLENS 129
+  HEADS_Q 8 HEADS_KV 2 HEAD_DIM 128 PAGE_SIZE 64)
+
+fmha_prefill_add_case(append.paged.hd128_new511_large_nondiv
+  APPENDKV PAGED CAUSAL
+  BATCH 1 SEQLEN_Q 128 SEQLEN_K 8192
+  CACHE_SEQLENS_OLD 7681 K_NEW_SEQLENS 511
+  HEADS_Q 8 HEADS_KV 2 HEAD_DIM 128 PAGE_SIZE 128)
+
 fmha_prefill_add_case(append.nopaged.hd128_zero
   APPENDKV CAUSAL
   BATCH 2 SEQLEN_Q 32 SEQLEN_K 96 SEQLEN_Q_LIST 1,32
@@ -489,6 +507,18 @@ fmha_prefill_add_case(append.nopaged.hd128_mixed_general
   APPENDKV CAUSAL
   BATCH 2 SEQLEN_Q 128 SEQLEN_K 192 SEQLEN_Q_LIST 1,128
   CACHE_SEQLENS_OLD 128,64 K_NEW_SEQLENS 1,128
+  HEADS_Q 8 HEADS_KV 2 HEAD_DIM 128)
+
+fmha_prefill_add_case(append.nopaged.hd128_new65_threshold
+  APPENDKV CAUSAL
+  BATCH 1 SEQLEN_Q 65 SEQLEN_K 128
+  CACHE_SEQLENS_OLD 63 K_NEW_SEQLENS 65
+  HEADS_Q 8 HEADS_KV 2 HEAD_DIM 128)
+
+fmha_prefill_add_case(append.nopaged.hd128_new129_nondiv
+  APPENDKV CAUSAL
+  BATCH 1 SEQLEN_Q 129 SEQLEN_K 256
+  CACHE_SEQLENS_OLD 127 K_NEW_SEQLENS 129
   HEADS_Q 8 HEADS_KV 2 HEAD_DIM 128)
 
 # Generalized chunk-prefill accuracy cases, following the coverage dimensions
