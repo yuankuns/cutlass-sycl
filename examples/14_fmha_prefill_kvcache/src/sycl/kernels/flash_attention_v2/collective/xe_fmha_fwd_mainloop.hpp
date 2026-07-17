@@ -575,7 +575,6 @@ struct FMHAFwdMainloop<
 
     if constexpr (AppendKV) {
       store_kv_new(K_cache_2D, V_cache_2D, l_coord, kv_head, num_heads_kv, thr_id, append_store_len);
-      sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::device);
       ::barrier();
     }
 
