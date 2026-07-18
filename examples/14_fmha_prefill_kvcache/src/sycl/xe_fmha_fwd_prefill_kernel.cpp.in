@@ -92,6 +92,23 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
     return;
   }
 
+  if (params.seqlen_q <= 256 &&
+      static_cast<int64_t>(params.total_q) * 2 <= static_cast<int64_t>(params.b) * params.seqlen_q &&
+      params.d == 64 && params.dv == 64 && params.is_causal) {
+    using MediumTileShapeQK = cute::Shape<cute::Int<64>, cute::Int<32>, cute::_32>;
+    using MediumTileShapePV = cute::Shape<cute::Int<64>, cute::_32, cute::Int<32>>;
+    using MediumTileShapeOutput = cute::Shape<cute::Int<64>, cute::Int<64>>;
+    using MediumSubgroupLayoutQK = cute::
+        Layout<cute::Shape<cute::Int<4>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+    AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+        FMHAConfig<true, LocalMask, Sink, MediumTileShapeQK, MediumTileShapePV, MediumTileShapeOutput,
+                   MediumSubgroupLayoutQK>::run_paged(params);
+      });
+    });
+    return;
+  }
+
   if (params.seqlen_q <= 32 && params.d == 64 && params.dv == 64) {
     using SmallTileShapeQK = cute::Shape<cute::Int<32>, cute::Int<64>, cute::_32>;
     using SmallTileShapePV = cute::Shape<cute::Int<32>, cute::_32, cute::Int<64>>;
