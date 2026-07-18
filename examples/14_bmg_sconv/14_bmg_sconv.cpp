@@ -373,53 +373,22 @@ void reference_case(CaseConfig const& cfg, HostTensors<Element>& h) {
   }
 }
 
-template <
-    typename Element,
-    int W,
-    bool UseSilu,
-    bool UseResidual,
-    bool IsDecode,
-    int Vec = kVec,
-    int BlockT = kBlockT,
-    bool RegularSequenceFastPath = false,
-    bool PairFastPath = false>
-void run_sconv_kernel(DeviceParams<Element> const& params, sycl::nd_item<2> item) {
-  static_assert(!(RegularSequenceFastPath && PairFastPath), "fast path template switches are mutually exclusive");
-  if constexpr (RegularSequenceFastPath) {
-    static_assert(W == 4, "regular sequence fast path requires W=4");
-    static_assert(Vec == 4, "regular sequence fast path requires Vec=4");
-    static_assert(UseResidual, "regular sequence fast path requires residual");
-    static_assert(!UseSilu, "regular sequence fast path does not support silu");
-    static_assert(!IsDecode, "regular sequence fast path is for prefill only");
-  }
-  if constexpr (PairFastPath) {
-    static_assert(W == 4, "pair fast path requires W=4");
-    static_assert(Vec == 2, "pair fast path requires Vec=2");
-    static_assert(UseResidual, "pair fast path requires residual");
-    static_assert(!UseSilu, "pair fast path does not support silu");
-  }
-
-  int channel_blocks;
-  if constexpr (RegularSequenceFastPath) {
-    channel_blocks = params.D / Vec;
-  } else {
-    channel_blocks = (params.D + Vec - 1) / Vec;
-  }
-  int cb = static_cast<int>(item.get_global_id(0));
-  int tb = static_cast<int>(item.get_global_id(1));
-  if (cb >= channel_blocks) {
-    return;
-  }
-
-  int c0 = cb * Vec;
-  int t0 = tb * BlockT;
-  bool channel_valid[Vec];
+template <int Vec>
+CUTLASS_DEVICE
+void set_channel_valid(int c0, int D, bool (&channel_valid)[Vec]) {
 #pragma unroll
   for (int v = 0; v < Vec; ++v) {
-    channel_valid[v] = c0 + v < params.D;
+    channel_valid[v] = c0 + v < D;
   }
+}
 
-  float weights[W][Vec];
+template <typename Element, int W, int Vec>
+CUTLASS_DEVICE
+void load_sconv_weights(
+    DeviceParams<Element> const& params,
+    int c0,
+    bool const (&channel_valid)[Vec],
+    float (&weights)[W][Vec]) {
 #pragma unroll
   for (int iw = 0; iw < W; ++iw) {
 #pragma unroll
@@ -430,9 +399,17 @@ void run_sconv_kernel(DeviceParams<Element> const& params, sycl::nd_item<2> item
           : 0.0f;
     }
   }
+}
 
-  uint64_t x_raw[BlockT + W - 1];
-  float x_window[BlockT + W - 1][Vec];
+template <typename Element, int W, int Vec, int BlockT, bool RegularSequenceFastPath, bool PairFastPath>
+CUTLASS_DEVICE
+void load_sconv_window(
+    DeviceParams<Element> const& params,
+    int c0,
+    int t0,
+    bool const (&channel_valid)[Vec],
+    uint64_t (&x_raw)[BlockT + W - 1],
+    float (&x_window)[BlockT + W - 1][Vec]) {
 #pragma unroll
   for (int r = 0; r < BlockT + W - 1; ++r) {
     int row = t0 - (W - 1) + r;
@@ -468,6 +445,288 @@ void run_sconv_kernel(DeviceParams<Element> const& params, sycl::nd_item<2> item
       }
     }
   }
+}
+
+template <typename Element, int W, bool IsDecode, bool RegularSequenceFastPath>
+CUTLASS_DEVICE
+void get_sconv_sequence_state(
+    DeviceParams<Element> const& params,
+    int t,
+    int sequence_mask,
+    int& bos,
+    int& slot,
+    bool& mask) {
+  slot = 0;
+  mask = true;
+  if constexpr (RegularSequenceFastPath) {
+    int local_t = t & sequence_mask;
+    if (local_t < W - 1) {
+      int seq = t >> params.regular_tokens_per_seq_log2;
+      bos = t - local_t;
+      slot = static_cast<int>(params.safe_idx[seq]);
+      mask = params.cache_mask[seq] != 0;
+    } else {
+      bos = t - (W - 1);
+    }
+  } else {
+    int seq = params.seq_idx[t];
+    bos = static_cast<int>(params.cu[seq]);
+    slot = static_cast<int>(params.safe_idx[seq]);
+    if constexpr (!IsDecode) {
+      mask = params.cache_mask[seq] != 0;
+    }
+  }
+}
+
+template <typename Element, int W, int Vec, int BlockT, bool IsDecode, bool RegularSequenceFastPath, bool PairFastPath>
+CUTLASS_DEVICE
+void prepare_sconv_taps(
+    DeviceParams<Element> const& params,
+    int c0,
+    int j,
+    int t,
+    int bos,
+    int slot,
+    bool mask,
+    bool const (&channel_valid)[Vec],
+    uint64_t const (&x_raw)[BlockT + W - 1],
+    float const (&x_window)[BlockT + W - 1][Vec],
+    float (&tap_values)[W][Vec]) {
+#pragma unroll
+  for (int iw = 0; iw < W; ++iw) {
+    if constexpr (RegularSequenceFastPath) {
+      uint64_t raw = x_raw[j + (W - 1 - iw)];
+#pragma unroll
+      for (int v = 0; v < Vec; ++v) {
+        tap_values[iw][v] = to_float(Element::bitcast(static_cast<uint16_t>(raw >> (16 * v))));
+      }
+    } else {
+#pragma unroll
+      for (int v = 0; v < Vec; ++v) {
+        tap_values[iw][v] = x_window[j + (W - 1 - iw)][v];
+      }
+    }
+  }
+
+  if constexpr (RegularSequenceFastPath) {
+    if (t - (W - 1) < bos) {
+#pragma unroll
+      for (int iw = 1; iw < W; ++iw) {
+        int shifted = t - iw;
+        int prefix_pos = shifted - bos + (W - 1);
+        bool in_prefix = shifted < bos && prefix_pos >= 0 && prefix_pos < W - 1;
+        if (shifted < bos) {
+#pragma unroll
+          for (int v = 0; v < Vec; ++v) {
+            tap_values[iw][v] = 0.0f;
+          }
+          if (in_prefix && mask) {
+            std::size_t cache_offset = static_cast<std::size_t>(slot) * params.cache_stride_slot
+                + static_cast<std::size_t>(prefix_pos) * params.cache_stride_w + c0;
+            auto base = params.cache + cache_offset;
+            uint64_t raw = *reinterpret_cast<uint64_t const*>(base);
+#pragma unroll
+            for (int v = 0; v < Vec; ++v) {
+              tap_values[iw][v] = to_float(Element::bitcast(static_cast<uint16_t>(raw >> (16 * v))));
+            }
+          }
+        }
+      }
+    }
+  } else {
+#pragma unroll
+    for (int iw = 0; iw < W; ++iw) {
+      int shifted = t - iw;
+      int prefix_pos = shifted - bos + (W - 1);
+      bool in_prefix = shifted < bos && prefix_pos >= 0 && prefix_pos < W - 1;
+      if (shifted < bos) {
+#pragma unroll
+        for (int v = 0; v < Vec; ++v) {
+          tap_values[iw][v] = 0.0f;
+        }
+        if (in_prefix && (IsDecode || mask)) {
+          std::size_t cache_offset = static_cast<std::size_t>(slot) * params.cache_stride_slot
+              + static_cast<std::size_t>(prefix_pos) * params.cache_stride_w + c0;
+          auto base = params.cache + cache_offset;
+          if constexpr (PairFastPath) {
+            if (channel_valid[1]) {
+              uint32_t raw = *reinterpret_cast<uint32_t const*>(base);
+              tap_values[iw][0] = to_float(Element::bitcast(static_cast<uint16_t>(raw & 0xffffu)));
+              tap_values[iw][1] = to_float(Element::bitcast(static_cast<uint16_t>(raw >> 16)));
+            } else {
+              tap_values[iw][0] = to_float(*base);
+            }
+          } else {
+#pragma unroll
+            for (int v = 0; v < Vec; ++v) {
+              int c = c0 + v;
+              if (c < params.D) {
+                tap_values[iw][v] = to_float(params.cache[cache_offset + v]);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+template <int W, int Vec, bool RegularSequenceFastPath, bool PairFastPath>
+CUTLASS_DEVICE
+void accumulate_sconv(
+    bool const (&channel_valid)[Vec],
+    float const (&weights)[W][Vec],
+    float const (&tap_values)[W][Vec],
+    float (&acc)[Vec]) {
+#pragma unroll
+  for (int v = 0; v < Vec; ++v) {
+    acc[v] = 0.0f;
+  }
+
+#pragma unroll
+  for (int iw = 0; iw < W; ++iw) {
+#pragma unroll
+    for (int v = 0; v < Vec; ++v) {
+      if constexpr (RegularSequenceFastPath || PairFastPath) {
+        acc[v] += tap_values[iw][v] * weights[iw][v];
+      } else if (channel_valid[v]) {
+        acc[v] += tap_values[iw][v] * weights[iw][v];
+      }
+    }
+  }
+}
+
+template <typename Element, int Vec, bool UseResidual, bool RegularSequenceFastPath, bool PairFastPath>
+CUTLASS_DEVICE
+void add_sconv_residual(
+    DeviceParams<Element> const& params,
+    int c0,
+    int t,
+    bool const (&channel_valid)[Vec],
+    float (&out_values)[Vec]) {
+  if constexpr (UseResidual) {
+    auto residual_base = params.residual + static_cast<std::size_t>(t) * params.D + c0;
+    if constexpr (RegularSequenceFastPath) {
+      uint64_t raw = *reinterpret_cast<uint64_t const*>(residual_base);
+#pragma unroll
+      for (int v = 0; v < Vec; ++v) {
+        out_values[v] += to_float(Element::bitcast(static_cast<uint16_t>(raw >> (16 * v))));
+      }
+    } else if constexpr (PairFastPath) {
+      if (channel_valid[1]) {
+        uint32_t raw = *reinterpret_cast<uint32_t const*>(residual_base);
+        out_values[0] += to_float(Element::bitcast(static_cast<uint16_t>(raw & 0xffffu)));
+        out_values[1] += to_float(Element::bitcast(static_cast<uint16_t>(raw >> 16)));
+      } else {
+        out_values[0] += to_float(*residual_base);
+      }
+    } else {
+#pragma unroll
+      for (int v = 0; v < Vec; ++v) {
+        int c = c0 + v;
+        if (c < params.D) {
+          out_values[v] += to_float(params.residual[static_cast<std::size_t>(t) * params.D + c]);
+        }
+      }
+    }
+  }
+}
+
+template <int Vec, bool UseSilu, bool RegularSequenceFastPath, bool PairFastPath>
+CUTLASS_DEVICE
+void apply_sconv_silu(bool const (&channel_valid)[Vec], float (&out_values)[Vec]) {
+  if constexpr (UseSilu) {
+#pragma unroll
+    for (int v = 0; v < Vec; ++v) {
+      if constexpr (RegularSequenceFastPath || PairFastPath) {
+        out_values[v] = out_values[v] / (1.0f + sycl::exp(-out_values[v]));
+      } else if (channel_valid[v]) {
+        out_values[v] = out_values[v] / (1.0f + sycl::exp(-out_values[v]));
+      }
+    }
+  }
+}
+
+template <typename Element, int Vec, bool RegularSequenceFastPath, bool PairFastPath>
+CUTLASS_DEVICE
+void store_sconv_output(
+    DeviceParams<Element> const& params,
+    int c0,
+    int t,
+    bool const (&channel_valid)[Vec],
+    float const (&out_values)[Vec]) {
+  auto out = params.y + static_cast<std::size_t>(t) * params.D + c0;
+  if constexpr (RegularSequenceFastPath) {
+    uint64_t raw = 0;
+#pragma unroll
+    for (int v = 0; v < Vec; ++v) {
+      raw |= static_cast<uint64_t>(Element(out_values[v]).raw()) << (16 * v);
+    }
+    *reinterpret_cast<uint64_t*>(out) = raw;
+  } else if constexpr (PairFastPath) {
+    if (channel_valid[1]) {
+      uint32_t raw = static_cast<uint32_t>(Element(out_values[0]).raw())
+          | (static_cast<uint32_t>(Element(out_values[1]).raw()) << 16);
+      *reinterpret_cast<uint32_t*>(out) = raw;
+    } else {
+      *out = Element(out_values[0]);
+    }
+  } else {
+#pragma unroll
+    for (int v = 0; v < Vec; ++v) {
+      int c = c0 + v;
+      if (c < params.D) {
+        params.y[static_cast<std::size_t>(t) * params.D + c] = Element(out_values[v]);
+      }
+    }
+  }
+}
+
+template <
+    typename Element,
+    int W,
+    bool UseSilu,
+    bool UseResidual,
+    bool IsDecode,
+    int Vec = kVec,
+    int BlockT = kBlockT,
+    bool RegularSequenceFastPath = false,
+    bool PairFastPath = false>
+void run_sconv_kernel(DeviceParams<Element> const& params, sycl::nd_item<2> item) {
+  static_assert(!(RegularSequenceFastPath && PairFastPath), "fast path template switches are mutually exclusive");
+  if constexpr (RegularSequenceFastPath) {
+    static_assert(W == 4, "regular sequence fast path requires W=4");
+    static_assert(Vec == 4, "regular sequence fast path requires Vec=4");
+    static_assert(UseResidual, "regular sequence fast path requires residual");
+    static_assert(!UseSilu, "regular sequence fast path does not support silu");
+    static_assert(!IsDecode, "regular sequence fast path is for prefill only");
+  }
+  if constexpr (PairFastPath) {
+    static_assert(W == 4, "pair fast path requires W=4");
+    static_assert(Vec == 2, "pair fast path requires Vec=2");
+    static_assert(UseResidual, "pair fast path requires residual");
+    static_assert(!UseSilu, "pair fast path does not support silu");
+  }
+
+  int channel_blocks = RegularSequenceFastPath ? params.D / Vec : (params.D + Vec - 1) / Vec;
+  int cb = static_cast<int>(item.get_global_id(0));
+  int tb = static_cast<int>(item.get_global_id(1));
+  if (cb >= channel_blocks) {
+    return;
+  }
+
+  int c0 = cb * Vec;
+  int t0 = tb * BlockT;
+  bool channel_valid[Vec];
+  set_channel_valid<Vec>(c0, params.D, channel_valid);
+
+  float weights[W][Vec];
+  load_sconv_weights<Element, W, Vec>(params, c0, channel_valid, weights);
+
+  uint64_t x_raw[BlockT + W - 1];
+  float x_window[BlockT + W - 1][Vec];
+  load_sconv_window<Element, W, Vec, BlockT, RegularSequenceFastPath, PairFastPath>(
+      params, c0, t0, channel_valid, x_raw, x_window);
 
   int sequence_mask = 0;
   if constexpr (RegularSequenceFastPath) {
@@ -482,125 +741,18 @@ void run_sconv_kernel(DeviceParams<Element> const& params, sycl::nd_item<2> item
     }
 
     int bos;
-    int slot = 0;
-    bool mask = true;
-    if constexpr (RegularSequenceFastPath) {
-      int local_t = t & sequence_mask;
-      if (local_t < W - 1) {
-        int seq = t >> params.regular_tokens_per_seq_log2;
-        bos = t - local_t;
-        slot = static_cast<int>(params.safe_idx[seq]);
-        mask = params.cache_mask[seq] != 0;
-      } else {
-        bos = t - (W - 1);
-      }
-    } else {
-      int seq = params.seq_idx[t];
-      bos = static_cast<int>(params.cu[seq]);
-      slot = static_cast<int>(params.safe_idx[seq]);
-      if constexpr (!IsDecode) {
-        mask = params.cache_mask[seq] != 0;
-      }
-    }
+    int slot;
+    bool mask;
+    get_sconv_sequence_state<Element, W, IsDecode, RegularSequenceFastPath>(
+        params, t, sequence_mask, bos, slot, mask);
 
     float tap_values[W][Vec];
-#pragma unroll
-    for (int iw = 0; iw < W; ++iw) {
-      if constexpr (RegularSequenceFastPath) {
-        uint64_t raw = x_raw[j + (W - 1 - iw)];
-#pragma unroll
-        for (int v = 0; v < Vec; ++v) {
-          tap_values[iw][v] = to_float(Element::bitcast(static_cast<uint16_t>(raw >> (16 * v))));
-        }
-      } else {
-#pragma unroll
-        for (int v = 0; v < Vec; ++v) {
-          tap_values[iw][v] = x_window[j + (W - 1 - iw)][v];
-        }
-      }
-    }
-
-    if constexpr (RegularSequenceFastPath) {
-      if (t - (W - 1) < bos) {
-#pragma unroll
-        for (int iw = 1; iw < W; ++iw) {
-          int shifted = t - iw;
-          int prefix_pos = shifted - bos + (W - 1);
-          bool in_prefix = shifted < bos && prefix_pos >= 0 && prefix_pos < W - 1;
-          if (shifted < bos) {
-#pragma unroll
-            for (int v = 0; v < Vec; ++v) {
-              tap_values[iw][v] = 0.0f;
-            }
-            if (in_prefix && mask) {
-              std::size_t cache_offset = static_cast<std::size_t>(slot) * params.cache_stride_slot
-                  + static_cast<std::size_t>(prefix_pos) * params.cache_stride_w + c0;
-              auto base = params.cache + cache_offset;
-              uint64_t raw = *reinterpret_cast<uint64_t const*>(base);
-#pragma unroll
-              for (int v = 0; v < Vec; ++v) {
-                tap_values[iw][v] = to_float(Element::bitcast(static_cast<uint16_t>(raw >> (16 * v))));
-              }
-            }
-          }
-        }
-      }
-    } else {
-#pragma unroll
-      for (int iw = 0; iw < W; ++iw) {
-        int shifted = t - iw;
-        int prefix_pos = shifted - bos + (W - 1);
-        bool in_prefix = shifted < bos && prefix_pos >= 0 && prefix_pos < W - 1;
-        if (shifted < bos) {
-#pragma unroll
-          for (int v = 0; v < Vec; ++v) {
-            tap_values[iw][v] = 0.0f;
-          }
-          if (in_prefix && (IsDecode || mask)) {
-            std::size_t cache_offset = static_cast<std::size_t>(slot) * params.cache_stride_slot
-                + static_cast<std::size_t>(prefix_pos) * params.cache_stride_w + c0;
-            auto base = params.cache + cache_offset;
-            if constexpr (PairFastPath) {
-              if (channel_valid[1]) {
-                uint32_t raw = *reinterpret_cast<uint32_t const*>(base);
-                tap_values[iw][0] = to_float(Element::bitcast(static_cast<uint16_t>(raw & 0xffffu)));
-                tap_values[iw][1] = to_float(Element::bitcast(static_cast<uint16_t>(raw >> 16)));
-              } else {
-                tap_values[iw][0] = to_float(*base);
-              }
-            } else {
-#pragma unroll
-              for (int v = 0; v < Vec; ++v) {
-                int c = c0 + v;
-                if (c < params.D) {
-                  tap_values[iw][v] = to_float(params.cache[cache_offset + v]);
-                }
-              }
-            }
-          }
-        }
-      }
-    }
+    prepare_sconv_taps<Element, W, Vec, BlockT, IsDecode, RegularSequenceFastPath, PairFastPath>(
+        params, c0, j, t, bos, slot, mask, channel_valid, x_raw, x_window, tap_values);
 
     float acc[Vec];
-#pragma unroll
-    for (int v = 0; v < Vec; ++v) {
-      acc[v] = 0.0f;
-    }
-
-#pragma unroll
-    for (int iw = 0; iw < W; ++iw) {
-#pragma unroll
-      for (int v = 0; v < Vec; ++v) {
-        if constexpr (RegularSequenceFastPath || PairFastPath) {
-          acc[v] += tap_values[iw][v] * weights[iw][v];
-        } else {
-          if (channel_valid[v]) {
-            acc[v] += tap_values[iw][v] * weights[iw][v];
-          }
-        }
-      }
-    }
+    accumulate_sconv<W, Vec, RegularSequenceFastPath, PairFastPath>(
+        channel_valid, weights, tap_values, acc);
 
     float out_values[Vec];
 #pragma unroll
@@ -608,69 +760,13 @@ void run_sconv_kernel(DeviceParams<Element> const& params, sycl::nd_item<2> item
       out_values[v] = acc[v];
     }
 
-    if constexpr (UseResidual) {
-      auto residual_base = params.residual + static_cast<std::size_t>(t) * params.D + c0;
-      if constexpr (RegularSequenceFastPath) {
-        uint64_t raw = *reinterpret_cast<uint64_t const*>(residual_base);
-#pragma unroll
-        for (int v = 0; v < Vec; ++v) {
-          out_values[v] += to_float(Element::bitcast(static_cast<uint16_t>(raw >> (16 * v))));
-        }
-      } else if constexpr (PairFastPath) {
-        if (channel_valid[1]) {
-          uint32_t raw = *reinterpret_cast<uint32_t const*>(residual_base);
-          out_values[0] += to_float(Element::bitcast(static_cast<uint16_t>(raw & 0xffffu)));
-          out_values[1] += to_float(Element::bitcast(static_cast<uint16_t>(raw >> 16)));
-        } else {
-          out_values[0] += to_float(*residual_base);
-        }
-      } else {
-#pragma unroll
-        for (int v = 0; v < Vec; ++v) {
-          int c = c0 + v;
-          if (c < params.D) {
-            out_values[v] += to_float(params.residual[static_cast<std::size_t>(t) * params.D + c]);
-          }
-        }
-      }
-    }
+    add_sconv_residual<Element, Vec, UseResidual, RegularSequenceFastPath, PairFastPath>(
+        params, c0, t, channel_valid, out_values);
+    apply_sconv_silu<Vec, UseSilu, RegularSequenceFastPath, PairFastPath>(
+        channel_valid, out_values);
 
-    if constexpr (UseSilu) {
-#pragma unroll
-      for (int v = 0; v < Vec; ++v) {
-        if constexpr (RegularSequenceFastPath || PairFastPath) {
-          out_values[v] = out_values[v] / (1.0f + sycl::exp(-out_values[v]));
-        } else if (channel_valid[v]) {
-          out_values[v] = out_values[v] / (1.0f + sycl::exp(-out_values[v]));
-        }
-      }
-    }
-
-    auto out = params.y + static_cast<std::size_t>(t) * params.D + c0;
-    if constexpr (RegularSequenceFastPath) {
-      uint64_t raw = 0;
-#pragma unroll
-      for (int v = 0; v < Vec; ++v) {
-        raw |= static_cast<uint64_t>(Element(out_values[v]).raw()) << (16 * v);
-      }
-      *reinterpret_cast<uint64_t*>(out) = raw;
-    } else if constexpr (PairFastPath) {
-      if (channel_valid[1]) {
-        uint32_t raw = static_cast<uint32_t>(Element(out_values[0]).raw())
-            | (static_cast<uint32_t>(Element(out_values[1]).raw()) << 16);
-        *reinterpret_cast<uint32_t*>(out) = raw;
-      } else {
-        *out = Element(out_values[0]);
-      }
-    } else {
-#pragma unroll
-      for (int v = 0; v < Vec; ++v) {
-        int c = c0 + v;
-        if (c < params.D) {
-          params.y[static_cast<std::size_t>(t) * params.D + c] = Element(out_values[v]);
-        }
-      }
-    }
+    store_sconv_output<Element, Vec, RegularSequenceFastPath, PairFastPath>(
+        params, c0, t, channel_valid, out_values);
   }
 }
 
