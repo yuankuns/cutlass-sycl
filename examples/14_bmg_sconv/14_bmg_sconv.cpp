@@ -1038,6 +1038,10 @@ std::vector<CaseConfig> quick_suite() {
       {"silu_residual_b4_l16_d256", 64, 256, 4, 4, 16, true, true, true, false},
       {"edge_varied_b5_l13_d257", 65, 257, 4, 5, 13, true, false, true, false},
       {"edge_pair_b3_l32_d770", 96, 770, 4, 3, 32, false, false, true, false},
+      {"edge_decode_odd_b17_d257", 17, 257, 4, 17, 1, false, false, true, true},
+      {"w3_medium_b4_l33_d129", 132, 129, 3, 4, 33, false, false, true, false},
+      {"no_residual_b4_l16_d512", 64, 512, 4, 4, 16, false, false, false, false},
+      {"nonpower_pair_b4_l17_d512", 68, 512, 4, 4, 17, false, false, true, false},
   };
 }
 
@@ -1053,6 +1057,10 @@ std::vector<CaseConfig> inkling_suite() {
       {"verify_b32_m8_d1536", 256, 1536, 4, 32, 8, false, false, true, false},
       {"scattered_tp8_b16_l128_d192", 2048, 192, 4, 16, 128, true, false, true, false},
       {"silu_residual_b8_l128_d256", 1024, 256, 4, 8, 128, true, true, true, false},
+      {"decode_odd_b65_d257", 65, 257, 4, 65, 1, false, false, true, true},
+      {"w3_medium_b8_l128_d256", 1024, 256, 3, 8, 128, false, false, true, false},
+      {"no_residual_b8_l128_d512", 1024, 512, 4, 8, 128, false, false, false, false},
+      {"nonpower_pair_b8_l257_d512", 2056, 512, 4, 8, 257, false, false, true, false},
   };
 }
 
@@ -1060,6 +1068,14 @@ std::vector<CaseConfig> perf_suite() {
   return {
       {"perf_extend_t65536_d1536", 65536, 1536, 4, 64, 1024, false, false, true, false},
       {"perf_extend_t262144_d1536", 262144, 1536, 4, 128, 2048, false, false, true, false},
+  };
+}
+
+std::vector<CaseConfig> perf_extra_suite() {
+  return {
+      {"perf_pair_t65536_d770", 65536, 770, 4, 64, 1024, false, false, true, false},
+      {"perf_decode_b4096_d1536", 4096, 1536, 4, 4096, 1, false, false, true, true},
+      {"perf_no_residual_t65536_d1536", 65536, 1536, 4, 64, 1024, false, false, false, false},
   };
 }
 
@@ -1150,7 +1166,8 @@ struct Options {
     out << "Inkling BMG SConv Example\n\n"
         << "Options:\n"
         << "  --help                         Print this message\n"
-        << "  --suite=<quick|inkling|perf>    Built-in shape suite (default: inkling)\n"
+        << "  --suite=<quick|inkling|perf|perf-extra>\n"
+        << "                                  Built-in shape suite (default: inkling)\n"
         << "  --shape=<k=v,...>               Run one custom shape instead of a suite\n"
         << "                                  Keys: name,T,D,W,B,L,varied,silu,residual,decode\n"
         << "  --dtype=<bf16|fp16>             Input/output dtype (default: bf16)\n"
@@ -1162,6 +1179,7 @@ struct Options {
         << "  ./examples/14_bmg_sconv/14_bmg_sconv --suite=quick\n"
         << "  ./examples/14_bmg_sconv/14_bmg_sconv --suite=quick --dtype=fp16\n"
         << "  ./examples/14_bmg_sconv/14_bmg_sconv --suite=perf --verify=0 --iterations=100 --target-gbps=350\n"
+        << "  ./examples/14_bmg_sconv/14_bmg_sconv --suite=perf-extra --verify=0 --iterations=100\n"
         << "  ./examples/14_bmg_sconv/14_bmg_sconv --shape=T=8192,D=1536,W=4,B=8,L=1024,residual=1\n";
     return out;
   }
@@ -1199,6 +1217,8 @@ int main(int argc, char const** argv) {
     cases = inkling_suite();
   } else if (options.suite == "perf") {
     cases = perf_suite();
+  } else if (options.suite == "perf-extra") {
+    cases = perf_extra_suite();
   } else {
     std::cerr << "Unknown suite: " << options.suite << "\n";
     options.print_usage(std::cerr);
