@@ -47,6 +47,7 @@
 #include <cute/util/compat.hpp>
 
 #include "cutlass/bfloat16.h"
+#include "cutlass/half.h"
 #include "cutlass/util/GPU_Clock.hpp"
 #include "cutlass/util/command_line.h"
 
@@ -61,18 +62,25 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace cutlass::examples::sconv {
 
-using Element = cutlass::bfloat16_t;
-
 constexpr int kThreads = 384;
 constexpr int kBlockT = 4;
-constexpr int kRegularBlockT = 8;
+constexpr int kRegularBlockT = 4;
 constexpr int kVec = 1;
 
+enum class DType {
+  kBf16,
+  kFp16
+};
+
+template <typename Element_>
 struct DeviceParams {
+  using Element = Element_;
+
   Element const* __restrict__ x;
   Element const* __restrict__ cache;
   int64_t const* __restrict__ safe_idx;
@@ -89,13 +97,13 @@ struct DeviceParams {
   int regular_tokens_per_seq_log2;
 };
 
-template <int W, bool UseSilu, bool UseResidual, bool IsDecode, int Vec, int BlockT>
+template <typename Element, int W, bool UseSilu, bool UseResidual, bool IsDecode, int Vec, int BlockT>
 class CausalSconvKernel;
 
-template <bool IsDecode, int BlockT>
+template <typename Element, bool IsDecode, int BlockT>
 class CausalSconvW4ResidualPairKernel;
 
-template <int BlockT>
+template <typename Element, int BlockT>
 class CausalSconvW4ResidualQuadRegularKernel;
 
 template <typename T>
@@ -177,7 +185,10 @@ struct CaseConfig {
   bool is_decode = false;
 };
 
+template <typename Element_>
 struct HostTensors {
+  using Element = Element_;
+
   std::vector<Element> x;
   std::vector<Element> cache;
   std::vector<Element> weight;
@@ -191,18 +202,35 @@ struct HostTensors {
   int slots = 0;
 };
 
+template <typename Element>
 CUTLASS_HOST_DEVICE
 float to_float(Element x) {
 #if defined(__SYCL_DEVICE_ONLY__)
-  uint32_t bits = static_cast<uint32_t>(x.storage) << 16;
-  return sycl::bit_cast<float>(bits);
+  if constexpr (std::is_same_v<Element, cutlass::bfloat16_t>) {
+    uint32_t bits = static_cast<uint32_t>(x.raw()) << 16;
+    return sycl::bit_cast<float>(bits);
+  } else {
+    return static_cast<float>(x);
+  }
 #else
   return static_cast<float>(x);
 #endif
 }
 
-Element to_bf16(float x) {
-  return Element(x);
+std::string dtype_text(DType dtype) {
+  return dtype == DType::kBf16 ? "bf16" : "fp16";
+}
+
+bool parse_dtype(std::string const& text, DType& dtype) {
+  if (text == "bf16") {
+    dtype = DType::kBf16;
+    return true;
+  }
+  if (text == "fp16") {
+    dtype = DType::kFp16;
+    return true;
+  }
+  return false;
 }
 
 float silu(float x) {
@@ -246,8 +274,9 @@ std::vector<int> make_lengths(CaseConfig const& cfg) {
   return lengths;
 }
 
-HostTensors initialize_case(CaseConfig const& cfg) {
-  HostTensors h;
+template <typename Element>
+HostTensors<Element> initialize_case(CaseConfig const& cfg) {
+  HostTensors<Element> h;
   h.slots = std::max(cfg.batch + 7, 8);
   h.x.resize(static_cast<std::size_t>(cfg.T) * cfg.D);
   h.y.resize(static_cast<std::size_t>(cfg.T) * cfg.D);
@@ -267,16 +296,16 @@ HostTensors initialize_case(CaseConfig const& cfg) {
   std::uniform_real_distribution<float> r_dist(-0.05f, 0.05f);
 
   for (auto& v : h.x) {
-    v = to_bf16(x_dist(gen));
+    v = Element(x_dist(gen));
   }
   for (auto& v : h.weight) {
-    v = to_bf16(w_dist(gen));
+    v = Element(w_dist(gen));
   }
   for (auto& v : h.cache) {
-    v = to_bf16(c_dist(gen));
+    v = Element(c_dist(gen));
   }
   for (auto& v : h.residual) {
-    v = to_bf16(r_dist(gen));
+    v = Element(r_dist(gen));
   }
 
   if (cfg.name == "reference_w3_tiny") {
@@ -305,8 +334,8 @@ HostTensors initialize_case(CaseConfig const& cfg) {
   return h;
 }
 
-template <int W>
-void reference_case(CaseConfig const& cfg, HostTensors& h) {
+template <typename Element, int W>
+void reference_case(CaseConfig const& cfg, HostTensors<Element>& h) {
   for (int t = 0; t < cfg.T; ++t) {
     int seq = h.seq_idx[t];
     int bos = static_cast<int>(h.cu[seq]);
@@ -336,13 +365,13 @@ void reference_case(CaseConfig const& cfg, HostTensors& h) {
       if (cfg.use_silu) {
         acc = silu(acc);
       }
-      h.ref[static_cast<std::size_t>(t) * cfg.D + d] = to_bf16(acc);
+      h.ref[static_cast<std::size_t>(t) * cfg.D + d] = Element(acc);
     }
   }
 }
 
-template <int W, bool UseSilu, bool UseResidual, bool IsDecode, int Vec = kVec, int BlockT = kBlockT>
-void run_sconv_kernel(DeviceParams const& params, sycl::nd_item<2> item) {
+template <typename Element, int W, bool UseSilu, bool UseResidual, bool IsDecode, int Vec = kVec, int BlockT = kBlockT>
+void run_sconv_kernel(DeviceParams<Element> const& params, sycl::nd_item<2> item) {
   int channel_blocks = (params.D + Vec - 1) / Vec;
   int cb = static_cast<int>(item.get_global_id(0));
   int tb = static_cast<int>(item.get_global_id(1));
@@ -439,8 +468,8 @@ void run_sconv_kernel(DeviceParams const& params, sycl::nd_item<2> item) {
   }
 }
 
-template <int W, bool UseSilu, bool UseResidual, bool IsDecode, int Vec = kVec, int BlockT = kBlockT>
-void launch_sconv(sycl::queue& q, DeviceParams const& params) {
+template <typename Element, int W, bool UseSilu, bool UseResidual, bool IsDecode, int Vec = kVec, int BlockT = kBlockT>
+void launch_sconv(sycl::queue& q, DeviceParams<Element> const& params) {
   int channel_blocks = (params.D + Vec - 1) / Vec;
   int token_blocks = (params.T + BlockT - 1) / BlockT;
   int rounded_channel_blocks = ((channel_blocks + kThreads - 1) / kThreads) * kThreads;
@@ -448,14 +477,14 @@ void launch_sconv(sycl::queue& q, DeviceParams const& params) {
   sycl::range<2> local(kThreads, 1);
   sycl::range<2> global(rounded_channel_blocks, token_blocks);
 
-  q.parallel_for<CausalSconvKernel<W, UseSilu, UseResidual, IsDecode, Vec, BlockT>>(
+  q.parallel_for<CausalSconvKernel<Element, W, UseSilu, UseResidual, IsDecode, Vec, BlockT>>(
       sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> item) {
-        run_sconv_kernel<W, UseSilu, UseResidual, IsDecode, Vec, BlockT>(params, item);
+        run_sconv_kernel<Element, W, UseSilu, UseResidual, IsDecode, Vec, BlockT>(params, item);
       });
 }
 
-template <bool IsDecode, int BlockT = kBlockT>
-void run_sconv_w4_residual_pair_kernel(DeviceParams const& params, sycl::nd_item<2> item) {
+template <typename Element, bool IsDecode, int BlockT = kBlockT>
+void run_sconv_w4_residual_pair_kernel(DeviceParams<Element> const& params, sycl::nd_item<2> item) {
   int channel_blocks = (params.D + 1) / 2;
   int cb = static_cast<int>(item.get_global_id(0));
   int tb = static_cast<int>(item.get_global_id(1));
@@ -586,8 +615,8 @@ void run_sconv_w4_residual_pair_kernel(DeviceParams const& params, sycl::nd_item
 
     auto out = params.y + static_cast<std::size_t>(t) * params.D + c0;
     if (has_pair) {
-      uint32_t raw = static_cast<uint32_t>(Element(out0).storage)
-          | (static_cast<uint32_t>(Element(out1).storage) << 16);
+      uint32_t raw = static_cast<uint32_t>(Element(out0).raw())
+          | (static_cast<uint32_t>(Element(out1).raw()) << 16);
       *reinterpret_cast<uint32_t*>(out) = raw;
     } else {
       *out = Element(out0);
@@ -595,8 +624,8 @@ void run_sconv_w4_residual_pair_kernel(DeviceParams const& params, sycl::nd_item
   }
 }
 
-template <bool IsDecode, int BlockT = kBlockT>
-void launch_sconv_w4_residual_pair(sycl::queue& q, DeviceParams const& params) {
+template <typename Element, bool IsDecode, int BlockT = kBlockT>
+void launch_sconv_w4_residual_pair(sycl::queue& q, DeviceParams<Element> const& params) {
   int channel_blocks = (params.D + 1) / 2;
   int token_blocks = (params.T + BlockT - 1) / BlockT;
   int rounded_channel_blocks = ((channel_blocks + kThreads - 1) / kThreads) * kThreads;
@@ -604,14 +633,14 @@ void launch_sconv_w4_residual_pair(sycl::queue& q, DeviceParams const& params) {
   sycl::range<2> local(kThreads, 1);
   sycl::range<2> global(rounded_channel_blocks, token_blocks);
 
-  q.parallel_for<CausalSconvW4ResidualPairKernel<IsDecode, BlockT>>(
+  q.parallel_for<CausalSconvW4ResidualPairKernel<Element, IsDecode, BlockT>>(
       sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> item) {
-        run_sconv_w4_residual_pair_kernel<IsDecode, BlockT>(params, item);
+        run_sconv_w4_residual_pair_kernel<Element, IsDecode, BlockT>(params, item);
       });
 }
 
-template <int BlockT = kBlockT>
-void run_sconv_w4_residual_quad_regular_kernel(DeviceParams const& params, sycl::nd_item<2> item) {
+template <typename Element, int BlockT = kBlockT>
+void run_sconv_w4_residual_quad_regular_kernel(DeviceParams<Element> const& params, sycl::nd_item<2> item) {
   int channel_blocks = params.D / 4;
   int cb = static_cast<int>(item.get_global_id(0));
   int tb = static_cast<int>(item.get_global_id(1));
@@ -746,15 +775,15 @@ void run_sconv_w4_residual_quad_regular_kernel(DeviceParams const& params, sycl:
     uint64_t out_raw = 0;
 #pragma unroll
     for (int v = 0; v < 4; ++v) {
-      out_raw |= static_cast<uint64_t>(Element(out_values[v]).storage) << (16 * v);
+      out_raw |= static_cast<uint64_t>(Element(out_values[v]).raw()) << (16 * v);
     }
     auto out = params.y + static_cast<std::size_t>(t) * params.D + c0;
     *reinterpret_cast<uint64_t*>(out) = out_raw;
   }
 }
 
-template <int BlockT = kBlockT>
-void launch_sconv_w4_residual_quad_regular(sycl::queue& q, DeviceParams const& params) {
+template <typename Element, int BlockT = kBlockT>
+void launch_sconv_w4_residual_quad_regular(sycl::queue& q, DeviceParams<Element> const& params) {
   int channel_blocks = params.D / 4;
   int token_blocks = (params.T + BlockT - 1) / BlockT;
   int rounded_channel_blocks = ((channel_blocks + kThreads - 1) / kThreads) * kThreads;
@@ -762,59 +791,59 @@ void launch_sconv_w4_residual_quad_regular(sycl::queue& q, DeviceParams const& p
   sycl::range<2> local(kThreads, 1);
   sycl::range<2> global(rounded_channel_blocks, token_blocks);
 
-  q.parallel_for<CausalSconvW4ResidualQuadRegularKernel<BlockT>>(
+  q.parallel_for<CausalSconvW4ResidualQuadRegularKernel<Element, BlockT>>(
       sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> item) {
-        run_sconv_w4_residual_quad_regular_kernel<BlockT>(params, item);
+        run_sconv_w4_residual_quad_regular_kernel<Element, BlockT>(params, item);
       });
 }
 
-template <int W, bool UseSilu, bool UseResidual, bool IsDecode>
-void launch_selected(sycl::queue& q, DeviceParams const& params) {
-  launch_sconv<W, UseSilu, UseResidual, IsDecode>(q, params);
+template <typename Element, int W, bool UseSilu, bool UseResidual, bool IsDecode>
+void launch_selected(sycl::queue& q, DeviceParams<Element> const& params) {
+  launch_sconv<Element, W, UseSilu, UseResidual, IsDecode>(q, params);
 }
 
-template <int W, bool UseSilu, bool UseResidual>
-void launch_decode_selected(sycl::queue& q, DeviceParams const& params, bool is_decode) {
+template <typename Element, int W, bool UseSilu, bool UseResidual>
+void launch_decode_selected(sycl::queue& q, DeviceParams<Element> const& params, bool is_decode) {
   if (is_decode) {
-    launch_selected<W, UseSilu, UseResidual, true>(q, params);
+    launch_selected<Element, W, UseSilu, UseResidual, true>(q, params);
   } else {
-    launch_selected<W, UseSilu, UseResidual, false>(q, params);
+    launch_selected<Element, W, UseSilu, UseResidual, false>(q, params);
   }
 }
 
-template <int W, bool UseSilu>
-void launch_residual_selected(sycl::queue& q, DeviceParams const& params, bool use_residual, bool is_decode) {
+template <typename Element, int W, bool UseSilu>
+void launch_residual_selected(sycl::queue& q, DeviceParams<Element> const& params, bool use_residual, bool is_decode) {
   if (use_residual) {
-    launch_decode_selected<W, UseSilu, true>(q, params, is_decode);
+    launch_decode_selected<Element, W, UseSilu, true>(q, params, is_decode);
   } else {
-    launch_decode_selected<W, UseSilu, false>(q, params, is_decode);
+    launch_decode_selected<Element, W, UseSilu, false>(q, params, is_decode);
   }
 }
 
-template <int W>
-void launch_runtime(sycl::queue& q, DeviceParams const& params, bool use_silu, bool use_residual, bool is_decode) {
+template <typename Element, int W>
+void launch_runtime(sycl::queue& q, DeviceParams<Element> const& params, bool use_silu, bool use_residual, bool is_decode) {
   if constexpr (W == 4) {
     if (!use_silu && use_residual && params.D % 2 == 0) {
       if (!is_decode && params.regular_tokens_per_seq_log2 >= 0) {
         if (params.D % 4 == 0) {
-          launch_sconv_w4_residual_quad_regular<kRegularBlockT>(q, params);
+          launch_sconv_w4_residual_quad_regular<Element, kRegularBlockT>(q, params);
         } else {
-          launch_sconv_w4_residual_pair<false>(q, params);
+          launch_sconv_w4_residual_pair<Element, false>(q, params);
         }
         return;
       }
       if (is_decode) {
-        launch_sconv_w4_residual_pair<true>(q, params);
+        launch_sconv_w4_residual_pair<Element, true>(q, params);
       } else {
-        launch_sconv_w4_residual_pair<false>(q, params);
+        launch_sconv_w4_residual_pair<Element, false>(q, params);
       }
       return;
     }
   }
   if (use_silu) {
-    launch_residual_selected<W, true>(q, params, use_residual, is_decode);
+    launch_residual_selected<Element, W, true>(q, params, use_residual, is_decode);
   } else {
-    launch_residual_selected<W, false>(q, params, use_residual, is_decode);
+    launch_residual_selected<Element, W, false>(q, params, use_residual, is_decode);
   }
 }
 
@@ -825,6 +854,7 @@ struct VerifyResult {
   int index = 0;
 };
 
+template <typename Element>
 VerifyResult verify_output(std::vector<Element> const& got, std::vector<Element> const& ref, bool use_silu) {
   VerifyResult result;
   float atol = use_silu ? 2.5e-2f : 1.0e-2f;
@@ -850,6 +880,7 @@ double gops_for(CaseConfig const& cfg) {
   return (2.0 * static_cast<double>(cfg.T) * cfg.D * cfg.W) / 1.0e9;
 }
 
+template <typename Element>
 double minimum_streaming_bytes(CaseConfig const& cfg, int slots) {
   double bytes = static_cast<double>(cfg.T) * cfg.D * sizeof(Element) * 2.0
       + static_cast<double>(cfg.D) * cfg.W * sizeof(Element)
@@ -860,6 +891,7 @@ double minimum_streaming_bytes(CaseConfig const& cfg, int slots) {
   return bytes;
 }
 
+template <typename Element>
 bool run_case(
     sycl::queue& q,
     CaseConfig const& cfg,
@@ -867,13 +899,13 @@ bool run_case(
     bool verify,
     double target_tops,
     double target_gbps) {
-  HostTensors h = initialize_case(cfg);
+  HostTensors<Element> h = initialize_case<Element>(cfg);
 
   if (verify) {
     if (cfg.W == 3) {
-      reference_case<3>(cfg, h);
+      reference_case<Element, 3>(cfg, h);
     } else if (cfg.W == 4) {
-      reference_case<4>(cfg, h);
+      reference_case<Element, 4>(cfg, h);
     } else {
       std::cerr << "Unsupported W=" << cfg.W << " in reference\n";
       return false;
@@ -899,7 +931,7 @@ bool run_case(
   d_cu.copy_from(h.cu);
   d_seq_idx.copy_from(h.seq_idx);
 
-  DeviceParams params{
+  DeviceParams<Element> params{
       d_x.get(),
       d_cache.get(),
       d_safe_idx.get(),
@@ -919,9 +951,9 @@ bool run_case(
 
   auto launch = [&]() {
     if (cfg.W == 3) {
-      launch_runtime<3>(q, params, cfg.use_silu, cfg.use_residual, cfg.is_decode);
+      launch_runtime<Element, 3>(q, params, cfg.use_silu, cfg.use_residual, cfg.is_decode);
     } else if (cfg.W == 4) {
-      launch_runtime<4>(q, params, cfg.use_silu, cfg.use_residual, cfg.is_decode);
+      launch_runtime<Element, 4>(q, params, cfg.use_silu, cfg.use_residual, cfg.is_decode);
     } else {
       throw std::runtime_error("unsupported W");
     }
@@ -934,7 +966,7 @@ bool run_case(
   VerifyResult vr;
   if (verify) {
     d_y.copy_to(h.y);
-    vr = verify_output(h.y, h.ref, cfg.use_silu);
+    vr = verify_output<Element>(h.y, h.ref, cfg.use_silu);
     passed = vr.passed;
   }
 
@@ -953,7 +985,7 @@ bool run_case(
   q.wait_and_throw();
   double avg_s = timer.seconds() / timing_iterations;
   double useful_tops = gops_for(cfg) / avg_s / 1000.0;
-  double bytes = minimum_streaming_bytes(cfg, h.slots);
+  double bytes = minimum_streaming_bytes<Element>(cfg, h.slots);
   double gbps = (bytes / 1.0e9) / avg_s;
 
   std::cout << std::left << std::setw(28) << cfg.name
@@ -1086,10 +1118,13 @@ bool parse_single_shape(std::string const& text, CaseConfig& cfg) {
 
 struct Options {
   bool help = false;
+  bool valid = true;
   bool verify = true;
   int iterations = 20;
   std::string suite = "inkling";
   std::string shape;
+  std::string dtype_name = "bf16";
+  DType dtype = DType::kBf16;
   double target_tops = 0.0;
   double target_gbps = 0.0;
 
@@ -1105,8 +1140,12 @@ struct Options {
     cmd.get_cmd_line_argument("iterations", iterations, 20);
     cmd.get_cmd_line_argument("suite", suite, std::string("inkling"));
     cmd.get_cmd_line_argument("shape", shape, std::string(""));
+    cmd.get_cmd_line_argument("dtype", dtype_name, std::string("bf16"));
     cmd.get_cmd_line_argument("target-tops", target_tops, 0.0);
     cmd.get_cmd_line_argument("target-gbps", target_gbps, 0.0);
+    if (!parse_dtype(dtype_name, dtype)) {
+      valid = false;
+    }
   }
 
   std::ostream& print_usage(std::ostream& out) const {
@@ -1116,12 +1155,14 @@ struct Options {
         << "  --suite=<quick|inkling|perf>    Built-in shape suite (default: inkling)\n"
         << "  --shape=<k=v,...>               Run one custom shape instead of a suite\n"
         << "                                  Keys: name,T,D,W,B,L,varied,silu,residual,decode\n"
+        << "  --dtype=<bf16|fp16>             Input/output dtype (default: bf16)\n"
         << "  --iterations=<int>              Timed kernel iterations\n"
-        << "  --verify=<0|1>                  Run CPU bf16 reference comparison\n"
+        << "  --verify=<0|1>                  Run CPU dtype reference comparison\n"
         << "  --target-tops=<float>           Fail if any timed case is below this useful TOPS\n"
         << "  --target-gbps=<float>           Fail if any timed case is below this effective GB/s\n\n"
         << "Examples:\n"
         << "  ./examples/14_bmg_sconv/14_bmg_sconv --suite=quick\n"
+        << "  ./examples/14_bmg_sconv/14_bmg_sconv --suite=quick --dtype=fp16\n"
         << "  ./examples/14_bmg_sconv/14_bmg_sconv --suite=perf --verify=0 --iterations=100 --target-gbps=350\n"
         << "  ./examples/14_bmg_sconv/14_bmg_sconv --shape=T=8192,D=1536,W=4,B=8,L=1024,residual=1\n";
     return out;
@@ -1138,6 +1179,11 @@ int main(int argc, char const** argv) {
   if (options.help) {
     options.print_usage(std::cout);
     return 0;
+  }
+  if (!options.valid) {
+    std::cerr << "Unsupported dtype: " << options.dtype_name << "\n";
+    options.print_usage(std::cerr);
+    return 1;
   }
 
   std::vector<CaseConfig> cases;
@@ -1166,13 +1212,19 @@ int main(int argc, char const** argv) {
     std::cout << "Device: " << q.get_device().get_info<sycl::info::device::name>() << "\n";
     std::cout << "Suite: " << (options.shape.empty() ? options.suite : "custom")
               << ", cases=" << cases.size()
+              << ", dtype=" << dtype_text(options.dtype)
               << ", iterations=" << options.iterations
               << ", verify=" << bool_text(options.verify) << "\n";
 
     bool all_passed = true;
     for (auto const& cfg : cases) {
-      all_passed &= run_case(
-          q, cfg, options.iterations, options.verify, options.target_tops, options.target_gbps);
+      if (options.dtype == DType::kBf16) {
+        all_passed &= run_case<cutlass::bfloat16_t>(
+            q, cfg, options.iterations, options.verify, options.target_tops, options.target_gbps);
+      } else {
+        all_passed &= run_case<cutlass::half_t>(
+            q, cfg, options.iterations, options.verify, options.target_tops, options.target_gbps);
+      }
     }
 
     return all_passed ? 0 : 2;
