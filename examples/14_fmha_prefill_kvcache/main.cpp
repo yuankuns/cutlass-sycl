@@ -973,17 +973,18 @@ int main(int argc, char** argv) {
     }
 
     for (int i = 0; i < cfg.warmup; ++i) {
-      (void)launch_once();
+      auto event = launch_once();
+      event.wait();
     }
-    q.wait();
 
     std::vector<sycl::event> measured_events;
     measured_events.reserve(std::max(cfg.iters, 0));
     const auto start = std::chrono::steady_clock::now();
     for (int i = 0; i < cfg.iters; ++i) {
-      measured_events.push_back(launch_once());
+      auto event = launch_once();
+      event.wait();
+      measured_events.push_back(event);
     }
-    q.wait();
     const auto end = std::chrono::steady_clock::now();
     const double total_ms = std::chrono::duration<double, std::milli>(end - start).count();
     double kernel_total_ms = 0.0;
