@@ -97,11 +97,17 @@ struct DeviceParams {
   int regular_tokens_per_seq_log2;
 };
 
-template <typename Element, int W, bool UseSilu, bool UseResidual, bool IsDecode, int Vec, int BlockT, bool RegularSequenceFastPath>
+template <
+    typename Element,
+    int W,
+    bool UseSilu,
+    bool UseResidual,
+    bool IsDecode,
+    int Vec,
+    int BlockT,
+    bool RegularSequenceFastPath,
+    bool PairFastPath>
 class CausalSconvKernel;
-
-template <typename Element, bool IsDecode, int BlockT>
-class CausalSconvW4ResidualPairKernel;
 
 template <typename T>
 struct DeviceBuffer {
@@ -375,181 +381,84 @@ template <
     bool IsDecode,
     int Vec = kVec,
     int BlockT = kBlockT,
-    bool RegularSequenceFastPath = false>
+    bool RegularSequenceFastPath = false,
+    bool PairFastPath = false>
 void run_sconv_kernel(DeviceParams<Element> const& params, sycl::nd_item<2> item) {
+  static_assert(!(RegularSequenceFastPath && PairFastPath), "fast path template switches are mutually exclusive");
   if constexpr (RegularSequenceFastPath) {
     static_assert(W == 4, "regular sequence fast path requires W=4");
     static_assert(Vec == 4, "regular sequence fast path requires Vec=4");
     static_assert(UseResidual, "regular sequence fast path requires residual");
     static_assert(!UseSilu, "regular sequence fast path does not support silu");
     static_assert(!IsDecode, "regular sequence fast path is for prefill only");
+  }
+  if constexpr (PairFastPath) {
+    static_assert(W == 4, "pair fast path requires W=4");
+    static_assert(Vec == 2, "pair fast path requires Vec=2");
+    static_assert(UseResidual, "pair fast path requires residual");
+    static_assert(!UseSilu, "pair fast path does not support silu");
+  }
 
-    int channel_blocks = params.D / Vec;
-    int cb = static_cast<int>(item.get_global_id(0));
-    int tb = static_cast<int>(item.get_global_id(1));
-    if (cb >= channel_blocks) {
-      return;
-    }
+  int channel_blocks;
+  if constexpr (RegularSequenceFastPath) {
+    channel_blocks = params.D / Vec;
+  } else {
+    channel_blocks = (params.D + Vec - 1) / Vec;
+  }
+  int cb = static_cast<int>(item.get_global_id(0));
+  int tb = static_cast<int>(item.get_global_id(1));
+  if (cb >= channel_blocks) {
+    return;
+  }
 
-    int c0 = cb * Vec;
-    int t0 = tb * BlockT;
+  int c0 = cb * Vec;
+  int t0 = tb * BlockT;
+  bool channel_valid[Vec];
+#pragma unroll
+  for (int v = 0; v < Vec; ++v) {
+    channel_valid[v] = c0 + v < params.D;
+  }
 
-    float weights[Vec][W];
+  float weights[W][Vec];
+#pragma unroll
+  for (int iw = 0; iw < W; ++iw) {
 #pragma unroll
     for (int v = 0; v < Vec; ++v) {
-#pragma unroll
-      for (int iw = 0; iw < W; ++iw) {
-        weights[v][iw] = to_float(params.weight[static_cast<std::size_t>(c0 + v) * W + iw]);
-      }
+      int c = c0 + v;
+      weights[iw][v] = channel_valid[v]
+          ? to_float(params.weight[static_cast<std::size_t>(c) * W + iw])
+          : 0.0f;
     }
+  }
 
-    uint64_t x_raw[BlockT + W - 1];
+  uint64_t x_raw[BlockT + W - 1];
+  float x_window[BlockT + W - 1][Vec];
 #pragma unroll
-    for (int r = 0; r < BlockT + W - 1; ++r) {
-      int row = t0 - (W - 1) + r;
+  for (int r = 0; r < BlockT + W - 1; ++r) {
+    int row = t0 - (W - 1) + r;
+    if constexpr (RegularSequenceFastPath) {
       if (row >= 0 && row < params.T) {
         auto base = params.x + static_cast<std::size_t>(row) * params.D + c0;
         x_raw[r] = *reinterpret_cast<uint64_t const*>(base);
       } else {
         x_raw[r] = 0;
       }
-    }
-
-    int sequence_mask = (1 << params.regular_tokens_per_seq_log2) - 1;
-
-#pragma unroll
-    for (int j = 0; j < BlockT; ++j) {
-      int t = t0 + j;
-      if (t >= params.T) {
-        return;
-      }
-
-      int local_t = t & sequence_mask;
-      float tap0[Vec];
-      float tap1[Vec];
-      float tap2[Vec];
-      uint64_t raw0 = x_raw[j + 0];
-      uint64_t raw1 = x_raw[j + 1];
-      uint64_t raw2 = x_raw[j + 2];
-      uint64_t raw3 = x_raw[j + 3];
-#pragma unroll
-      for (int v = 0; v < Vec; ++v) {
-        tap0[v] = to_float(Element::bitcast(static_cast<uint16_t>(raw0 >> (16 * v))));
-        tap1[v] = to_float(Element::bitcast(static_cast<uint16_t>(raw1 >> (16 * v))));
-        tap2[v] = to_float(Element::bitcast(static_cast<uint16_t>(raw2 >> (16 * v))));
-      }
-
-      if (local_t < W - 1) {
-        int seq = t >> params.regular_tokens_per_seq_log2;
-        int bos = t - local_t;
-        int slot = static_cast<int>(params.safe_idx[seq]);
-        bool mask = params.cache_mask[seq] != 0;
-
-        int shifted0 = t - 3;
-        int shifted1 = t - 2;
-        int shifted2 = t - 1;
-
-        if (shifted0 < bos) {
-#pragma unroll
-          for (int v = 0; v < Vec; ++v) {
-            tap0[v] = 0.0f;
-          }
-          int prefix_pos = shifted0 - bos + 3;
-          if (mask && prefix_pos >= 0) {
-            auto base = params.cache + static_cast<std::size_t>(slot) * params.cache_stride_slot
-                + static_cast<std::size_t>(prefix_pos) * params.cache_stride_w + c0;
-            uint64_t raw = *reinterpret_cast<uint64_t const*>(base);
-#pragma unroll
-            for (int v = 0; v < Vec; ++v) {
-              tap0[v] = to_float(Element::bitcast(static_cast<uint16_t>(raw >> (16 * v))));
-            }
-          }
+    } else if constexpr (PairFastPath) {
+      if (row >= 0 && row < params.T) {
+        auto base = params.x + static_cast<std::size_t>(row) * params.D + c0;
+        if (channel_valid[1]) {
+          uint32_t raw = *reinterpret_cast<uint32_t const*>(base);
+          x_window[r][0] = to_float(Element::bitcast(static_cast<uint16_t>(raw & 0xffffu)));
+          x_window[r][1] = to_float(Element::bitcast(static_cast<uint16_t>(raw >> 16)));
+        } else {
+          x_window[r][0] = to_float(*base);
+          x_window[r][1] = 0.0f;
         }
-
-        if (shifted1 < bos) {
-#pragma unroll
-          for (int v = 0; v < Vec; ++v) {
-            tap1[v] = 0.0f;
-          }
-          int prefix_pos = shifted1 - bos + 3;
-          if (mask && prefix_pos >= 0) {
-            auto base = params.cache + static_cast<std::size_t>(slot) * params.cache_stride_slot
-                + static_cast<std::size_t>(prefix_pos) * params.cache_stride_w + c0;
-            uint64_t raw = *reinterpret_cast<uint64_t const*>(base);
-#pragma unroll
-            for (int v = 0; v < Vec; ++v) {
-              tap1[v] = to_float(Element::bitcast(static_cast<uint16_t>(raw >> (16 * v))));
-            }
-          }
-        }
-
-        if (shifted2 < bos) {
-#pragma unroll
-          for (int v = 0; v < Vec; ++v) {
-            tap2[v] = 0.0f;
-          }
-          int prefix_pos = shifted2 - bos + 3;
-          if (mask && prefix_pos >= 0) {
-            auto base = params.cache + static_cast<std::size_t>(slot) * params.cache_stride_slot
-                + static_cast<std::size_t>(prefix_pos) * params.cache_stride_w + c0;
-            uint64_t raw = *reinterpret_cast<uint64_t const*>(base);
-#pragma unroll
-            for (int v = 0; v < Vec; ++v) {
-              tap2[v] = to_float(Element::bitcast(static_cast<uint16_t>(raw >> (16 * v))));
-            }
-          }
-        }
+      } else {
+        x_window[r][0] = 0.0f;
+        x_window[r][1] = 0.0f;
       }
-
-      auto residual_base = params.residual + static_cast<std::size_t>(t) * params.D + c0;
-      uint64_t residual_raw = *reinterpret_cast<uint64_t const*>(residual_base);
-      float out_values[Vec];
-#pragma unroll
-      for (int v = 0; v < Vec; ++v) {
-        float cur = to_float(Element::bitcast(static_cast<uint16_t>(raw3 >> (16 * v))));
-        float residual = to_float(Element::bitcast(static_cast<uint16_t>(residual_raw >> (16 * v))));
-        out_values[v] = cur * weights[v][0]
-            + tap2[v] * weights[v][1]
-            + tap1[v] * weights[v][2]
-            + tap0[v] * weights[v][3]
-            + residual;
-      }
-
-      uint64_t out_raw = 0;
-#pragma unroll
-      for (int v = 0; v < Vec; ++v) {
-        out_raw |= static_cast<uint64_t>(Element(out_values[v]).raw()) << (16 * v);
-      }
-      auto out = params.y + static_cast<std::size_t>(t) * params.D + c0;
-      *reinterpret_cast<uint64_t*>(out) = out_raw;
-    }
-  } else {
-    int channel_blocks = (params.D + Vec - 1) / Vec;
-    int cb = static_cast<int>(item.get_global_id(0));
-    int tb = static_cast<int>(item.get_global_id(1));
-    if (cb >= channel_blocks) {
-      return;
-    }
-
-    int c0 = cb * Vec;
-    int t0 = tb * BlockT;
-
-    float weights[W][Vec];
-#pragma unroll
-    for (int iw = 0; iw < W; ++iw) {
-#pragma unroll
-      for (int v = 0; v < Vec; ++v) {
-        int c = c0 + v;
-        weights[iw][v] = c < params.D
-            ? to_float(params.weight[static_cast<std::size_t>(c) * W + iw])
-            : 0.0f;
-      }
-    }
-
-    float x_window[BlockT + W - 1][Vec];
-#pragma unroll
-    for (int r = 0; r < BlockT + W - 1; ++r) {
-      int row = t0 - (W - 1) + r;
+    } else {
 #pragma unroll
       for (int v = 0; v < Vec; ++v) {
         int c = c0 + v;
@@ -558,63 +467,207 @@ void run_sconv_kernel(DeviceParams<Element> const& params, sycl::nd_item<2> item
             : 0.0f;
       }
     }
+  }
+
+  int sequence_mask = 0;
+  if constexpr (RegularSequenceFastPath) {
+    sequence_mask = (1 << params.regular_tokens_per_seq_log2) - 1;
+  }
 
 #pragma unroll
-    for (int j = 0; j < BlockT; ++j) {
-      int t = t0 + j;
-      if (t >= params.T) {
-        return;
-      }
+  for (int j = 0; j < BlockT; ++j) {
+    int t = t0 + j;
+    if (t >= params.T) {
+      return;
+    }
 
+    int bos;
+    int slot = 0;
+    bool mask = true;
+    if constexpr (RegularSequenceFastPath) {
+      int local_t = t & sequence_mask;
+      if (local_t < W - 1) {
+        int seq = t >> params.regular_tokens_per_seq_log2;
+        bos = t - local_t;
+        slot = static_cast<int>(params.safe_idx[seq]);
+        mask = params.cache_mask[seq] != 0;
+      } else {
+        bos = t - (W - 1);
+      }
+    } else {
       int seq = params.seq_idx[t];
-      int bos = static_cast<int>(params.cu[seq]);
-      int slot = static_cast<int>(params.safe_idx[seq]);
-      bool mask = true;
+      bos = static_cast<int>(params.cu[seq]);
+      slot = static_cast<int>(params.safe_idx[seq]);
       if constexpr (!IsDecode) {
         mask = params.cache_mask[seq] != 0;
       }
+    }
 
-      float acc[Vec];
+    float tap_values[W][Vec];
 #pragma unroll
-      for (int v = 0; v < Vec; ++v) {
-        acc[v] = 0.0f;
+    for (int iw = 0; iw < W; ++iw) {
+      if constexpr (RegularSequenceFastPath) {
+        uint64_t raw = x_raw[j + (W - 1 - iw)];
+#pragma unroll
+        for (int v = 0; v < Vec; ++v) {
+          tap_values[iw][v] = to_float(Element::bitcast(static_cast<uint16_t>(raw >> (16 * v))));
+        }
+      } else {
+#pragma unroll
+        for (int v = 0; v < Vec; ++v) {
+          tap_values[iw][v] = x_window[j + (W - 1 - iw)][v];
+        }
       }
+    }
 
+    if constexpr (RegularSequenceFastPath) {
+      if (t - (W - 1) < bos) {
+#pragma unroll
+        for (int iw = 1; iw < W; ++iw) {
+          int shifted = t - iw;
+          int prefix_pos = shifted - bos + (W - 1);
+          bool in_prefix = shifted < bos && prefix_pos >= 0 && prefix_pos < W - 1;
+          if (shifted < bos) {
+#pragma unroll
+            for (int v = 0; v < Vec; ++v) {
+              tap_values[iw][v] = 0.0f;
+            }
+            if (in_prefix && mask) {
+              std::size_t cache_offset = static_cast<std::size_t>(slot) * params.cache_stride_slot
+                  + static_cast<std::size_t>(prefix_pos) * params.cache_stride_w + c0;
+              auto base = params.cache + cache_offset;
+              uint64_t raw = *reinterpret_cast<uint64_t const*>(base);
+#pragma unroll
+              for (int v = 0; v < Vec; ++v) {
+                tap_values[iw][v] = to_float(Element::bitcast(static_cast<uint16_t>(raw >> (16 * v))));
+              }
+            }
+          }
+        }
+      }
+    } else {
 #pragma unroll
       for (int iw = 0; iw < W; ++iw) {
         int shifted = t - iw;
         int prefix_pos = shifted - bos + (W - 1);
         bool in_prefix = shifted < bos && prefix_pos >= 0 && prefix_pos < W - 1;
+        if (shifted < bos) {
+#pragma unroll
+          for (int v = 0; v < Vec; ++v) {
+            tap_values[iw][v] = 0.0f;
+          }
+          if (in_prefix && (IsDecode || mask)) {
+            std::size_t cache_offset = static_cast<std::size_t>(slot) * params.cache_stride_slot
+                + static_cast<std::size_t>(prefix_pos) * params.cache_stride_w + c0;
+            auto base = params.cache + cache_offset;
+            if constexpr (PairFastPath) {
+              if (channel_valid[1]) {
+                uint32_t raw = *reinterpret_cast<uint32_t const*>(base);
+                tap_values[iw][0] = to_float(Element::bitcast(static_cast<uint16_t>(raw & 0xffffu)));
+                tap_values[iw][1] = to_float(Element::bitcast(static_cast<uint16_t>(raw >> 16)));
+              } else {
+                tap_values[iw][0] = to_float(*base);
+              }
+            } else {
+#pragma unroll
+              for (int v = 0; v < Vec; ++v) {
+                int c = c0 + v;
+                if (c < params.D) {
+                  tap_values[iw][v] = to_float(params.cache[cache_offset + v]);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
 
+    float acc[Vec];
+#pragma unroll
+    for (int v = 0; v < Vec; ++v) {
+      acc[v] = 0.0f;
+    }
+
+#pragma unroll
+    for (int iw = 0; iw < W; ++iw) {
+#pragma unroll
+      for (int v = 0; v < Vec; ++v) {
+        if constexpr (RegularSequenceFastPath || PairFastPath) {
+          acc[v] += tap_values[iw][v] * weights[iw][v];
+        } else {
+          if (channel_valid[v]) {
+            acc[v] += tap_values[iw][v] * weights[iw][v];
+          }
+        }
+      }
+    }
+
+    float out_values[Vec];
+#pragma unroll
+    for (int v = 0; v < Vec; ++v) {
+      out_values[v] = acc[v];
+    }
+
+    if constexpr (UseResidual) {
+      auto residual_base = params.residual + static_cast<std::size_t>(t) * params.D + c0;
+      if constexpr (RegularSequenceFastPath) {
+        uint64_t raw = *reinterpret_cast<uint64_t const*>(residual_base);
+#pragma unroll
+        for (int v = 0; v < Vec; ++v) {
+          out_values[v] += to_float(Element::bitcast(static_cast<uint16_t>(raw >> (16 * v))));
+        }
+      } else if constexpr (PairFastPath) {
+        if (channel_valid[1]) {
+          uint32_t raw = *reinterpret_cast<uint32_t const*>(residual_base);
+          out_values[0] += to_float(Element::bitcast(static_cast<uint16_t>(raw & 0xffffu)));
+          out_values[1] += to_float(Element::bitcast(static_cast<uint16_t>(raw >> 16)));
+        } else {
+          out_values[0] += to_float(*residual_base);
+        }
+      } else {
 #pragma unroll
         for (int v = 0; v < Vec; ++v) {
           int c = c0 + v;
-          float tap = 0.0f;
           if (c < params.D) {
-            if (shifted >= bos) {
-              tap = x_window[j + (W - 1 - iw)][v];
-            } else if (in_prefix && (IsDecode || mask)) {
-              std::size_t offset = static_cast<std::size_t>(slot) * params.cache_stride_slot
-                  + static_cast<std::size_t>(prefix_pos) * params.cache_stride_w + c;
-              tap = to_float(params.cache[offset]);
-            }
+            out_values[v] += to_float(params.residual[static_cast<std::size_t>(t) * params.D + c]);
           }
-          acc[v] += tap * weights[iw][v];
         }
       }
+    }
 
+    if constexpr (UseSilu) {
+#pragma unroll
+      for (int v = 0; v < Vec; ++v) {
+        if constexpr (RegularSequenceFastPath || PairFastPath) {
+          out_values[v] = out_values[v] / (1.0f + sycl::exp(-out_values[v]));
+        } else if (channel_valid[v]) {
+          out_values[v] = out_values[v] / (1.0f + sycl::exp(-out_values[v]));
+        }
+      }
+    }
+
+    auto out = params.y + static_cast<std::size_t>(t) * params.D + c0;
+    if constexpr (RegularSequenceFastPath) {
+      uint64_t raw = 0;
+#pragma unroll
+      for (int v = 0; v < Vec; ++v) {
+        raw |= static_cast<uint64_t>(Element(out_values[v]).raw()) << (16 * v);
+      }
+      *reinterpret_cast<uint64_t*>(out) = raw;
+    } else if constexpr (PairFastPath) {
+      if (channel_valid[1]) {
+        uint32_t raw = static_cast<uint32_t>(Element(out_values[0]).raw())
+            | (static_cast<uint32_t>(Element(out_values[1]).raw()) << 16);
+        *reinterpret_cast<uint32_t*>(out) = raw;
+      } else {
+        *out = Element(out_values[0]);
+      }
+    } else {
 #pragma unroll
       for (int v = 0; v < Vec; ++v) {
         int c = c0 + v;
         if (c < params.D) {
-          float out = acc[v];
-          if constexpr (UseResidual) {
-            out += to_float(params.residual[static_cast<std::size_t>(t) * params.D + c]);
-          }
-          if constexpr (UseSilu) {
-            out = out / (1.0f + sycl::exp(-out));
-          }
-          params.y[static_cast<std::size_t>(t) * params.D + c] = Element(out);
+          params.y[static_cast<std::size_t>(t) * params.D + c] = Element(out_values[v]);
         }
       }
     }
@@ -629,7 +682,8 @@ template <
     bool IsDecode,
     int Vec = kVec,
     int BlockT = kBlockT,
-    bool RegularSequenceFastPath = false>
+    bool RegularSequenceFastPath = false,
+    bool PairFastPath = false>
 void launch_sconv(sycl::queue& q, DeviceParams<Element> const& params) {
   int channel_blocks = (params.D + Vec - 1) / Vec;
   int token_blocks = (params.T + BlockT - 1) / BlockT;
@@ -638,165 +692,10 @@ void launch_sconv(sycl::queue& q, DeviceParams<Element> const& params) {
   sycl::range<2> local(kThreads, 1);
   sycl::range<2> global(rounded_channel_blocks, token_blocks);
 
-  q.parallel_for<CausalSconvKernel<Element, W, UseSilu, UseResidual, IsDecode, Vec, BlockT, RegularSequenceFastPath>>(
+  q.parallel_for<CausalSconvKernel<Element, W, UseSilu, UseResidual, IsDecode, Vec, BlockT, RegularSequenceFastPath, PairFastPath>>(
       sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> item) {
-        run_sconv_kernel<Element, W, UseSilu, UseResidual, IsDecode, Vec, BlockT, RegularSequenceFastPath>(params, item);
-      });
-}
-
-template <typename Element, bool IsDecode, int BlockT = kBlockT>
-void run_sconv_w4_residual_pair_kernel(DeviceParams<Element> const& params, sycl::nd_item<2> item) {
-  int channel_blocks = (params.D + 1) / 2;
-  int cb = static_cast<int>(item.get_global_id(0));
-  int tb = static_cast<int>(item.get_global_id(1));
-  if (cb >= channel_blocks) {
-    return;
-  }
-
-  int c0 = cb * 2;
-  int c1 = c0 + 1;
-  bool has_pair = c1 < params.D;
-  int t0 = tb * BlockT;
-
-  float w00 = to_float(params.weight[static_cast<std::size_t>(c0) * 4 + 0]);
-  float w01 = to_float(params.weight[static_cast<std::size_t>(c0) * 4 + 1]);
-  float w02 = to_float(params.weight[static_cast<std::size_t>(c0) * 4 + 2]);
-  float w03 = to_float(params.weight[static_cast<std::size_t>(c0) * 4 + 3]);
-  float w10 = has_pair ? to_float(params.weight[static_cast<std::size_t>(c1) * 4 + 0]) : 0.0f;
-  float w11 = has_pair ? to_float(params.weight[static_cast<std::size_t>(c1) * 4 + 1]) : 0.0f;
-  float w12 = has_pair ? to_float(params.weight[static_cast<std::size_t>(c1) * 4 + 2]) : 0.0f;
-  float w13 = has_pair ? to_float(params.weight[static_cast<std::size_t>(c1) * 4 + 3]) : 0.0f;
-
-  float x0[BlockT + 3];
-  float x1[BlockT + 3];
-#pragma unroll
-  for (int r = 0; r < BlockT + 3; ++r) {
-    int row = t0 - 3 + r;
-    if (row >= 0 && row < params.T) {
-      auto base = params.x + static_cast<std::size_t>(row) * params.D + c0;
-      if (has_pair) {
-        uint32_t raw = *reinterpret_cast<uint32_t const*>(base);
-        x0[r] = to_float(Element::bitcast(static_cast<uint16_t>(raw & 0xffffu)));
-        x1[r] = to_float(Element::bitcast(static_cast<uint16_t>(raw >> 16)));
-      } else {
-        x0[r] = to_float(*base);
-        x1[r] = 0.0f;
-      }
-    } else {
-      x0[r] = 0.0f;
-      x1[r] = 0.0f;
-    }
-  }
-
-#pragma unroll
-  for (int j = 0; j < BlockT; ++j) {
-    int t = t0 + j;
-    if (t >= params.T) {
-      return;
-    }
-
-    int seq = params.seq_idx[t];
-    int bos = static_cast<int>(params.cu[seq]);
-    int slot = static_cast<int>(params.safe_idx[seq]);
-    bool mask = true;
-    if constexpr (!IsDecode) {
-      mask = params.cache_mask[seq] != 0;
-    }
-
-    float tap00 = 0.0f, tap01 = 0.0f;
-    float tap10 = 0.0f, tap11 = 0.0f;
-    float tap20 = 0.0f, tap21 = 0.0f;
-    int shifted0 = t - 3;
-    int shifted1 = t - 2;
-    int shifted2 = t - 1;
-
-    if (shifted0 >= bos) {
-      tap00 = x0[j + 0];
-      tap01 = x1[j + 0];
-    } else if ((IsDecode || mask) && shifted0 - bos + 3 >= 0) {
-      int prefix_pos = shifted0 - bos + 3;
-      auto base = params.cache + static_cast<std::size_t>(slot) * params.cache_stride_slot
-          + static_cast<std::size_t>(prefix_pos) * params.cache_stride_w + c0;
-      if (has_pair) {
-        uint32_t raw = *reinterpret_cast<uint32_t const*>(base);
-        tap00 = to_float(Element::bitcast(static_cast<uint16_t>(raw & 0xffffu)));
-        tap01 = to_float(Element::bitcast(static_cast<uint16_t>(raw >> 16)));
-      } else {
-        tap00 = to_float(*base);
-      }
-    }
-
-    if (shifted1 >= bos) {
-      tap10 = x0[j + 1];
-      tap11 = x1[j + 1];
-    } else if ((IsDecode || mask) && shifted1 - bos + 3 >= 0) {
-      int prefix_pos = shifted1 - bos + 3;
-      auto base = params.cache + static_cast<std::size_t>(slot) * params.cache_stride_slot
-          + static_cast<std::size_t>(prefix_pos) * params.cache_stride_w + c0;
-      if (has_pair) {
-        uint32_t raw = *reinterpret_cast<uint32_t const*>(base);
-        tap10 = to_float(Element::bitcast(static_cast<uint16_t>(raw & 0xffffu)));
-        tap11 = to_float(Element::bitcast(static_cast<uint16_t>(raw >> 16)));
-      } else {
-        tap10 = to_float(*base);
-      }
-    }
-
-    if (shifted2 >= bos) {
-      tap20 = x0[j + 2];
-      tap21 = x1[j + 2];
-    } else if ((IsDecode || mask) && shifted2 - bos + 3 >= 0) {
-      int prefix_pos = shifted2 - bos + 3;
-      auto base = params.cache + static_cast<std::size_t>(slot) * params.cache_stride_slot
-          + static_cast<std::size_t>(prefix_pos) * params.cache_stride_w + c0;
-      if (has_pair) {
-        uint32_t raw = *reinterpret_cast<uint32_t const*>(base);
-        tap20 = to_float(Element::bitcast(static_cast<uint16_t>(raw & 0xffffu)));
-        tap21 = to_float(Element::bitcast(static_cast<uint16_t>(raw >> 16)));
-      } else {
-        tap20 = to_float(*base);
-      }
-    }
-
-    float cur0 = x0[j + 3];
-    float cur1 = x1[j + 3];
-    float residual0;
-    float residual1;
-    auto residual_base = params.residual + static_cast<std::size_t>(t) * params.D + c0;
-    if (has_pair) {
-      uint32_t raw = *reinterpret_cast<uint32_t const*>(residual_base);
-      residual0 = to_float(Element::bitcast(static_cast<uint16_t>(raw & 0xffffu)));
-      residual1 = to_float(Element::bitcast(static_cast<uint16_t>(raw >> 16)));
-    } else {
-      residual0 = to_float(*residual_base);
-      residual1 = 0.0f;
-    }
-    float out0 = cur0 * w00 + tap20 * w01 + tap10 * w02 + tap00 * w03 + residual0;
-    float out1 = cur1 * w10 + tap21 * w11 + tap11 * w12 + tap01 * w13 + residual1;
-
-    auto out = params.y + static_cast<std::size_t>(t) * params.D + c0;
-    if (has_pair) {
-      uint32_t raw = static_cast<uint32_t>(Element(out0).raw())
-          | (static_cast<uint32_t>(Element(out1).raw()) << 16);
-      *reinterpret_cast<uint32_t*>(out) = raw;
-    } else {
-      *out = Element(out0);
-    }
-  }
-}
-
-template <typename Element, bool IsDecode, int BlockT = kBlockT>
-void launch_sconv_w4_residual_pair(sycl::queue& q, DeviceParams<Element> const& params) {
-  int channel_blocks = (params.D + 1) / 2;
-  int token_blocks = (params.T + BlockT - 1) / BlockT;
-  int rounded_channel_blocks = ((channel_blocks + kThreads - 1) / kThreads) * kThreads;
-
-  sycl::range<2> local(kThreads, 1);
-  sycl::range<2> global(rounded_channel_blocks, token_blocks);
-
-  q.parallel_for<CausalSconvW4ResidualPairKernel<Element, IsDecode, BlockT>>(
-      sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> item) {
-        run_sconv_w4_residual_pair_kernel<Element, IsDecode, BlockT>(params, item);
+        run_sconv_kernel<Element, W, UseSilu, UseResidual, IsDecode, Vec, BlockT, RegularSequenceFastPath, PairFastPath>(
+            params, item);
       });
 }
 
@@ -831,14 +730,14 @@ void launch_runtime(sycl::queue& q, DeviceParams<Element> const& params, bool us
         if (params.D % 4 == 0) {
           launch_sconv<Element, 4, false, true, false, 4, kRegularBlockT, true>(q, params);
         } else {
-          launch_sconv_w4_residual_pair<Element, false>(q, params);
+          launch_sconv<Element, 4, false, true, false, 2, kBlockT, false, true>(q, params);
         }
         return;
       }
       if (is_decode) {
-        launch_sconv_w4_residual_pair<Element, true>(q, params);
+        launch_sconv<Element, 4, false, true, true, 2, kBlockT, false, true>(q, params);
       } else {
-        launch_sconv_w4_residual_pair<Element, false>(q, params);
+        launch_sconv<Element, 4, false, true, false, 2, kBlockT, false, true>(q, params);
       }
       return;
     }
