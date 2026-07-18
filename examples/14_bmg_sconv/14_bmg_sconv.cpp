@@ -67,8 +67,9 @@ namespace cutlass::examples::sconv {
 
 using Element = cutlass::bfloat16_t;
 
-constexpr int kThreads = 128;
+constexpr int kThreads = 384;
 constexpr int kBlockT = 4;
+constexpr int kRegularBlockT = 8;
 constexpr int kVec = 1;
 
 struct DeviceParams {
@@ -85,6 +86,7 @@ struct DeviceParams {
   int D;
   int cache_stride_slot;
   int cache_stride_w;
+  int regular_tokens_per_seq_log2;
 };
 
 template <int W, bool UseSilu, bool UseResidual, bool IsDecode, int Vec, int BlockT>
@@ -92,6 +94,12 @@ class CausalSconvKernel;
 
 template <bool IsDecode, int BlockT>
 class CausalSconvW4ResidualPairKernel;
+
+template <int BlockT>
+class CausalSconvW4ResidualPairRegularKernel;
+
+template <int BlockT>
+class CausalSconvW4ResidualQuadRegularKernel;
 
 template <typename T>
 struct DeviceBuffer {
@@ -206,6 +214,17 @@ float silu(float x) {
 
 std::string bool_text(bool value) {
   return value ? "true" : "false";
+}
+
+int log2_if_power_of_two(int value) {
+  if (value <= 0 || (value & (value - 1)) != 0) {
+    return -1;
+  }
+  int result = 0;
+  while ((1 << result) != value) {
+    ++result;
+  }
+  return result;
 }
 
 std::vector<int> make_lengths(CaseConfig const& cfg) {
@@ -582,6 +601,317 @@ void launch_sconv_w4_residual_pair(sycl::queue& q, DeviceParams const& params) {
       });
 }
 
+template <int BlockT = kBlockT>
+void launch_sconv_w4_residual_pair_regular(sycl::queue& q, DeviceParams const& params) {
+  int channel_blocks = (params.D + 1) / 2;
+  int token_blocks = (params.T + BlockT - 1) / BlockT;
+  int rounded_channel_blocks = ((channel_blocks + kThreads - 1) / kThreads) * kThreads;
+
+  sycl::range<2> local(kThreads, 1);
+  sycl::range<2> global(rounded_channel_blocks, token_blocks);
+
+  q.parallel_for<CausalSconvW4ResidualPairRegularKernel<BlockT>>(
+      sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> item) {
+        int cb = static_cast<int>(item.get_global_id(0));
+        int tb = static_cast<int>(item.get_global_id(1));
+        if (cb >= channel_blocks) {
+          return;
+        }
+
+        int c0 = cb * 2;
+        int c1 = c0 + 1;
+        bool has_pair = c1 < params.D;
+        int t0 = tb * BlockT;
+
+        float w00 = to_float(params.weight[static_cast<std::size_t>(c0) * 4 + 0]);
+        float w01 = to_float(params.weight[static_cast<std::size_t>(c0) * 4 + 1]);
+        float w02 = to_float(params.weight[static_cast<std::size_t>(c0) * 4 + 2]);
+        float w03 = to_float(params.weight[static_cast<std::size_t>(c0) * 4 + 3]);
+        float w10 = has_pair ? to_float(params.weight[static_cast<std::size_t>(c1) * 4 + 0]) : 0.0f;
+        float w11 = has_pair ? to_float(params.weight[static_cast<std::size_t>(c1) * 4 + 1]) : 0.0f;
+        float w12 = has_pair ? to_float(params.weight[static_cast<std::size_t>(c1) * 4 + 2]) : 0.0f;
+        float w13 = has_pair ? to_float(params.weight[static_cast<std::size_t>(c1) * 4 + 3]) : 0.0f;
+
+        float x0[BlockT + 3];
+        float x1[BlockT + 3];
+#pragma unroll
+        for (int r = 0; r < BlockT + 3; ++r) {
+          int row = t0 - 3 + r;
+          if (row >= 0 && row < params.T) {
+            auto base = params.x + static_cast<std::size_t>(row) * params.D + c0;
+            if (has_pair) {
+              uint32_t raw = *reinterpret_cast<uint32_t const*>(base);
+              x0[r] = to_float(Element::bitcast(static_cast<uint16_t>(raw & 0xffffu)));
+              x1[r] = to_float(Element::bitcast(static_cast<uint16_t>(raw >> 16)));
+            } else {
+              x0[r] = to_float(*base);
+              x1[r] = 0.0f;
+            }
+          } else {
+            x0[r] = 0.0f;
+            x1[r] = 0.0f;
+          }
+        }
+
+        int sequence_mask = (1 << params.regular_tokens_per_seq_log2) - 1;
+
+#pragma unroll
+        for (int j = 0; j < BlockT; ++j) {
+          int t = t0 + j;
+          if (t >= params.T) {
+            return;
+          }
+
+          int local_t = t & sequence_mask;
+          float tap00 = x0[j + 0];
+          float tap01 = x1[j + 0];
+          float tap10 = x0[j + 1];
+          float tap11 = x1[j + 1];
+          float tap20 = x0[j + 2];
+          float tap21 = x1[j + 2];
+
+          if (local_t < 3) {
+            int seq = t >> params.regular_tokens_per_seq_log2;
+            int bos = t - local_t;
+            int slot = static_cast<int>(params.safe_idx[seq]);
+            bool mask = params.cache_mask[seq] != 0;
+
+            int shifted0 = t - 3;
+            int shifted1 = t - 2;
+            int shifted2 = t - 1;
+
+            if (shifted0 < bos) {
+              tap00 = 0.0f;
+              tap01 = 0.0f;
+              int prefix_pos = shifted0 - bos + 3;
+              if (mask && prefix_pos >= 0) {
+                auto base = params.cache + static_cast<std::size_t>(slot) * params.cache_stride_slot
+                    + static_cast<std::size_t>(prefix_pos) * params.cache_stride_w + c0;
+                if (has_pair) {
+                  uint32_t raw = *reinterpret_cast<uint32_t const*>(base);
+                  tap00 = to_float(Element::bitcast(static_cast<uint16_t>(raw & 0xffffu)));
+                  tap01 = to_float(Element::bitcast(static_cast<uint16_t>(raw >> 16)));
+                } else {
+                  tap00 = to_float(*base);
+                }
+              }
+            }
+
+            if (shifted1 < bos) {
+              tap10 = 0.0f;
+              tap11 = 0.0f;
+              int prefix_pos = shifted1 - bos + 3;
+              if (mask && prefix_pos >= 0) {
+                auto base = params.cache + static_cast<std::size_t>(slot) * params.cache_stride_slot
+                    + static_cast<std::size_t>(prefix_pos) * params.cache_stride_w + c0;
+                if (has_pair) {
+                  uint32_t raw = *reinterpret_cast<uint32_t const*>(base);
+                  tap10 = to_float(Element::bitcast(static_cast<uint16_t>(raw & 0xffffu)));
+                  tap11 = to_float(Element::bitcast(static_cast<uint16_t>(raw >> 16)));
+                } else {
+                  tap10 = to_float(*base);
+                }
+              }
+            }
+
+            if (shifted2 < bos) {
+              tap20 = 0.0f;
+              tap21 = 0.0f;
+              int prefix_pos = shifted2 - bos + 3;
+              if (mask && prefix_pos >= 0) {
+                auto base = params.cache + static_cast<std::size_t>(slot) * params.cache_stride_slot
+                    + static_cast<std::size_t>(prefix_pos) * params.cache_stride_w + c0;
+                if (has_pair) {
+                  uint32_t raw = *reinterpret_cast<uint32_t const*>(base);
+                  tap20 = to_float(Element::bitcast(static_cast<uint16_t>(raw & 0xffffu)));
+                  tap21 = to_float(Element::bitcast(static_cast<uint16_t>(raw >> 16)));
+                } else {
+                  tap20 = to_float(*base);
+                }
+              }
+            }
+          }
+
+          float cur0 = x0[j + 3];
+          float cur1 = x1[j + 3];
+          float residual0;
+          float residual1;
+          auto residual_base = params.residual + static_cast<std::size_t>(t) * params.D + c0;
+          if (has_pair) {
+            uint32_t raw = *reinterpret_cast<uint32_t const*>(residual_base);
+            residual0 = to_float(Element::bitcast(static_cast<uint16_t>(raw & 0xffffu)));
+            residual1 = to_float(Element::bitcast(static_cast<uint16_t>(raw >> 16)));
+          } else {
+            residual0 = to_float(*residual_base);
+            residual1 = 0.0f;
+          }
+          float out0 = cur0 * w00 + tap20 * w01 + tap10 * w02 + tap00 * w03 + residual0;
+          float out1 = cur1 * w10 + tap21 * w11 + tap11 * w12 + tap01 * w13 + residual1;
+
+          auto out = params.y + static_cast<std::size_t>(t) * params.D + c0;
+          if (has_pair) {
+            uint32_t raw = static_cast<uint32_t>(Element(out0).storage)
+                | (static_cast<uint32_t>(Element(out1).storage) << 16);
+            *reinterpret_cast<uint32_t*>(out) = raw;
+          } else {
+            *out = Element(out0);
+          }
+        }
+      });
+}
+
+template <int BlockT = kBlockT>
+void launch_sconv_w4_residual_quad_regular(sycl::queue& q, DeviceParams const& params) {
+  int channel_blocks = params.D / 4;
+  int token_blocks = (params.T + BlockT - 1) / BlockT;
+  int rounded_channel_blocks = ((channel_blocks + kThreads - 1) / kThreads) * kThreads;
+
+  sycl::range<2> local(kThreads, 1);
+  sycl::range<2> global(rounded_channel_blocks, token_blocks);
+
+  q.parallel_for<CausalSconvW4ResidualQuadRegularKernel<BlockT>>(
+      sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> item) {
+        int cb = static_cast<int>(item.get_global_id(0));
+        int tb = static_cast<int>(item.get_global_id(1));
+        if (cb >= channel_blocks) {
+          return;
+        }
+
+        int c0 = cb * 4;
+        int t0 = tb * BlockT;
+
+        float weights[4][4];
+#pragma unroll
+        for (int v = 0; v < 4; ++v) {
+#pragma unroll
+          for (int iw = 0; iw < 4; ++iw) {
+            weights[v][iw] = to_float(params.weight[static_cast<std::size_t>(c0 + v) * 4 + iw]);
+          }
+        }
+
+        uint64_t x_raw[BlockT + 3];
+#pragma unroll
+        for (int r = 0; r < BlockT + 3; ++r) {
+          int row = t0 - 3 + r;
+          if (row >= 0 && row < params.T) {
+            auto base = params.x + static_cast<std::size_t>(row) * params.D + c0;
+            x_raw[r] = *reinterpret_cast<uint64_t const*>(base);
+          } else {
+            x_raw[r] = 0;
+          }
+        }
+
+        int sequence_mask = (1 << params.regular_tokens_per_seq_log2) - 1;
+
+#pragma unroll
+        for (int j = 0; j < BlockT; ++j) {
+          int t = t0 + j;
+          if (t >= params.T) {
+            return;
+          }
+
+          int local_t = t & sequence_mask;
+          float tap0[4];
+          float tap1[4];
+          float tap2[4];
+          uint64_t raw0 = x_raw[j + 0];
+          uint64_t raw1 = x_raw[j + 1];
+          uint64_t raw2 = x_raw[j + 2];
+          uint64_t raw3 = x_raw[j + 3];
+#pragma unroll
+          for (int v = 0; v < 4; ++v) {
+            tap0[v] = to_float(Element::bitcast(static_cast<uint16_t>(raw0 >> (16 * v))));
+            tap1[v] = to_float(Element::bitcast(static_cast<uint16_t>(raw1 >> (16 * v))));
+            tap2[v] = to_float(Element::bitcast(static_cast<uint16_t>(raw2 >> (16 * v))));
+          }
+
+          if (local_t < 3) {
+            int seq = t >> params.regular_tokens_per_seq_log2;
+            int bos = t - local_t;
+            int slot = static_cast<int>(params.safe_idx[seq]);
+            bool mask = params.cache_mask[seq] != 0;
+
+            int shifted0 = t - 3;
+            int shifted1 = t - 2;
+            int shifted2 = t - 1;
+
+            if (shifted0 < bos) {
+#pragma unroll
+              for (int v = 0; v < 4; ++v) {
+                tap0[v] = 0.0f;
+              }
+              int prefix_pos = shifted0 - bos + 3;
+              if (mask && prefix_pos >= 0) {
+                auto base = params.cache + static_cast<std::size_t>(slot) * params.cache_stride_slot
+                    + static_cast<std::size_t>(prefix_pos) * params.cache_stride_w + c0;
+                uint64_t raw = *reinterpret_cast<uint64_t const*>(base);
+#pragma unroll
+                for (int v = 0; v < 4; ++v) {
+                  tap0[v] = to_float(Element::bitcast(static_cast<uint16_t>(raw >> (16 * v))));
+                }
+              }
+            }
+
+            if (shifted1 < bos) {
+#pragma unroll
+              for (int v = 0; v < 4; ++v) {
+                tap1[v] = 0.0f;
+              }
+              int prefix_pos = shifted1 - bos + 3;
+              if (mask && prefix_pos >= 0) {
+                auto base = params.cache + static_cast<std::size_t>(slot) * params.cache_stride_slot
+                    + static_cast<std::size_t>(prefix_pos) * params.cache_stride_w + c0;
+                uint64_t raw = *reinterpret_cast<uint64_t const*>(base);
+#pragma unroll
+                for (int v = 0; v < 4; ++v) {
+                  tap1[v] = to_float(Element::bitcast(static_cast<uint16_t>(raw >> (16 * v))));
+                }
+              }
+            }
+
+            if (shifted2 < bos) {
+#pragma unroll
+              for (int v = 0; v < 4; ++v) {
+                tap2[v] = 0.0f;
+              }
+              int prefix_pos = shifted2 - bos + 3;
+              if (mask && prefix_pos >= 0) {
+                auto base = params.cache + static_cast<std::size_t>(slot) * params.cache_stride_slot
+                    + static_cast<std::size_t>(prefix_pos) * params.cache_stride_w + c0;
+                uint64_t raw = *reinterpret_cast<uint64_t const*>(base);
+#pragma unroll
+                for (int v = 0; v < 4; ++v) {
+                  tap2[v] = to_float(Element::bitcast(static_cast<uint16_t>(raw >> (16 * v))));
+                }
+              }
+            }
+          }
+
+          auto residual_base = params.residual + static_cast<std::size_t>(t) * params.D + c0;
+          uint64_t residual_raw = *reinterpret_cast<uint64_t const*>(residual_base);
+          float out_values[4];
+#pragma unroll
+          for (int v = 0; v < 4; ++v) {
+            float cur = to_float(Element::bitcast(static_cast<uint16_t>(raw3 >> (16 * v))));
+            float residual = to_float(Element::bitcast(static_cast<uint16_t>(residual_raw >> (16 * v))));
+            out_values[v] = cur * weights[v][0]
+                + tap2[v] * weights[v][1]
+                + tap1[v] * weights[v][2]
+                + tap0[v] * weights[v][3]
+                + residual;
+          }
+
+          uint64_t out_raw = 0;
+#pragma unroll
+          for (int v = 0; v < 4; ++v) {
+            out_raw |= static_cast<uint64_t>(Element(out_values[v]).storage) << (16 * v);
+          }
+          auto out = params.y + static_cast<std::size_t>(t) * params.D + c0;
+          *reinterpret_cast<uint64_t*>(out) = out_raw;
+        }
+      });
+}
+
 template <int W, bool UseSilu, bool UseResidual, bool IsDecode>
 void launch_selected(sycl::queue& q, DeviceParams const& params) {
   launch_sconv<W, UseSilu, UseResidual, IsDecode>(q, params);
@@ -608,7 +938,15 @@ void launch_residual_selected(sycl::queue& q, DeviceParams const& params, bool u
 template <int W>
 void launch_runtime(sycl::queue& q, DeviceParams const& params, bool use_silu, bool use_residual, bool is_decode) {
   if constexpr (W == 4) {
-    if (!use_silu && use_residual) {
+    if (!use_silu && use_residual && params.D % 2 == 0) {
+      if (!is_decode && params.regular_tokens_per_seq_log2 >= 0) {
+        if (params.D % 4 == 0) {
+          launch_sconv_w4_residual_quad_regular<kRegularBlockT>(q, params);
+        } else {
+          launch_sconv_w4_residual_pair_regular<kRegularBlockT>(q, params);
+        }
+        return;
+      }
       if (is_decode) {
         launch_sconv_w4_residual_pair<true>(q, params);
       } else {
@@ -666,7 +1004,13 @@ double minimum_streaming_bytes(CaseConfig const& cfg, int slots) {
   return bytes;
 }
 
-bool run_case(sycl::queue& q, CaseConfig const& cfg, int iterations, bool verify, double target_tops) {
+bool run_case(
+    sycl::queue& q,
+    CaseConfig const& cfg,
+    int iterations,
+    bool verify,
+    double target_tops,
+    double target_gbps) {
   HostTensors h = initialize_case(cfg);
 
   if (verify) {
@@ -712,7 +1056,10 @@ bool run_case(sycl::queue& q, CaseConfig const& cfg, int iterations, bool verify
       cfg.T,
       cfg.D,
       (cfg.W - 1) * cfg.D,
-      cfg.D};
+      cfg.D,
+      (!cfg.is_decode && !cfg.varied_lengths && cfg.T == cfg.batch * cfg.tokens_per_seq)
+          ? log2_if_power_of_two(cfg.tokens_per_seq)
+          : -1};
 
   auto launch = [&]() {
     if (cfg.W == 3) {
@@ -772,6 +1119,9 @@ bool run_case(sycl::queue& q, CaseConfig const& cfg, int iterations, bool verify
               << " needs=" << (target_s * 1000.0) << " ms/"
               << required_tbps << " TB/s";
   }
+  if (target_gbps > 0.0) {
+    std::cout << "  target=" << target_gbps << " GB/s";
+  }
 
   if (verify) {
     std::cout << "  " << (passed ? "passed" : "failed")
@@ -786,6 +1136,9 @@ bool run_case(sycl::queue& q, CaseConfig const& cfg, int iterations, bool verify
   if (target_tops > 0.0 && useful_tops < target_tops) {
     passed = false;
   }
+  if (target_gbps > 0.0 && gbps < target_gbps) {
+    passed = false;
+  }
 
   return passed;
 }
@@ -797,6 +1150,8 @@ std::vector<CaseConfig> quick_suite() {
       {"extend_b4_l64_d512", 256, 512, 4, 4, 64, true, false, true, false},
       {"verify_b16_m8_d1536", 128, 1536, 4, 16, 8, false, false, true, false},
       {"silu_residual_b4_l16_d256", 64, 256, 4, 4, 16, true, true, true, false},
+      {"edge_varied_b5_l13_d257", 65, 257, 4, 5, 13, true, false, true, false},
+      {"edge_pair_b3_l32_d770", 96, 770, 4, 3, 32, false, false, true, false},
   };
 }
 
@@ -880,6 +1235,7 @@ struct Options {
   std::string suite = "inkling";
   std::string shape;
   double target_tops = 0.0;
+  double target_gbps = 0.0;
 
   void parse(int argc, char const** argv) {
     cutlass::CommandLine cmd(argc, argv);
@@ -894,6 +1250,7 @@ struct Options {
     cmd.get_cmd_line_argument("suite", suite, std::string("inkling"));
     cmd.get_cmd_line_argument("shape", shape, std::string(""));
     cmd.get_cmd_line_argument("target-tops", target_tops, 0.0);
+    cmd.get_cmd_line_argument("target-gbps", target_gbps, 0.0);
   }
 
   std::ostream& print_usage(std::ostream& out) const {
@@ -905,10 +1262,11 @@ struct Options {
         << "                                  Keys: name,T,D,W,B,L,varied,silu,residual,decode\n"
         << "  --iterations=<int>              Timed kernel iterations\n"
         << "  --verify=<0|1>                  Run CPU bf16 reference comparison\n"
-        << "  --target-tops=<float>           Fail if any timed case is below this useful TOPS\n\n"
+        << "  --target-tops=<float>           Fail if any timed case is below this useful TOPS\n"
+        << "  --target-gbps=<float>           Fail if any timed case is below this effective GB/s\n\n"
         << "Examples:\n"
         << "  ./examples/14_bmg_sconv/14_bmg_sconv --suite=quick\n"
-        << "  ./examples/14_bmg_sconv/14_bmg_sconv --suite=perf --verify=0 --iterations=100 --target-tops=50\n"
+        << "  ./examples/14_bmg_sconv/14_bmg_sconv --suite=perf --verify=0 --iterations=100 --target-gbps=350\n"
         << "  ./examples/14_bmg_sconv/14_bmg_sconv --shape=T=8192,D=1536,W=4,B=8,L=1024,residual=1\n";
     return out;
   }
@@ -957,7 +1315,8 @@ int main(int argc, char const** argv) {
 
     bool all_passed = true;
     for (auto const& cfg : cases) {
-      all_passed &= run_case(q, cfg, options.iterations, options.verify, options.target_tops);
+      all_passed &= run_case(
+          q, cfg, options.iterations, options.verify, options.target_tops, options.target_gbps);
     }
 
     return all_passed ? 0 : 2;
