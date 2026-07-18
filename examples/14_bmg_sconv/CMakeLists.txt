@@ -13,3 +13,10 @@ cutlass_example_add_executable(
   TEST_COMMAND_OPTIONS
   SCONV_QUICK_ARGS
 )
+
+cutlass_example_add_executable(
+  14_bmg_update_sconv_cache
+  14_bmg_update_sconv_cache.cpp
+  TEST_COMMAND_OPTIONS
+  SCONV_QUICK_ARGS
+)
