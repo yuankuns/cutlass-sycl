@@ -127,6 +127,7 @@ if (CUTLASS_ENABLE_SYCL)
       11_xe20_cutlass_library
       12_xe20_moe_gemm_cute_interface
       13_bmg_gemm_bias
+      14_bmg_sconv
       50_xe35_block_scaled_gemm
       51_xe35_block_scaled_grouped_gemm
       )
@@ -140,4 +141,3 @@ else()
   message(STATUS "CUTLASS_ENABLE_SYCL is OFF - no examples will be built")
   message(STATUS "Enable SYCL support to build CUTLASS examples")
 endif()
-
