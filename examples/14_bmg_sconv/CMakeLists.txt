@@ -34,3 +34,10 @@ cutlass_example_add_executable(
   TEST_COMMAND_OPTIONS
   SCONV_QUICK_ARGS
 )
+
+cutlass_example_add_executable(
+  14_bmg_metadata_windows_sconv
+  14_bmg_metadata_windows_sconv.cpp
+  TEST_COMMAND_OPTIONS
+  SCONV_QUICK_ARGS
+)

@@ -68,8 +68,11 @@
 namespace cutlass::examples::sconv {
 
 constexpr int kThreads = 384;
+constexpr int kLargeDThreads = 768;
 constexpr int kBlockT = 4;
 constexpr int kRegularBlockT = 4;
+constexpr int kMidDRegularBlockT = 8;
+constexpr int kLargeDRegularBlockT = 4;
 constexpr int kVec = 1;
 
 enum class DType {
@@ -408,32 +411,60 @@ void load_sconv_window(
     int c0,
     int t0,
     bool const (&channel_valid)[Vec],
-    uint64_t (&x_raw)[BlockT + W - 1],
+    uint64_t (&x_raw)[BlockT + W - 1][(Vec + 3) / 4],
     float (&x_window)[BlockT + W - 1][Vec]) {
+  constexpr int RawWords = (Vec + 3) / 4;
 #pragma unroll
   for (int r = 0; r < BlockT + W - 1; ++r) {
     int row = t0 - (W - 1) + r;
     if constexpr (RegularSequenceFastPath) {
       if (row >= 0 && row < params.T) {
         auto base = params.x + static_cast<std::size_t>(row) * params.D + c0;
-        x_raw[r] = *reinterpret_cast<uint64_t const*>(base);
+        #pragma unroll
+        for (int word = 0; word < RawWords; ++word) {
+          x_raw[r][word] = *reinterpret_cast<uint64_t const*>(base + word * 4);
+        }
       } else {
-        x_raw[r] = 0;
+        #pragma unroll
+        for (int word = 0; word < RawWords; ++word) {
+          x_raw[r][word] = 0;
+        }
       }
     } else if constexpr (PairFastPath) {
       if (row >= 0 && row < params.T) {
         auto base = params.x + static_cast<std::size_t>(row) * params.D + c0;
-        if (channel_valid[1]) {
-          uint32_t raw = *reinterpret_cast<uint32_t const*>(base);
-          x_window[r][0] = to_float(Element::bitcast(static_cast<uint16_t>(raw & 0xffffu)));
-          x_window[r][1] = to_float(Element::bitcast(static_cast<uint16_t>(raw >> 16)));
+        if constexpr (Vec == 2) {
+          if (channel_valid[1]) {
+            uint32_t raw = *reinterpret_cast<uint32_t const*>(base);
+            x_window[r][0] = to_float(Element::bitcast(static_cast<uint16_t>(raw & 0xffffu)));
+            x_window[r][1] = to_float(Element::bitcast(static_cast<uint16_t>(raw >> 16)));
+          } else {
+            x_window[r][0] = to_float(*base);
+            x_window[r][1] = 0.0f;
+          }
+        } else if (channel_valid[Vec - 1]) {
+          uint64_t raw[(Vec + 3) / 4];
+#pragma unroll
+          for (int word = 0; word < (Vec + 3) / 4; ++word) {
+            raw[word] = *reinterpret_cast<uint64_t const*>(base + word * 4);
+          }
+#pragma unroll
+          for (int v = 0; v < Vec; ++v) {
+            x_window[r][v] = to_float(Element::bitcast(static_cast<uint16_t>(raw[v / 4] >> (16 * (v % 4)))));
+          }
         } else {
-          x_window[r][0] = to_float(*base);
-          x_window[r][1] = 0.0f;
+#pragma unroll
+          for (int v = 0; v < Vec; ++v) {
+            int c = c0 + v;
+            x_window[r][v] = c < params.D ? to_float(params.x[static_cast<std::size_t>(row) * params.D + c])
+                                          : 0.0f;
+          }
         }
       } else {
-        x_window[r][0] = 0.0f;
-        x_window[r][1] = 0.0f;
+#pragma unroll
+        for (int v = 0; v < Vec; ++v) {
+          x_window[r][v] = 0.0f;
+        }
       }
     } else {
 #pragma unroll
@@ -489,16 +520,16 @@ void prepare_sconv_taps(
     int slot,
     bool mask,
     bool const (&channel_valid)[Vec],
-    uint64_t const (&x_raw)[BlockT + W - 1],
+    uint64_t const (&x_raw)[BlockT + W - 1][(Vec + 3) / 4],
     float const (&x_window)[BlockT + W - 1][Vec],
     float (&tap_values)[W][Vec]) {
 #pragma unroll
   for (int iw = 0; iw < W; ++iw) {
     if constexpr (RegularSequenceFastPath) {
-      uint64_t raw = x_raw[j + (W - 1 - iw)];
 #pragma unroll
       for (int v = 0; v < Vec; ++v) {
-        tap_values[iw][v] = to_float(Element::bitcast(static_cast<uint16_t>(raw >> (16 * v))));
+        uint64_t raw = x_raw[j + (W - 1 - iw)][v / 4];
+        tap_values[iw][v] = to_float(Element::bitcast(static_cast<uint16_t>(raw >> (16 * (v % 4)))));
       }
     } else {
 #pragma unroll
@@ -520,17 +551,21 @@ void prepare_sconv_taps(
           for (int v = 0; v < Vec; ++v) {
             tap_values[iw][v] = 0.0f;
           }
-          if (in_prefix && mask) {
-            std::size_t cache_offset = static_cast<std::size_t>(slot) * params.cache_stride_slot
-                + static_cast<std::size_t>(prefix_pos) * params.cache_stride_w + c0;
-            auto base = params.cache + cache_offset;
-            uint64_t raw = *reinterpret_cast<uint64_t const*>(base);
+        if (in_prefix && mask) {
+          std::size_t cache_offset = static_cast<std::size_t>(slot) * params.cache_stride_slot
+              + static_cast<std::size_t>(prefix_pos) * params.cache_stride_w + c0;
+          auto base = params.cache + cache_offset;
+          uint64_t raw[(Vec + 3) / 4];
 #pragma unroll
-            for (int v = 0; v < Vec; ++v) {
-              tap_values[iw][v] = to_float(Element::bitcast(static_cast<uint16_t>(raw >> (16 * v))));
-            }
+          for (int word = 0; word < (Vec + 3) / 4; ++word) {
+            raw[word] = *reinterpret_cast<uint64_t const*>(base + word * 4);
+          }
+#pragma unroll
+          for (int v = 0; v < Vec; ++v) {
+            tap_values[iw][v] = to_float(Element::bitcast(static_cast<uint16_t>(raw[v / 4] >> (16 * (v % 4)))));
           }
         }
+      }
       }
     }
   } else {
@@ -605,14 +640,18 @@ void add_sconv_residual(
     bool const (&channel_valid)[Vec],
     float (&out_values)[Vec]) {
   if constexpr (UseResidual) {
-    auto residual_base = params.residual + static_cast<std::size_t>(t) * params.D + c0;
-    if constexpr (RegularSequenceFastPath) {
-      uint64_t raw = *reinterpret_cast<uint64_t const*>(residual_base);
+  auto residual_base = params.residual + static_cast<std::size_t>(t) * params.D + c0;
+  if constexpr (RegularSequenceFastPath) {
+    uint64_t raw[(Vec + 3) / 4];
 #pragma unroll
-      for (int v = 0; v < Vec; ++v) {
-        out_values[v] += to_float(Element::bitcast(static_cast<uint16_t>(raw >> (16 * v))));
-      }
-    } else if constexpr (PairFastPath) {
+    for (int word = 0; word < (Vec + 3) / 4; ++word) {
+      raw[word] = *reinterpret_cast<uint64_t const*>(residual_base + word * 4);
+    }
+#pragma unroll
+    for (int v = 0; v < Vec; ++v) {
+      out_values[v] += to_float(Element::bitcast(static_cast<uint16_t>(raw[v / 4] >> (16 * (v % 4)))));
+    }
+  } else if constexpr (PairFastPath) {
       if (channel_valid[1]) {
         uint32_t raw = *reinterpret_cast<uint32_t const*>(residual_base);
         out_values[0] += to_float(Element::bitcast(static_cast<uint16_t>(raw & 0xffffu)));
@@ -657,12 +696,19 @@ void store_sconv_output(
     float const (&out_values)[Vec]) {
   auto out = params.y + static_cast<std::size_t>(t) * params.D + c0;
   if constexpr (RegularSequenceFastPath) {
-    uint64_t raw = 0;
+    uint64_t raw[(Vec + 3) / 4];
+#pragma unroll
+    for (int word = 0; word < (Vec + 3) / 4; ++word) {
+      raw[word] = 0;
+    }
 #pragma unroll
     for (int v = 0; v < Vec; ++v) {
-      raw |= static_cast<uint64_t>(Element(out_values[v]).raw()) << (16 * v);
+      raw[v / 4] |= static_cast<uint64_t>(Element(out_values[v]).raw()) << (16 * (v % 4));
     }
-    *reinterpret_cast<uint64_t*>(out) = raw;
+#pragma unroll
+    for (int word = 0; word < (Vec + 3) / 4; ++word) {
+      *reinterpret_cast<uint64_t*>(out + word * 4) = raw[word];
+    }
   } else if constexpr (PairFastPath) {
     if (channel_valid[1]) {
       uint32_t raw = static_cast<uint32_t>(Element(out_values[0]).raw())
@@ -696,7 +742,7 @@ void run_sconv_kernel(DeviceParams<Element> const& params, sycl::nd_item<2> item
   static_assert(!(RegularSequenceFastPath && PairFastPath), "fast path template switches are mutually exclusive");
   if constexpr (RegularSequenceFastPath) {
     static_assert(W == 4, "regular sequence fast path requires W=4");
-    static_assert(Vec == 4, "regular sequence fast path requires Vec=4");
+    static_assert(Vec == 4 || Vec == 8, "regular sequence fast path requires Vec=4 or Vec=8");
     static_assert(UseResidual, "regular sequence fast path requires residual");
     static_assert(!UseSilu, "regular sequence fast path does not support silu");
     static_assert(!IsDecode, "regular sequence fast path is for prefill only");
@@ -723,7 +769,7 @@ void run_sconv_kernel(DeviceParams<Element> const& params, sycl::nd_item<2> item
   float weights[W][Vec];
   load_sconv_weights<Element, W, Vec>(params, c0, channel_valid, weights);
 
-  uint64_t x_raw[BlockT + W - 1];
+  uint64_t x_raw[BlockT + W - 1][(Vec + 3) / 4];
   float x_window[BlockT + W - 1][Vec];
   load_sconv_window<Element, W, Vec, BlockT, RegularSequenceFastPath, PairFastPath>(
       params, c0, t0, channel_valid, x_raw, x_window);
@@ -779,13 +825,14 @@ template <
     int Vec = kVec,
     int BlockT = kBlockT,
     bool RegularSequenceFastPath = false,
-    bool PairFastPath = false>
+    bool PairFastPath = false,
+    int Threads = kThreads>
 void launch_sconv(sycl::queue& q, DeviceParams<Element> const& params) {
   int channel_blocks = (params.D + Vec - 1) / Vec;
   int token_blocks = (params.T + BlockT - 1) / BlockT;
-  int rounded_channel_blocks = ((channel_blocks + kThreads - 1) / kThreads) * kThreads;
+  int rounded_channel_blocks = ((channel_blocks + Threads - 1) / Threads) * Threads;
 
-  sycl::range<2> local(kThreads, 1);
+  sycl::range<2> local(Threads, 1);
   sycl::range<2> global(rounded_channel_blocks, token_blocks);
 
   q.parallel_for<CausalSconvKernel<Element, W, UseSilu, UseResidual, IsDecode, Vec, BlockT, RegularSequenceFastPath, PairFastPath>>(
@@ -823,7 +870,11 @@ void launch_runtime(sycl::queue& q, DeviceParams<Element> const& params, bool us
   if constexpr (W == 4) {
     if (!use_silu && use_residual && params.D % 2 == 0) {
       if (!is_decode && params.regular_tokens_per_seq_log2 >= 0) {
-        if (params.D % 4 == 0) {
+        if (params.D >= 6144 && params.D % 8 == 0) {
+          launch_sconv<Element, 4, false, true, false, 8, kLargeDRegularBlockT, true, false, kLargeDThreads>(q, params);
+        } else if (params.D >= 3072 && params.D % 8 == 0) {
+          launch_sconv<Element, 4, false, true, false, 8, kMidDRegularBlockT, true>(q, params);
+        } else if (params.D % 4 == 0) {
           launch_sconv<Element, 4, false, true, false, 4, kRegularBlockT, true>(q, params);
         } else {
           launch_sconv<Element, 4, false, true, false, 2, kBlockT, false, true>(q, params);
@@ -1046,23 +1097,41 @@ std::vector<CaseConfig> quick_suite() {
 }
 
 std::vector<CaseConfig> inkling_suite() {
-  // Inkling defaults: hidden_size=1536, head_dim=128, num_kv_heads=4, sconv_kernel_size=4,
-  // draft_token_num=9. TP sharding (attn.py:264): num_tp_kv_heads = max(1, num_kv_heads/tp),
-  // scattered_sconv shard = hidden_size / tp. So the four production sconvs at TP=1/2/4/8:
-  //   attn/mlp non-scattered : D=1536
-  //   attn/mlp scattered     : D=1536/tp = 1536, 768, 384, 192
-  //   k/v_sconv              : D=head_dim*num_tp_kv_heads = 512, 256, 128, 128
+  // Inkling has two shipped configurations:
+  //   * config defaults          : hidden_size=1536, head_dim=128, num_kv_heads=4
+  //   * production checkpoint    : hidden_size=6144, head_dim=128, num_kv_heads=4
+  //                                (attested by _INKLING_GATE_GEMV_HIDDEN=6144,
+  //                                _INKLING_AR_SSCONV_OUT_REGION=16384*6144, and the
+  //                                'hidden_size=6144 in BF16' comment in inkling.py).
+  // sconv_kernel_size=4, draft_token_num=9, and chunked prefill caps extend T at
+  // max_prefill_tokens=16384 (comm.py:876). TP sharding (attn.py:264):
+  // num_tp_kv_heads = max(1, num_kv_heads/tp), scattered_sconv shard = hidden_size / tp.
+  // Effective per-layer sconv D at each TP:
+  //   attn/mlp non-scattered : D=1536 (default) / 6144 (prod)  — same for TP=1..8
+  //   attn/mlp scattered     : D=hidden/tp = {1536,768,384,192} / {6144,3072,1536,768}
+  //   k/v_sconv              : D=head_dim*num_tp_kv_heads = {512,256,128,128}
+  //                            (num_kv_heads=4 saturates to num_tp_kv_heads=1 at TP>=4)
   return {
       {"reference_w3_tiny", 7, 4, 3, 2, 1, false, true, true, false},
       {"decode_b64_d128", 64, 128, 4, 64, 1, false, false, true, true},
       {"decode_b128_d512", 128, 512, 4, 128, 1, false, false, true, true},
       {"decode_b128_d1536", 128, 1536, 4, 128, 1, false, false, true, true},
+      {"decode_b128_d6144", 128, 6144, 4, 128, 1, false, false, true, true},
       {"extend_b8_l128_d128", 1024, 128, 4, 8, 128, true, false, true, false},
       {"extend_b8_l512_d512", 4096, 512, 4, 8, 512, true, false, true, false},
       {"extend_b8_l1024_d1536", 8192, 1536, 4, 8, 1024, true, false, true, false},
+      {"extend_b8_l1024_d6144", 8192, 6144, 4, 8, 1024, true, false, true, false},
+      {"extend_b8_l2048_d6144", 16384, 6144, 4, 8, 2048, true, false, true, false},
       {"verify_b32_q9_d1536", 288, 1536, 4, 32, 9, false, false, true, false},
       {"verify_b128_q9_d512", 1152, 512, 4, 128, 9, false, false, true, false},
       {"verify_b128_q9_d128", 1152, 128, 4, 128, 9, false, false, true, false},
+      {"verify_b128_q9_d6144", 1152, 6144, 4, 128, 9, false, false, true, false},
+      // Scattered sconv shards for the production hidden_size=6144 across TP={1,2,4,8}.
+      {"scattered_tp1_b8_l128_d6144", 1024, 6144, 4, 8, 128, true, false, true, false},
+      {"scattered_tp2_b8_l128_d3072", 1024, 3072, 4, 8, 128, true, false, true, false},
+      {"scattered_tp4_b8_l128_d1536", 1024, 1536, 4, 8, 128, true, false, true, false},
+      {"scattered_tp8_b8_l128_d768", 1024, 768, 4, 8, 128, true, false, true, false},
+      // Scattered sconv shards for the default hidden_size=1536 across TP={2,4,8}.
       {"scattered_tp2_b8_l128_d768", 1024, 768, 4, 8, 128, true, false, true, false},
       {"scattered_tp4_b8_l128_d384", 1024, 384, 4, 8, 128, true, false, true, false},
       {"scattered_tp8_b16_l128_d192", 2048, 192, 4, 16, 128, true, false, true, false},
@@ -1078,27 +1147,44 @@ std::vector<CaseConfig> inkling_suite() {
 }
 
 std::vector<CaseConfig> perf_suite() {
-  // Inkling defaults: hidden_size=1536, head_dim=128, num_kv_heads=4, sconv_kernel_size=4.
-  // Per-layer sconvs across TP configs (attn.py:264):
-  //   attn/mlp non-scattered : D=1536 (all TP)
-  //   attn/mlp scattered     : D=1536, 768, 384, 192  for TP=1, 2, 4, 8
-  //   k/v_sconv              : D=512, 256, 128, 128   for TP=1, 2, 4, 8
+  // Inkling has two shipped configurations:
+  //   * config defaults          : hidden_size=1536, head_dim=128, num_kv_heads=4
+  //   * production checkpoint    : hidden_size=6144, head_dim=128, num_kv_heads=4
+  // sconv_kernel_size=4. Chunked prefill caps extend T at max_prefill_tokens=16384
+  // (comm.py:876). Per-layer sconvs across TP={1,2,4,8}:
+  //   attn/mlp non-scattered : D=1536 / 6144  (same across TP)
+  //   attn/mlp scattered     : D=hidden/tp
+  //                            defaults: {1536,768,384,192}
+  //                            prod    : {6144,3072,1536,768}
+  //   k/v_sconv              : D=head_dim*num_tp_kv_heads = {512,256,128,128}
   // Draft speculative decode: target-verify has T = B * draft_token_num, Q=9.
   return {
+      // Non-scattered attn/mlp sconv at both configs.
       {"perf_extend_t65536_d1536", 65536, 1536, 4, 64, 1024, false, false, true, false},
       {"perf_extend_t262144_d1536", 262144, 1536, 4, 128, 2048, false, false, true, false},
+      {"perf_extend_t16384_d6144", 16384, 6144, 4, 16, 1024, false, false, true, false},
+      {"perf_extend_t65536_d6144", 65536, 6144, 4, 64, 1024, false, false, true, false},
+      // K/V sconv across TP.
       {"perf_kv_extend_t65536_d512", 65536, 512, 4, 64, 1024, false, false, true, false},
       {"perf_kv_extend_t65536_d256", 65536, 256, 4, 64, 1024, false, false, true, false},
       {"perf_kv_extend_t65536_d128", 65536, 128, 4, 64, 1024, false, false, true, false},
+      // Scattered sconv shards for default hidden=1536 across TP={2,4,8}.
       {"perf_scattered_tp2_t65536_d768", 65536, 768, 4, 64, 1024, false, false, true, false},
       {"perf_scattered_tp4_t65536_d384", 65536, 384, 4, 64, 1024, false, false, true, false},
       {"perf_scattered_tp8_t65536_d192", 65536, 192, 4, 64, 1024, false, false, true, false},
+      // Scattered sconv shards for production hidden=6144 across TP={2,4,8}.
+      {"perf_scattered_tp2_prod_t65536_d3072", 65536, 3072, 4, 64, 1024, false, false, true, false},
+      {"perf_scattered_tp4_prod_t65536_d1536", 65536, 1536, 4, 64, 1024, false, false, true, false},
+      {"perf_scattered_tp8_prod_t65536_d768", 65536, 768, 4, 64, 1024, false, false, true, false},
+      // Target-verify sweeps (draft_token_num=9) across both configs.
       {"perf_verify_b128_q9_d1536", 1152, 1536, 4, 128, 9, false, false, true, false},
       {"perf_verify_b128_q9_d768", 1152, 768, 4, 128, 9, false, false, true, false},
       {"perf_verify_b128_q9_d512", 1152, 512, 4, 128, 9, false, false, true, false},
       {"perf_verify_b128_q9_d256", 1152, 256, 4, 128, 9, false, false, true, false},
       {"perf_verify_b128_q9_d192", 1152, 192, 4, 128, 9, false, false, true, false},
       {"perf_verify_b128_q9_d128", 1152, 128, 4, 128, 9, false, false, true, false},
+      {"perf_verify_b128_q9_d6144", 1152, 6144, 4, 128, 9, false, false, true, false},
+      {"perf_verify_b128_q9_d3072", 1152, 3072, 4, 128, 9, false, false, true, false},
   };
 }
 
@@ -1106,13 +1192,19 @@ std::vector<CaseConfig> perf_extra_suite() {
   return {
       {"perf_pair_t65536_d770", 65536, 770, 4, 64, 1024, false, false, true, false},
       {"perf_decode_b4096_d1536", 4096, 1536, 4, 4096, 1, false, false, true, true},
+      {"perf_decode_b4096_d6144", 4096, 6144, 4, 4096, 1, false, false, true, true},
       {"perf_no_residual_t65536_d1536", 65536, 1536, 4, 64, 1024, false, false, false, false},
+      {"perf_no_residual_t65536_d6144", 65536, 6144, 4, 64, 1024, false, false, false, false},
       {"perf_kv_decode_b4096_d512", 4096, 512, 4, 4096, 1, false, false, true, true},
       {"perf_kv_decode_b4096_d256", 4096, 256, 4, 4096, 1, false, false, true, true},
       {"perf_kv_decode_b4096_d128", 4096, 128, 4, 4096, 1, false, false, true, true},
       {"perf_scattered_tp2_decode_b4096_d768", 4096, 768, 4, 4096, 1, false, false, true, true},
       {"perf_scattered_tp4_decode_b4096_d384", 4096, 384, 4, 4096, 1, false, false, true, true},
       {"perf_scattered_tp8_decode_b4096_d192", 4096, 192, 4, 4096, 1, false, false, true, true},
+      // Production hidden=6144 decode shards for TP={2,4,8}.
+      {"perf_scattered_tp2_prod_decode_b4096_d3072", 4096, 3072, 4, 4096, 1, false, false, true, true},
+      {"perf_scattered_tp4_prod_decode_b4096_d1536", 4096, 1536, 4, 4096, 1, false, false, true, true},
+      {"perf_scattered_tp8_prod_decode_b4096_d768", 4096, 768, 4, 4096, 1, false, false, true, true},
   };
 }
 
