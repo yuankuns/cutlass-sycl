@@ -667,6 +667,8 @@ bool run_case(
 }
 
 std::vector<CaseConfig> quick_suite() {
+  // Inkling calls update with W-1 = sconv_kernel_size - 1 = 3 and D chosen from
+  // {hidden_size=1536, hidden_size/tp=768/384/192, head_dim*num_tp_kv_heads=512/256/128}.
   return {
       {"decode_b5_w3_d7", 5, 3, 7, 1, false, true, false},
       {"decode_b32_w3_d128", 32, 3, 128, 1, false, true, false},
@@ -677,6 +679,12 @@ std::vector<CaseConfig> quick_suite() {
       {"padded_aligned_b7_w5_d130", 7, 5, 130, 6, true, true, true, 14, 14, 64},
       {"misaligned_scalar_b6_w3_d19", 6, 3, 19, 2, true, true, true, 3, 5, 11, 1, 1},
       {"random_meta_b17_w7_d263", 17, 7, 263, 9, false, true, true, 4, 9, 17, 0, 0, true, 12345u},
+      {"inkling_verify_b16_w3_d1536_q9", 16, 3, 1536, 9, false, true, false},
+      {"inkling_verify_b16_w3_d512_q9", 16, 3, 512, 9, false, true, false},
+      {"inkling_extend_mixed_b8_w3_d768_q128", 8, 3, 768, 128, true, true, true},
+      {"inkling_extend_mixed_b8_w3_d384_q128", 8, 3, 384, 128, true, true, true},
+      {"inkling_extend_mixed_b8_w3_d192_q128", 8, 3, 192, 128, true, true, true},
+      {"inkling_extend_mixed_b8_w3_d256_q128", 8, 3, 256, 128, true, true, true},
   };
 }
 
@@ -694,10 +702,27 @@ std::vector<CaseConfig> stress_suite() {
 }
 
 std::vector<CaseConfig> perf_suite() {
+  // Inkling always calls update with W-1 = sconv_kernel_size - 1 = 3. Per-layer
+  // dims across TP configs:
+  //   attn/mlp non-scattered : D=1536
+  //   attn/mlp scattered     : D=1536/tp = 1536, 768, 384, 192
+  //   k/v_sconv              : D=head_dim*num_tp_kv_heads = 512, 256, 128, 128
   return {
       {"decode_launch_smoke_b1_w3_d4096", 1, 3, 4096, 1, false, false, false},
       {"extend_cache_smoke_b32_w7_d4096_q8", 32, 7, 4096, 8, false, false, false},
       {"extend_b256_w7_d7168_q256", 256, 7, 7168, 256, false, false, false},
+      {"inkling_extend_b64_w3_d1536_q1024", 64, 3, 1536, 1024, false, false, false},
+      {"inkling_extend_b64_w3_d768_q1024", 64, 3, 768, 1024, false, false, false},
+      {"inkling_extend_b64_w3_d512_q1024", 64, 3, 512, 1024, false, false, false},
+      {"inkling_extend_b64_w3_d384_q1024", 64, 3, 384, 1024, false, false, false},
+      {"inkling_extend_b64_w3_d256_q1024", 64, 3, 256, 1024, false, false, false},
+      {"inkling_extend_b64_w3_d192_q1024", 64, 3, 192, 1024, false, false, false},
+      {"inkling_extend_b64_w3_d128_q1024", 64, 3, 128, 1024, false, false, false},
+      {"inkling_verify_b128_w3_d1536_q9", 128, 3, 1536, 9, false, false, false},
+      {"inkling_verify_b128_w3_d512_q9", 128, 3, 512, 9, false, false, false},
+      {"inkling_verify_b128_w3_d192_q9", 128, 3, 192, 9, false, false, false},
+      {"inkling_verify_b128_w3_d128_q9", 128, 3, 128, 9, false, false, false},
+      {"inkling_extend_b256_w3_d1536_q256", 256, 3, 1536, 256, false, false, false},
   };
 }
 

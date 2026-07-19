@@ -1046,6 +1046,12 @@ std::vector<CaseConfig> quick_suite() {
 }
 
 std::vector<CaseConfig> inkling_suite() {
+  // Inkling defaults: hidden_size=1536, head_dim=128, num_kv_heads=4, sconv_kernel_size=4,
+  // draft_token_num=9. TP sharding (attn.py:264): num_tp_kv_heads = max(1, num_kv_heads/tp),
+  // scattered_sconv shard = hidden_size / tp. So the four production sconvs at TP=1/2/4/8:
+  //   attn/mlp non-scattered : D=1536
+  //   attn/mlp scattered     : D=1536/tp = 1536, 768, 384, 192
+  //   k/v_sconv              : D=head_dim*num_tp_kv_heads = 512, 256, 128, 128
   return {
       {"reference_w3_tiny", 7, 4, 3, 2, 1, false, true, true, false},
       {"decode_b64_d128", 64, 128, 4, 64, 1, false, false, true, true},
@@ -1054,8 +1060,15 @@ std::vector<CaseConfig> inkling_suite() {
       {"extend_b8_l128_d128", 1024, 128, 4, 8, 128, true, false, true, false},
       {"extend_b8_l512_d512", 4096, 512, 4, 8, 512, true, false, true, false},
       {"extend_b8_l1024_d1536", 8192, 1536, 4, 8, 1024, true, false, true, false},
-      {"verify_b32_m8_d1536", 256, 1536, 4, 32, 8, false, false, true, false},
+      {"verify_b32_q9_d1536", 288, 1536, 4, 32, 9, false, false, true, false},
+      {"verify_b128_q9_d512", 1152, 512, 4, 128, 9, false, false, true, false},
+      {"verify_b128_q9_d128", 1152, 128, 4, 128, 9, false, false, true, false},
+      {"scattered_tp2_b8_l128_d768", 1024, 768, 4, 8, 128, true, false, true, false},
+      {"scattered_tp4_b8_l128_d384", 1024, 384, 4, 8, 128, true, false, true, false},
       {"scattered_tp8_b16_l128_d192", 2048, 192, 4, 16, 128, true, false, true, false},
+      {"kv_tp2_extend_b8_l128_d256", 1024, 256, 4, 8, 128, true, false, true, false},
+      {"kv_tp4_extend_b8_l128_d128", 1024, 128, 4, 8, 128, true, false, true, false},
+      {"kv_tp4_decode_b128_d128", 128, 128, 4, 128, 1, false, false, true, true},
       {"silu_residual_b8_l128_d256", 1024, 256, 4, 8, 128, true, true, true, false},
       {"decode_odd_b65_d257", 65, 257, 4, 65, 1, false, false, true, true},
       {"w3_medium_b8_l128_d256", 1024, 256, 3, 8, 128, false, false, true, false},
@@ -1065,9 +1078,27 @@ std::vector<CaseConfig> inkling_suite() {
 }
 
 std::vector<CaseConfig> perf_suite() {
+  // Inkling defaults: hidden_size=1536, head_dim=128, num_kv_heads=4, sconv_kernel_size=4.
+  // Per-layer sconvs across TP configs (attn.py:264):
+  //   attn/mlp non-scattered : D=1536 (all TP)
+  //   attn/mlp scattered     : D=1536, 768, 384, 192  for TP=1, 2, 4, 8
+  //   k/v_sconv              : D=512, 256, 128, 128   for TP=1, 2, 4, 8
+  // Draft speculative decode: target-verify has T = B * draft_token_num, Q=9.
   return {
       {"perf_extend_t65536_d1536", 65536, 1536, 4, 64, 1024, false, false, true, false},
       {"perf_extend_t262144_d1536", 262144, 1536, 4, 128, 2048, false, false, true, false},
+      {"perf_kv_extend_t65536_d512", 65536, 512, 4, 64, 1024, false, false, true, false},
+      {"perf_kv_extend_t65536_d256", 65536, 256, 4, 64, 1024, false, false, true, false},
+      {"perf_kv_extend_t65536_d128", 65536, 128, 4, 64, 1024, false, false, true, false},
+      {"perf_scattered_tp2_t65536_d768", 65536, 768, 4, 64, 1024, false, false, true, false},
+      {"perf_scattered_tp4_t65536_d384", 65536, 384, 4, 64, 1024, false, false, true, false},
+      {"perf_scattered_tp8_t65536_d192", 65536, 192, 4, 64, 1024, false, false, true, false},
+      {"perf_verify_b128_q9_d1536", 1152, 1536, 4, 128, 9, false, false, true, false},
+      {"perf_verify_b128_q9_d768", 1152, 768, 4, 128, 9, false, false, true, false},
+      {"perf_verify_b128_q9_d512", 1152, 512, 4, 128, 9, false, false, true, false},
+      {"perf_verify_b128_q9_d256", 1152, 256, 4, 128, 9, false, false, true, false},
+      {"perf_verify_b128_q9_d192", 1152, 192, 4, 128, 9, false, false, true, false},
+      {"perf_verify_b128_q9_d128", 1152, 128, 4, 128, 9, false, false, true, false},
   };
 }
 
@@ -1076,6 +1107,12 @@ std::vector<CaseConfig> perf_extra_suite() {
       {"perf_pair_t65536_d770", 65536, 770, 4, 64, 1024, false, false, true, false},
       {"perf_decode_b4096_d1536", 4096, 1536, 4, 4096, 1, false, false, true, true},
       {"perf_no_residual_t65536_d1536", 65536, 1536, 4, 64, 1024, false, false, false, false},
+      {"perf_kv_decode_b4096_d512", 4096, 512, 4, 4096, 1, false, false, true, true},
+      {"perf_kv_decode_b4096_d256", 4096, 256, 4, 4096, 1, false, false, true, true},
+      {"perf_kv_decode_b4096_d128", 4096, 128, 4, 4096, 1, false, false, true, true},
+      {"perf_scattered_tp2_decode_b4096_d768", 4096, 768, 4, 4096, 1, false, false, true, true},
+      {"perf_scattered_tp4_decode_b4096_d384", 4096, 384, 4, 4096, 1, false, false, true, true},
+      {"perf_scattered_tp8_decode_b4096_d192", 4096, 192, 4, 4096, 1, false, false, true, true},
   };
 }
 
