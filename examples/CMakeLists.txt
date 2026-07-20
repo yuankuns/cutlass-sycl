@@ -129,6 +129,7 @@ if (CUTLASS_ENABLE_SYCL)
       13_bmg_gemm_bias
       14_bmg_sconv
       15_bmg_attn_prologue
+      16_bmg_moe_gate
       50_xe35_block_scaled_gemm
       51_xe35_block_scaled_grouped_gemm
       )
