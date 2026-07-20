@@ -74,6 +74,89 @@ inline bool score_better(float score, int idx, float best_score, int best_idx) {
   return score > best_score || (score == best_score && idx < best_idx);
 }
 
+template <bool Packed>
+inline void gate_topk_renorm_row(
+    GateParams const& params,
+    sycl::sub_group sg,
+    int lane,
+    int64_t row,
+    int64_t row_base) {
+  float scores[kValuesPerLane];
+
+#pragma unroll
+  for (int j = 0; j < kValuesPerLane; ++j) {
+    int expert = lane * kValuesPerLane + j;
+    float s = sigmoid_device(params.logits[row_base + expert]);
+    scores[j] = s + params.bias[expert];
+  }
+
+  int selected_idx[kTopK];
+  float selected_sigmoid[kTopK];
+
+#pragma unroll
+  for (int k = 0; k < kTopK; ++k) {
+    float best_score = -FLT_MAX;
+    int best_idx = INT32_MAX;
+
+#pragma unroll
+    for (int j = 0; j < kValuesPerLane; ++j) {
+      int expert = lane * kValuesPerLane + j;
+      float score = scores[j];
+      if (score_better(score, expert, best_score, best_idx)) {
+        best_score = score;
+        best_idx = expert;
+      }
+    }
+
+#pragma unroll
+    for (int offset = kSubGroupSize / 2; offset > 0; offset >>= 1) {
+      float other_score = sycl::permute_group_by_xor(sg, best_score, offset);
+      int other_idx = sycl::permute_group_by_xor(sg, best_idx, offset);
+      if (score_better(other_score, other_idx, best_score, best_idx)) {
+        best_score = other_score;
+        best_idx = other_idx;
+      }
+    }
+
+    if (lane == 0) {
+      selected_idx[k] = best_idx;
+      selected_sigmoid[k] = best_score - params.bias[best_idx];
+    }
+
+    int owner_lane = best_idx / kValuesPerLane;
+    int owner_j = best_idx - owner_lane * kValuesPerLane;
+    if (lane == owner_lane) {
+      scores[owner_j] = -FLT_MAX;
+    }
+  }
+
+  if (lane == 0) {
+    float shared0 = sigmoid_device(params.logits[row_base + kRoutedExperts]);
+    float shared1 = sigmoid_device(params.logits[row_base + kRoutedExperts + 1]);
+    float sum = shared0 + shared1;
+
+#pragma unroll
+    for (int k = 0; k < kTopK; ++k) {
+      sum += selected_sigmoid[k];
+    }
+
+    float scale = params.route_scale * params.global_scale[0] / sum;
+
+#pragma unroll
+    for (int k = 0; k < kTopK; ++k) {
+      float weight = selected_sigmoid[k] * scale;
+      if constexpr (Packed) {
+        params.packed[row * kTopK + k] = pack_routed_device(selected_idx[k], weight);
+      } else {
+        params.routed_weights[row * kTopK + k] = weight;
+        params.indices[row * kTopK + k] = selected_idx[k];
+      }
+    }
+    params.shared_weights[row * kSharedExperts] = shared0 * scale;
+    params.shared_weights[row * kSharedExperts + 1] = shared1 * scale;
+  }
+}
+
 }  // namespace detail
 
 template <bool Packed, int RowsPerWorkGroup>
@@ -92,80 +175,7 @@ class GateTopKRenormKernel {
     }
 
     int64_t row_base = row * params_.logits_stride;
-    float scores[kValuesPerLane];
-
-#pragma unroll
-    for (int j = 0; j < kValuesPerLane; ++j) {
-      int expert = lane * kValuesPerLane + j;
-      float s = detail::sigmoid_device(params_.logits[row_base + expert]);
-      scores[j] = s + params_.bias[expert];
-    }
-
-    int selected_idx[kTopK];
-    float selected_sigmoid[kTopK];
-
-#pragma unroll
-    for (int k = 0; k < kTopK; ++k) {
-      float best_score = -FLT_MAX;
-      int best_idx = INT32_MAX;
-
-#pragma unroll
-      for (int j = 0; j < kValuesPerLane; ++j) {
-        int expert = lane * kValuesPerLane + j;
-        float score = scores[j];
-        if (detail::score_better(score, expert, best_score, best_idx)) {
-          best_score = score;
-          best_idx = expert;
-        }
-      }
-
-#pragma unroll
-      for (int offset = kSubGroupSize / 2; offset > 0; offset >>= 1) {
-        float other_score = sycl::permute_group_by_xor(sg, best_score, offset);
-        int other_idx = sycl::permute_group_by_xor(sg, best_idx, offset);
-        if (detail::score_better(other_score, other_idx, best_score, best_idx)) {
-          best_score = other_score;
-          best_idx = other_idx;
-        }
-      }
-
-      if (lane == 0) {
-        selected_idx[k] = best_idx;
-        selected_sigmoid[k] = best_score - params_.bias[best_idx];
-      }
-
-      int owner_lane = best_idx / kValuesPerLane;
-      int owner_j = best_idx - owner_lane * kValuesPerLane;
-      if (lane == owner_lane) {
-        scores[owner_j] = -FLT_MAX;
-      }
-    }
-
-    if (lane == 0) {
-      float shared0 = detail::sigmoid_device(params_.logits[row_base + kRoutedExperts]);
-      float shared1 = detail::sigmoid_device(params_.logits[row_base + kRoutedExperts + 1]);
-      float sum = shared0 + shared1;
-
-#pragma unroll
-      for (int k = 0; k < kTopK; ++k) {
-        sum += selected_sigmoid[k];
-      }
-
-      float scale = params_.route_scale * params_.global_scale[0] / sum;
-
-#pragma unroll
-      for (int k = 0; k < kTopK; ++k) {
-        float weight = selected_sigmoid[k] * scale;
-        if constexpr (Packed) {
-          params_.packed[row * kTopK + k] = detail::pack_routed_device(selected_idx[k], weight);
-        } else {
-          params_.routed_weights[row * kTopK + k] = weight;
-          params_.indices[row * kTopK + k] = selected_idx[k];
-        }
-      }
-      params_.shared_weights[row * kSharedExperts] = shared0 * scale;
-      params_.shared_weights[row * kSharedExperts + 1] = shared1 * scale;
-    }
+    detail::gate_topk_renorm_row<Packed>(params_, sg, lane, row, row_base);
   }
 
  private:
