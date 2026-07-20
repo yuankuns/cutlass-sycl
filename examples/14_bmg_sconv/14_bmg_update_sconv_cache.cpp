@@ -689,10 +689,25 @@ std::vector<CaseConfig> quick_suite() {
       {"inkling_verify_b16_w3_d1536_q9", 16, 3, 1536, 9, false, true, false},
       {"inkling_verify_b16_w3_d6144_q9", 16, 3, 6144, 9, false, true, false},
       {"inkling_verify_b16_w3_d512_q9", 16, 3, 512, 9, false, true, false},
+      // Target-verify (draft_token_num=9) at every per-layer D produced by
+      // TP={2,4,8} shards for both hidden_size configs (kv D=128 saturates at
+      // TP>=4, scattered D=192/384/768 default, D=3072 prod TP=2).
+      {"inkling_verify_b16_w3_d128_q9", 16, 3, 128, 9, false, true, false},
+      {"inkling_verify_b16_w3_d192_q9", 16, 3, 192, 9, false, true, false},
+      {"inkling_verify_b16_w3_d256_q9", 16, 3, 256, 9, false, true, false},
+      {"inkling_verify_b16_w3_d384_q9", 16, 3, 384, 9, false, true, false},
+      {"inkling_verify_b16_w3_d768_q9", 16, 3, 768, 9, false, true, false},
+      {"inkling_verify_b16_w3_d3072_q9", 16, 3, 3072, 9, false, true, false},
       {"inkling_extend_mixed_b8_w3_d768_q128", 8, 3, 768, 128, true, true, true},
       {"inkling_extend_mixed_b8_w3_d384_q128", 8, 3, 384, 128, true, true, true},
       {"inkling_extend_mixed_b8_w3_d192_q128", 8, 3, 192, 128, true, true, true},
       {"inkling_extend_mixed_b8_w3_d256_q128", 8, 3, 256, 128, true, true, true},
+      // Default hidden non-scattered attn/mlp (D=1536), plus K/V sconv shards
+      // for TP=1 (D=512) and TP>=4 (D=128) so every per-layer D appears with a
+      // varied-length extend qlen and both empty + padded metadata.
+      {"inkling_extend_mixed_b8_w3_d1536_q128", 8, 3, 1536, 128, true, true, true},
+      {"inkling_extend_mixed_b8_w3_d512_q128", 8, 3, 512, 128, true, true, true},
+      {"inkling_extend_mixed_b8_w3_d128_q128", 8, 3, 128, 128, true, true, true},
       // Production checkpoint scattered-sconv shards (hidden=6144) across TP={1,2,4,8}.
       // (TP=4 shard D=1536 numerically matches the default hidden non-scattered case
       //  and TP=8 shard D=768 matches the default TP=2 scattered case; kept under
@@ -748,7 +763,10 @@ std::vector<CaseConfig> perf_suite() {
       {"inkling_verify_b128_w3_d1536_q9", 128, 3, 1536, 9, false, false, false},
       {"inkling_verify_b128_w3_d6144_q9", 128, 3, 6144, 9, false, false, false},
       {"inkling_verify_b128_w3_d3072_q9", 128, 3, 3072, 9, false, false, false},
+      {"inkling_verify_b128_w3_d768_q9", 128, 3, 768, 9, false, false, false},
       {"inkling_verify_b128_w3_d512_q9", 128, 3, 512, 9, false, false, false},
+      {"inkling_verify_b128_w3_d384_q9", 128, 3, 384, 9, false, false, false},
+      {"inkling_verify_b128_w3_d256_q9", 128, 3, 256, 9, false, false, false},
       {"inkling_verify_b128_w3_d192_q9", 128, 3, 192, 9, false, false, false},
       {"inkling_verify_b128_w3_d128_q9", 128, 3, 128, 9, false, false, false},
       {"inkling_extend_b256_w3_d1536_q256", 256, 3, 1536, 256, false, false, false},

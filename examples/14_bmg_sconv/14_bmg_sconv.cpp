@@ -1126,6 +1126,20 @@ std::vector<CaseConfig> inkling_suite() {
       {"verify_b128_q9_d512", 1152, 512, 4, 128, 9, false, false, true, false},
       {"verify_b128_q9_d128", 1152, 128, 4, 128, 9, false, false, true, false},
       {"verify_b128_q9_d6144", 1152, 6144, 4, 128, 9, false, false, true, false},
+      // Target-verify (draft_token_num=9) at every per-layer D produced by
+      // TP={1,2,4,8} shards for both hidden_size configs, so accuracy coverage
+      // matches the perf sweep. B=16 mirrors the typical target-verify batch.
+      {"verify_b16_q9_d192", 144, 192, 4, 16, 9, false, false, true, false},
+      {"verify_b16_q9_d256", 144, 256, 4, 16, 9, false, false, true, false},
+      {"verify_b16_q9_d384", 144, 384, 4, 16, 9, false, false, true, false},
+      {"verify_b16_q9_d768", 144, 768, 4, 16, 9, false, false, true, false},
+      {"verify_b16_q9_d3072", 144, 3072, 4, 16, 9, false, false, true, false},
+      // Chunked-prefill ceiling for the default hidden_size=1536 configuration
+      // (max_prefill_tokens=16384 per comm.py:876). The prod hidden case is
+      // already covered by extend_b8_l2048_d6144 above.
+      {"extend_b16_l1024_d1536_prefill_cap", 16384, 1536, 4, 16, 1024, true, false, true, false},
+      // K/V sconv extend for TP=1 (D=head_dim*num_kv_heads=512).
+      {"kv_tp1_extend_b8_l128_d512", 1024, 512, 4, 8, 128, true, false, true, false},
       // Scattered sconv shards for the production hidden_size=6144 across TP={1,2,4,8}.
       {"scattered_tp1_b8_l128_d6144", 1024, 6144, 4, 8, 128, true, false, true, false},
       {"scattered_tp2_b8_l128_d3072", 1024, 3072, 4, 8, 128, true, false, true, false},
@@ -1180,6 +1194,7 @@ std::vector<CaseConfig> perf_suite() {
       {"perf_verify_b128_q9_d1536", 1152, 1536, 4, 128, 9, false, false, true, false},
       {"perf_verify_b128_q9_d768", 1152, 768, 4, 128, 9, false, false, true, false},
       {"perf_verify_b128_q9_d512", 1152, 512, 4, 128, 9, false, false, true, false},
+      {"perf_verify_b128_q9_d384", 1152, 384, 4, 128, 9, false, false, true, false},
       {"perf_verify_b128_q9_d256", 1152, 256, 4, 128, 9, false, false, true, false},
       {"perf_verify_b128_q9_d192", 1152, 192, 4, 128, 9, false, false, true, false},
       {"perf_verify_b128_q9_d128", 1152, 128, 4, 128, 9, false, false, true, false},
