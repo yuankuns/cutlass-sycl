@@ -130,6 +130,7 @@ if (CUTLASS_ENABLE_SYCL)
       14_bmg_sconv
       15_bmg_attn_prologue
       16_bmg_moe_gate
+      17_bmg_relative_attention_backend
       50_xe35_block_scaled_gemm
       51_xe35_block_scaled_grouped_gemm
       )
