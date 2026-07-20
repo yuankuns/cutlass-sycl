@@ -13,3 +13,10 @@ cutlass_example_add_executable(
   TEST_COMMAND_OPTIONS
   ATTN_PROLOGUE_QUICK_ARGS
 )
+
+cutlass_example_add_executable(
+  15_bmg_attn_prologue_mxfp8_store_tau
+  15_bmg_attn_prologue_mxfp8_store_tau.cpp
+  TEST_COMMAND_OPTIONS
+  ATTN_PROLOGUE_QUICK_ARGS
+)
