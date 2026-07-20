@@ -19,7 +19,7 @@
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
  * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE
  * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
  * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
  * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
@@ -30,30 +30,30 @@
  **************************************************************************************************/
 
 /*! \file
-    \brief Inkling target-verify attention prologue for CUTLASS SYCL on BMG.
+    \brief Inkling extend/prefill attention prologue for CUTLASS SYCL on BMG.
 
-    This standalone example mirrors the target-verify branch of
-    inkling_attn_prologue_verify:
+    This standalone example mirrors the extend branch of Inkling's fused
+    attention prologue:
 
       q_out = per-head RMSNorm(q)
-      k_work/v_work = k/v causal depthwise short-conv using cache prefixes
+      k_work/v_work = varlen causal depthwise short-conv using old cache prefixes
       k_out = per-head RMSNorm(round_to_dtype(k_work))
       v_out = round_to_dtype(v_work)
-      k_inter/v_inter save raw intermediate conv windows
       k_buf/v_buf optionally receive the final K/V rows at loc[t]
+      k_cache/v_cache optionally receive the trailing sequence-end conv windows
 
-    The production CUDA path stores K/V short-conv weights as [oldest ... current] for
-    each channel. This example follows that layout rather than the tiny Python
-    pedagogical cases that index tap 0 as current.
+    The main kernel uses one work-group per token and one 16-byte vec8 lane per
+    work-item. A second tiny kernel updates the convolution cache after the main
+    kernel completes; doing it in the main kernel would race with early-token
+    blocks that still need to read the old prefix cache.
 
-    Roofline: for the common W=4 bf16 verify case, each K/V channel performs
-    about 8 useful conv FLOPs plus a few norm/residual operations, while reading
-    multiple qkvr/cache/weight/gamma values and writing output, windows, and
-    optional KV rows. Even ignoring intermediate-window traffic, arithmetic
-    intensity is well under 1 FLOP/B for production B=128, q=9 shapes, so this
-    kernel is memory-bound. Performance reporting emphasizes effective GB/s;
-    target gates should use sustained working sets large enough to avoid
-    measuring cache-hit behavior.
+    Roofline: for the common W=4 bf16/fp16 extend path, each K/V channel does
+    about 8 useful convolution FLOPs plus modest norm/residual work while
+    streaming qkvr, cache prefix, weights, outputs, optional KV stores, and
+    cache-update rows. Arithmetic intensity is well below 1 FLOP/B for large
+    prefill shapes, so this is memory-bound. Performance reporting emphasizes
+    effective GB/s and the perf suite uses large working sets to avoid cache-hit
+    microbenchmarks.
 */
 
 #include <sycl/sycl.hpp>
@@ -78,7 +78,7 @@
 #include <type_traits>
 #include <vector>
 
-namespace cutlass::examples::attn_prologue {
+namespace cutlass::examples::attn_prologue_extend {
 
 constexpr int kPadSlot = -1;
 constexpr int kVecElems = 8;
@@ -86,7 +86,8 @@ constexpr int kHeadDim = 128;
 constexpr int kHeadLanes = kHeadDim / kVecElems;
 constexpr int kMaxLanes = 1024;
 constexpr int kMinLocalSize = 32;
-constexpr double kMinSustainedTargetBytes = 32.0 * 1024.0 * 1024.0;
+constexpr int kUpdateThreads = 256;
+constexpr double kMinSustainedTargetBytes = 64.0 * 1024.0 * 1024.0;
 
 enum class DType {
   kAll,
@@ -97,27 +98,29 @@ enum class DType {
 struct CaseConfig {
   std::string name;
   int batch = 1;
-  int draft_tokens = 1;
+  int max_q = 1;
   int dq = kHeadDim;
   int dkv = kHeadDim;
   int W = 4;
   int slice_gap = 0;
   int row_padding = 0;
   int cache_padding = 0;
-  int inter_padding = 0;
   int kv_padding = 0;
   int extra_slots = 8;
   bool use_silu = false;
   bool use_residual = true;
   bool do_store = true;
+  bool do_cache_update = true;
+  bool do_track = false;
   bool include_pad = false;
   bool include_mask_zero = false;
   bool include_negative_loc = false;
+  bool include_zero_length = false;
   double target_gbps = 0.0;
 };
 
 template <typename Element_>
-struct VerifyParams {
+struct ExtendParams {
   using Element = Element_;
 
   Element const* __restrict__ qkvr;
@@ -125,10 +128,10 @@ struct VerifyParams {
   Element const* __restrict__ v_cache;
   int32_t const* __restrict__ cache_indices;
   uint8_t const* __restrict__ cache_mask;
+  int64_t const* __restrict__ cu;
+  int32_t const* __restrict__ si;
   Element const* __restrict__ k_weight;
   Element const* __restrict__ v_weight;
-  Element* __restrict__ k_inter;
-  Element* __restrict__ v_inter;
   Element const* __restrict__ q_gamma;
   Element const* __restrict__ k_gamma;
   Element* __restrict__ q_out;
@@ -140,7 +143,6 @@ struct VerifyParams {
   float eps;
   int T;
   int batch;
-  int draft_tokens;
   int dq;
   int dkv;
   int qkvr_stride_t;
@@ -150,10 +152,30 @@ struct VerifyParams {
   int cache_stride_slot;
   int cache_stride_w;
   int weight_stride_d;
-  int inter_stride_b;
-  int inter_stride_t;
-  int inter_stride_w;
   int kv_buf_stride;
+};
+
+template <typename Element_>
+struct CacheUpdateParams {
+  using Element = Element_;
+
+  Element const* __restrict__ qkvr;
+  Element* __restrict__ k_cache;
+  Element* __restrict__ v_cache;
+  int32_t const* __restrict__ cache_indices;
+  uint8_t const* __restrict__ has_init;
+  int64_t const* __restrict__ cu;
+  int64_t const* __restrict__ track_rows;
+  uint8_t const* __restrict__ track_mask;
+  int64_t const* __restrict__ track_dst;
+  int qkvr_stride_t;
+  int k_off;
+  int v_off;
+  int cache_stride_slot;
+  int cache_stride_w;
+  int track_dst_stride;
+  int batch;
+  int dkv;
 };
 
 template <typename Element_>
@@ -165,10 +187,14 @@ struct HostTensors {
   std::vector<Element> v_cache;
   std::vector<int32_t> cache_indices;
   std::vector<uint8_t> cache_mask;
+  std::vector<uint8_t> has_init;
+  std::vector<int64_t> cu;
+  std::vector<int32_t> si;
   std::vector<Element> k_weight;
   std::vector<Element> v_weight;
-  std::vector<Element> k_inter;
-  std::vector<Element> v_inter;
+  std::vector<int64_t> track_rows;
+  std::vector<uint8_t> track_mask;
+  std::vector<int64_t> track_dst;
   std::vector<Element> q_gamma;
   std::vector<Element> k_gamma;
   std::vector<Element> q_out;
@@ -180,8 +206,8 @@ struct HostTensors {
   std::vector<Element> ref_q_out;
   std::vector<Element> ref_k_out;
   std::vector<Element> ref_v_out;
-  std::vector<Element> ref_k_inter;
-  std::vector<Element> ref_v_inter;
+  std::vector<Element> ref_k_cache;
+  std::vector<Element> ref_v_cache;
   std::vector<Element> ref_k_buf;
   std::vector<Element> ref_v_buf;
   int T = 0;
@@ -194,9 +220,6 @@ struct HostTensors {
   int cache_stride_w = 0;
   int cache_stride_slot = 0;
   int weight_stride_d = 0;
-  int inter_stride_w = 0;
-  int inter_stride_t = 0;
-  int inter_stride_b = 0;
   int kv_buf_stride = 0;
 };
 
@@ -335,6 +358,13 @@ void copy_vec8_raw(Element const* src, Element* dst) {
   *reinterpret_cast<uint64_t*>(dst + 4) = raw1;
 }
 
+template <typename Element>
+CUTLASS_DEVICE
+void store_zero_vec8(Element* dst) {
+  *reinterpret_cast<uint64_t*>(dst) = 0;
+  *reinterpret_cast<uint64_t*>(dst + 4) = 0;
+}
+
 std::string bool_text(bool value) {
   return value ? "true" : "false";
 }
@@ -387,7 +417,7 @@ float silu(float x) {
 template <typename Element, int W, bool UseSilu, bool UseResidual>
 CUTLASS_DEVICE
 void compute_kv_short_conv_vec(
-    VerifyParams<Element> const& p,
+    ExtendParams<Element> const& p,
     int t,
     int bos,
     int slot,
@@ -459,51 +489,15 @@ void compute_kv_short_conv_vec(
   }
 }
 
-template <typename Element, int W>
-CUTLASS_DEVICE
-void save_intermediate_windows_vec(
-    VerifyParams<Element> const& p,
-    int seq,
-    int tq,
-    int bos,
-    int slot,
-    bool is_k,
-    int ch) {
-  constexpr int W1 = W - 1;
-  Element const* cache = is_k ? p.k_cache : p.v_cache;
-  Element* inter = is_k ? p.k_inter : p.v_inter;
-  int x_off = is_k ? p.k_off : p.v_off;
-  Element* dst_base = inter
-      + static_cast<int64_t>(seq) * p.inter_stride_b
-      + static_cast<int64_t>(tq) * p.inter_stride_t
-      + ch;
-
-#pragma unroll
-  for (int w = 0; w < W1; ++w) {
-    int position = tq + 1 + w;
-    Element const* src = nullptr;
-    if (position < W1) {
-      src = cache
-          + static_cast<int64_t>(slot) * p.cache_stride_slot
-          + static_cast<int64_t>(position) * p.cache_stride_w
-          + ch;
-    } else {
-      int row = bos + position - W1;
-      src = p.qkvr + static_cast<int64_t>(row) * p.qkvr_stride_t + x_off + ch;
-    }
-    copy_vec8_raw(src, dst_base + static_cast<int64_t>(w) * p.inter_stride_w);
-  }
-}
-
 template <
     typename Element,
     int W,
     bool UseSilu,
     bool UseResidual,
     bool DoStore>
-class AttnPrologueVerifyKernel {
+class AttnPrologueExtendKernel {
  public:
-  VerifyParams<Element> params;
+  ExtendParams<Element> params;
 
   auto get(sycl::ext::oneapi::experimental::properties_tag) const {
     namespace syclex = sycl::ext::oneapi::experimental;
@@ -517,24 +511,22 @@ class AttnPrologueVerifyKernel {
     int nq = params.dq / kVecElems;
     int nkv = params.dkv / kVecElems;
     int total_lanes = nq + 2 * nkv;
-    int seq = t / params.draft_tokens;
-    int tq = t - seq * params.draft_tokens;
-    int bos = seq * params.draft_tokens;
+    if (lane >= total_lanes) {
+      return;
+    }
+
+    int seq = params.si[t];
+    int bos = static_cast<int>(params.cu[seq]);
+    int ci = params.cache_indices[seq];
+    bool valid = ci != kPadSlot;
+    int slot = valid ? ci : 0;
+    float cache_gate = (valid && params.cache_mask[seq] != 0) ? 1.0f : 0.0f;
 
     float values[kVecElems];
 #pragma unroll
     for (int j = 0; j < kVecElems; ++j) {
       values[j] = 0.0f;
     }
-
-    if (lane >= total_lanes) {
-      return;
-    }
-
-    int ci = params.cache_indices[seq];
-    bool valid = ci != kPadSlot;
-    int slot = valid ? ci : 0;
-    float cache_gate = (valid && params.cache_mask[seq] != 0) ? 1.0f : 0.0f;
 
     if (lane < nq) {
       int ch = lane * kVecElems;
@@ -562,9 +554,6 @@ class AttnPrologueVerifyKernel {
       int ch = (lane - nq) * kVecElems;
       compute_kv_short_conv_vec<Element, W, UseSilu, UseResidual>(
           params, t, bos, slot, cache_gate, true, ch, values);
-      if (valid) {
-        save_intermediate_windows_vec<Element, W>(params, seq, tq, bos, slot, true, ch);
-      }
       float ss = 0.0f;
 #pragma unroll
       for (int j = 0; j < kVecElems; ++j) {
@@ -592,14 +581,77 @@ class AttnPrologueVerifyKernel {
     int ch = (lane - nq - nkv) * kVecElems;
     compute_kv_short_conv_vec<Element, W, UseSilu, UseResidual>(
         params, t, bos, slot, cache_gate, false, ch, values);
-    if (valid) {
-      save_intermediate_windows_vec<Element, W>(params, seq, tq, bos, slot, false, ch);
-    }
     store_vec8(params.v_out + static_cast<int64_t>(t) * params.dkv + ch, values);
     if constexpr (DoStore) {
       int64_t kv_slot = params.loc[t];
       if (kv_slot >= 0) {
         store_vec8(params.v_buf + kv_slot * params.kv_buf_stride + ch, values);
+      }
+    }
+  }
+};
+
+template <typename Element, int W, bool DoTrack>
+class KvConvCacheUpdateKernel {
+ public:
+  CacheUpdateParams<Element> params;
+
+  CUTLASS_DEVICE
+  void operator()(sycl::nd_item<1> item) const {
+    constexpr int W1 = W - 1;
+    int nkv = params.dkv / kVecElems;
+    int items = params.batch * 2 * nkv;
+    int idx = static_cast<int>(item.get_global_linear_id());
+    if (idx >= items) {
+      return;
+    }
+
+    int b = idx / (2 * nkv);
+    int role_vec = idx - b * 2 * nkv;
+    bool is_k = role_vec < nkv;
+    int ch = (is_k ? role_vec : role_vec - nkv) * kVecElems;
+    Element const* base = params.qkvr;
+    int x_off = is_k ? params.k_off : params.v_off;
+    Element* cache = is_k ? params.k_cache : params.v_cache;
+    int slot = params.cache_indices[b];
+    int64_t qlen = params.cu[b + 1] - params.cu[b];
+
+    if (slot != kPadSlot && qlen > 0) {
+      Element* cache_base = cache + static_cast<int64_t>(slot) * params.cache_stride_slot + ch;
+      uint64_t old_raw0[W1];
+      uint64_t old_raw1[W1];
+#pragma unroll
+      for (int w = 0; w < W1; ++w) {
+        Element* src = cache_base + static_cast<int64_t>(w) * params.cache_stride_w;
+        old_raw0[w] = *reinterpret_cast<uint64_t const*>(src);
+        old_raw1[w] = *reinterpret_cast<uint64_t const*>(src + 4);
+      }
+#pragma unroll
+      for (int w = 0; w < W1; ++w) {
+        Element* dst = cache_base + static_cast<int64_t>(w) * params.cache_stride_w;
+        if (qlen >= W1 - w) {
+          int64_t row = params.cu[b + 1] - W1 + w;
+          copy_vec8_raw(base + row * params.qkvr_stride_t + x_off + ch, dst);
+        } else if (params.has_init[b] != 0) {
+          int src_w = w + static_cast<int>(qlen);
+          *reinterpret_cast<uint64_t*>(dst) = old_raw0[src_w];
+          *reinterpret_cast<uint64_t*>(dst + 4) = old_raw1[src_w];
+        } else {
+          store_zero_vec8(dst);
+        }
+      }
+    }
+
+    if constexpr (DoTrack) {
+      if (params.track_mask[b] != 0) {
+        int64_t dst_slot = params.track_dst[static_cast<int64_t>(b) * params.track_dst_stride];
+        Element* dst_base = cache + dst_slot * params.cache_stride_slot + ch;
+        for (int w = 0; w < W1; ++w) {
+          int64_t row = params.track_rows[static_cast<int64_t>(b) * W1 + w];
+          copy_vec8_raw(
+              base + row * params.qkvr_stride_t + x_off + ch,
+              dst_base + static_cast<int64_t>(w) * params.cache_stride_w);
+        }
       }
     }
   }
@@ -611,14 +663,14 @@ template <
     bool UseSilu,
     bool UseResidual,
     bool DoStore>
-sycl::event launch_verify_static(sycl::queue& q, VerifyParams<Element> const& params, int local_size) {
-  if (params.T == 0) {
-    return sycl::event{};
-  }
+sycl::event launch_extend_main_static(
+    sycl::queue& q,
+    ExtendParams<Element> const& params,
+    int local_size) {
   int global = params.T * local_size;
   return q.submit([&](sycl::handler& cgh) {
-    AttnPrologueVerifyKernel<Element, W, UseSilu, UseResidual, DoStore> kernel{params};
-    cgh.parallel_for<AttnPrologueVerifyKernel<Element, W, UseSilu, UseResidual, DoStore>>(
+    AttnPrologueExtendKernel<Element, W, UseSilu, UseResidual, DoStore> kernel{params};
+    cgh.parallel_for<AttnPrologueExtendKernel<Element, W, UseSilu, UseResidual, DoStore>>(
         sycl::nd_range<1>(
             sycl::range<1>(static_cast<std::size_t>(global)),
             sycl::range<1>(static_cast<std::size_t>(local_size))),
@@ -629,19 +681,19 @@ sycl::event launch_verify_static(sycl::queue& q, VerifyParams<Element> const& pa
 template <typename Element, int W, bool UseSilu, bool UseResidual>
 sycl::event launch_store_selected(
     sycl::queue& q,
-    VerifyParams<Element> const& params,
+    ExtendParams<Element> const& params,
     int local_size,
     bool do_store) {
   if (do_store) {
-    return launch_verify_static<Element, W, UseSilu, UseResidual, true>(q, params, local_size);
+    return launch_extend_main_static<Element, W, UseSilu, UseResidual, true>(q, params, local_size);
   }
-  return launch_verify_static<Element, W, UseSilu, UseResidual, false>(q, params, local_size);
+  return launch_extend_main_static<Element, W, UseSilu, UseResidual, false>(q, params, local_size);
 }
 
 template <typename Element, int W, bool UseSilu>
 sycl::event launch_residual_selected(
     sycl::queue& q,
-    VerifyParams<Element> const& params,
+    ExtendParams<Element> const& params,
     int local_size,
     bool use_residual,
     bool do_store) {
@@ -654,7 +706,7 @@ sycl::event launch_residual_selected(
 template <typename Element, int W>
 sycl::event launch_silu_selected(
     sycl::queue& q,
-    VerifyParams<Element> const& params,
+    ExtendParams<Element> const& params,
     int local_size,
     bool use_silu,
     bool use_residual,
@@ -666,30 +718,15 @@ sycl::event launch_silu_selected(
 }
 
 template <typename Element>
-sycl::event launch_verify(
+sycl::event launch_extend_main(
     sycl::queue& q,
-    VerifyParams<Element> const& params,
+    ExtendParams<Element> const& params,
     int W,
     bool use_silu,
     bool use_residual,
     bool do_store) {
   int lanes = params.dq / kVecElems + 2 * (params.dkv / kVecElems);
-  if (params.dq % kHeadDim != 0 || params.dkv % kHeadDim != 0) {
-    throw std::invalid_argument("dq and dkv must be multiples of 128");
-  }
-  if (params.qkvr_stride_t % kVecElems != 0 ||
-      params.q_off % kVecElems != 0 ||
-      params.k_off % kVecElems != 0 ||
-      params.v_off % kVecElems != 0 ||
-      params.cache_stride_w % kVecElems != 0 ||
-      params.inter_stride_w % kVecElems != 0 ||
-      params.kv_buf_stride % kVecElems != 0) {
-    throw std::invalid_argument("all vectorized strides and offsets must be 8-element aligned");
-  }
   int local_size = std::max(kMinLocalSize, round_up(lanes, kMinLocalSize));
-  if (local_size > kMaxLanes) {
-    throw std::invalid_argument("verify prologue lanes exceed 1024 work-items");
-  }
   if (W == 3) {
     return launch_silu_selected<Element, 3>(q, params, local_size, use_silu, use_residual, do_store);
   }
@@ -699,9 +736,96 @@ sycl::event launch_verify(
   throw std::invalid_argument("only W=3 and W=4 are supported");
 }
 
+template <typename Element, int W, bool DoTrack>
+sycl::event launch_cache_update_static(
+    sycl::queue& q,
+    CacheUpdateParams<Element> const& params) {
+  int nkv = params.dkv / kVecElems;
+  int items = params.batch * 2 * nkv;
+  int global = round_up(items, kUpdateThreads);
+  return q.submit([&](sycl::handler& cgh) {
+    KvConvCacheUpdateKernel<Element, W, DoTrack> kernel{params};
+    cgh.parallel_for<KvConvCacheUpdateKernel<Element, W, DoTrack>>(
+        sycl::nd_range<1>(
+            sycl::range<1>(static_cast<std::size_t>(global)),
+            sycl::range<1>(static_cast<std::size_t>(kUpdateThreads))),
+        kernel);
+  });
+}
+
+template <typename Element, int W>
+sycl::event launch_track_selected(
+    sycl::queue& q,
+    CacheUpdateParams<Element> const& params,
+    bool do_track) {
+  if (do_track) {
+    return launch_cache_update_static<Element, W, true>(q, params);
+  }
+  return launch_cache_update_static<Element, W, false>(q, params);
+}
+
+template <typename Element>
+sycl::event launch_cache_update(
+    sycl::queue& q,
+    CacheUpdateParams<Element> const& params,
+    int W,
+    bool do_track) {
+  if (W == 3) {
+    return launch_track_selected<Element, 3>(q, params, do_track);
+  }
+  if (W == 4) {
+    return launch_track_selected<Element, 4>(q, params, do_track);
+  }
+  throw std::invalid_argument("only W=3 and W=4 are supported");
+}
+
+struct LaunchEvents {
+  sycl::event first;
+  sycl::event last;
+};
+
+template <typename Element>
+LaunchEvents launch_extend(
+    sycl::queue& q,
+    ExtendParams<Element> const& main_params,
+    CacheUpdateParams<Element> const& update_params,
+    int W,
+    bool use_silu,
+    bool use_residual,
+    bool do_store,
+    bool do_cache_update,
+    bool do_track) {
+  if (main_params.T == 0) {
+    return {};
+  }
+  if (main_params.dq % kHeadDim != 0 || main_params.dkv % kHeadDim != 0) {
+    throw std::invalid_argument("dq and dkv must be multiples of 128");
+  }
+  if (main_params.qkvr_stride_t % kVecElems != 0 ||
+      main_params.q_off % kVecElems != 0 ||
+      main_params.k_off % kVecElems != 0 ||
+      main_params.v_off % kVecElems != 0 ||
+      main_params.cache_stride_w % kVecElems != 0 ||
+      main_params.kv_buf_stride % kVecElems != 0) {
+    throw std::invalid_argument("all vectorized strides and offsets must be 8-element aligned");
+  }
+  int lanes = main_params.dq / kVecElems + 2 * (main_params.dkv / kVecElems);
+  if (lanes > kMaxLanes) {
+    throw std::invalid_argument("extend prologue lanes exceed 1024 work-items");
+  }
+
+  sycl::event main_event = launch_extend_main<Element>(
+      q, main_params, W, use_silu, use_residual, do_store);
+  if (!do_cache_update) {
+    return {main_event, main_event};
+  }
+  sycl::event update_event = launch_cache_update<Element>(q, update_params, W, do_track);
+  return {main_event, update_event};
+}
+
 template <typename Element>
 HostTensors<Element> initialize_case(CaseConfig const& cfg) {
-  if (cfg.batch < 0 || cfg.draft_tokens < 0 || cfg.dq <= 0 || cfg.dkv <= 0) {
+  if (cfg.batch <= 0 || cfg.max_q <= 0 || cfg.dq <= 0 || cfg.dkv <= 0) {
     throw std::invalid_argument("invalid non-positive shape");
   }
   if (cfg.dq % kHeadDim != 0 || cfg.dkv % kHeadDim != 0) {
@@ -712,9 +836,6 @@ HostTensors<Element> initialize_case(CaseConfig const& cfg) {
   }
 
   HostTensors<Element> h;
-  h.T = cfg.batch * cfg.draft_tokens;
-  h.slots = std::max(1, cfg.batch + cfg.extra_slots);
-  h.kv_slots = h.T + 16;
   h.q_off = 0;
   h.k_off = round_up(cfg.dq + cfg.slice_gap, kVecElems);
   h.v_off = round_up(h.k_off + cfg.dkv + cfg.slice_gap, kVecElems);
@@ -722,20 +843,41 @@ HostTensors<Element> initialize_case(CaseConfig const& cfg) {
   h.cache_stride_w = round_up(cfg.dkv + cfg.cache_padding, kVecElems);
   h.cache_stride_slot = (cfg.W - 1) * h.cache_stride_w;
   h.weight_stride_d = cfg.W;
-  h.inter_stride_w = round_up(cfg.dkv + cfg.inter_padding, kVecElems);
-  h.inter_stride_t = (cfg.W - 1) * h.inter_stride_w;
-  h.inter_stride_b = cfg.draft_tokens * h.inter_stride_t;
   h.kv_buf_stride = round_up(cfg.dkv + cfg.kv_padding, kVecElems);
+
+  h.cu.resize(cfg.batch + 1);
+  h.cu[0] = 0;
+  for (int b = 0; b < cfg.batch; ++b) {
+    int len = 1 + ((b * 7 + 3) % cfg.max_q);
+    if (cfg.include_zero_length && (b % 9 == 4)) {
+      len = 0;
+    }
+    h.cu[b + 1] = h.cu[b] + len;
+    for (int i = 0; i < len; ++i) {
+      h.si.push_back(b);
+    }
+  }
+  h.T = static_cast<int>(h.si.size());
+  if (h.T == 0) {
+    throw std::invalid_argument("case generated zero tokens");
+  }
+  h.slots = std::max(1, cfg.batch + (cfg.do_track ? cfg.batch : 0) + cfg.extra_slots + 8);
+  while (h.slots / std::gcd(h.slots, 5) < cfg.batch) {
+    ++h.slots;
+  }
+  h.kv_slots = h.T + 16;
 
   h.qkvr.resize(static_cast<std::size_t>(h.T) * h.qkvr_stride_t);
   h.k_cache.resize(static_cast<std::size_t>(h.slots) * h.cache_stride_slot);
   h.v_cache.resize(static_cast<std::size_t>(h.slots) * h.cache_stride_slot);
   h.cache_indices.resize(cfg.batch);
   h.cache_mask.resize(cfg.batch);
+  h.has_init.resize(cfg.batch);
   h.k_weight.resize(static_cast<std::size_t>(cfg.dkv) * h.weight_stride_d);
   h.v_weight.resize(static_cast<std::size_t>(cfg.dkv) * h.weight_stride_d);
-  h.k_inter.resize(static_cast<std::size_t>(cfg.batch) * h.inter_stride_b);
-  h.v_inter.resize(static_cast<std::size_t>(cfg.batch) * h.inter_stride_b);
+  h.track_rows.resize(static_cast<std::size_t>(cfg.batch) * (cfg.W - 1));
+  h.track_mask.resize(cfg.batch);
+  h.track_dst.resize(cfg.batch);
   h.q_gamma.resize(kHeadDim);
   h.k_gamma.resize(kHeadDim);
   h.q_out.resize(static_cast<std::size_t>(h.T) * cfg.dq);
@@ -745,7 +887,7 @@ HostTensors<Element> initialize_case(CaseConfig const& cfg) {
   h.k_buf.resize(static_cast<std::size_t>(h.kv_slots) * h.kv_buf_stride);
   h.v_buf.resize(static_cast<std::size_t>(h.kv_slots) * h.kv_buf_stride);
 
-  std::mt19937 gen(20260719u + static_cast<unsigned>(cfg.batch * 17 + cfg.dq + cfg.dkv + cfg.W));
+  std::mt19937 gen(20260719u + static_cast<unsigned>(cfg.batch * 37 + cfg.max_q * 11 + cfg.dq + cfg.dkv + cfg.W));
   std::uniform_real_distribution<float> x_dist(-0.60f, 0.60f);
   std::uniform_real_distribution<float> w_dist(-0.18f, 0.18f);
   std::uniform_real_distribution<float> c_dist(-0.12f, 0.12f);
@@ -766,12 +908,6 @@ HostTensors<Element> initialize_case(CaseConfig const& cfg) {
   }
   for (auto& x : h.v_weight) {
     x = Element(w_dist(gen));
-  }
-  for (auto& x : h.k_inter) {
-    x = Element(init_dist(gen));
-  }
-  for (auto& x : h.v_inter) {
-    x = Element(init_dist(gen));
   }
   for (auto& x : h.q_gamma) {
     x = Element(g_dist(gen));
@@ -797,8 +933,48 @@ HostTensors<Element> initialize_case(CaseConfig const& cfg) {
 
   for (int b = 0; b < cfg.batch; ++b) {
     bool pad = cfg.include_pad && (b % 7 == 3);
+    bool init = !(cfg.include_mask_zero && (b % 5 == 2));
     h.cache_indices[b] = pad ? kPadSlot : ((b * 5 + 1) % h.slots);
-    h.cache_mask[b] = static_cast<uint8_t>(!(cfg.include_mask_zero && (b % 5 == 2)));
+    h.has_init[b] = static_cast<uint8_t>(init);
+    h.cache_mask[b] = static_cast<uint8_t>((!pad && init) ? 1 : 0);
+    h.track_mask[b] = 0;
+  }
+
+  std::vector<uint8_t> used_slots(h.slots, 0);
+  for (int b = 0; b < cfg.batch; ++b) {
+    if (h.cache_indices[b] != kPadSlot) {
+      used_slots[h.cache_indices[b]] = 1;
+    }
+  }
+  for (int b = 0; b < cfg.batch; ++b) {
+    if (cfg.do_track) {
+      int candidate = (h.slots - 1 - b) % h.slots;
+      int probes = 0;
+      while (used_slots[candidate] != 0 && probes < h.slots) {
+        candidate = (candidate + h.slots - 1) % h.slots;
+        ++probes;
+      }
+      if (probes == h.slots) {
+        throw std::runtime_error("insufficient unique cache slots for track destinations");
+      }
+      h.track_dst[b] = candidate;
+      used_slots[candidate] = 1;
+    } else {
+      h.track_dst[b] = 0;
+    }
+
+    int64_t qlen = h.cu[b + 1] - h.cu[b];
+    bool valid = h.cache_indices[b] != kPadSlot;
+    if (cfg.do_track && valid && qlen >= cfg.W - 1 && (b % 3 == 1)) {
+      h.track_mask[b] = 1;
+      for (int w = 0; w < cfg.W - 1; ++w) {
+        h.track_rows[static_cast<std::size_t>(b) * (cfg.W - 1) + w] = h.cu[b + 1] - (cfg.W - 1) + w;
+      }
+    } else {
+      for (int w = 0; w < cfg.W - 1; ++w) {
+        h.track_rows[static_cast<std::size_t>(b) * (cfg.W - 1) + w] = std::max<int64_t>(0, h.cu[b]);
+      }
+    }
   }
   for (int t = 0; t < h.T; ++t) {
     h.loc[t] = (cfg.include_negative_loc && (t % 11 == 5)) ? -1 : static_cast<int64_t>(t + 4);
@@ -807,15 +983,15 @@ HostTensors<Element> initialize_case(CaseConfig const& cfg) {
   h.ref_q_out = h.q_out;
   h.ref_k_out = h.k_out;
   h.ref_v_out = h.v_out;
-  h.ref_k_inter = h.k_inter;
-  h.ref_v_inter = h.v_inter;
+  h.ref_k_cache = h.k_cache;
+  h.ref_v_cache = h.v_cache;
   h.ref_k_buf = h.k_buf;
   h.ref_v_buf = h.v_buf;
   return h;
 }
 
 template <typename Element>
-float host_load(HostTensors<Element> const& h, std::vector<Element> const& storage, std::size_t idx) {
+float host_load(std::vector<Element> const& storage, std::size_t idx) {
   return to_float(storage[idx]);
 }
 
@@ -828,27 +1004,16 @@ void reference_case(CaseConfig const& cfg, HostTensors<Element>& h) {
 
   for (int t = 0; t < h.T; ++t) {
     for (int head = 0; head < cfg.dq / kHeadDim; ++head) {
-      float partial[kHeadLanes];
-#pragma unroll
-      for (int lane = 0; lane < kHeadLanes; ++lane) {
-        float ss = 0.0f;
-#pragma unroll
-        for (int j = 0; j < kVecElems; ++j) {
-          int c = head * kHeadDim + lane * kVecElems + j;
-          float x = host_load(h, h.qkvr, static_cast<std::size_t>(t) * h.qkvr_stride_t + h.q_off + c);
-          ss += x * x;
-        }
-        partial[lane] = ss;
-      }
       float ss = 0.0f;
-#pragma unroll
-      for (int lane = 0; lane < kHeadLanes; ++lane) {
-        ss += partial[lane];
+      for (int c = 0; c < kHeadDim; ++c) {
+        int d = head * kHeadDim + c;
+        float x = host_load(h.qkvr, static_cast<std::size_t>(t) * h.qkvr_stride_t + h.q_off + d);
+        ss += x * x;
       }
       float inv = 1.0f / std::sqrt(ss / static_cast<float>(kHeadDim) + eps);
       for (int c = 0; c < kHeadDim; ++c) {
         int d = head * kHeadDim + c;
-        float x = host_load(h, h.qkvr, static_cast<std::size_t>(t) * h.qkvr_stride_t + h.q_off + d);
+        float x = host_load(h.qkvr, static_cast<std::size_t>(t) * h.qkvr_stride_t + h.q_off + d);
         float gamma = to_float(h.q_gamma[c]);
         h.ref_q_out[static_cast<std::size_t>(t) * cfg.dq + d] = Element(x * inv * gamma);
       }
@@ -860,30 +1025,30 @@ void reference_case(CaseConfig const& cfg, HostTensors<Element>& h) {
     bool valid = ci != kPadSlot;
     int slot = valid ? ci : 0;
     bool use_cache = valid && h.cache_mask[b] != 0;
-    int bos = b * cfg.draft_tokens;
-    for (int tq = 0; tq < cfg.draft_tokens; ++tq) {
-      int t = bos + tq;
+    int64_t bos = h.cu[b];
+    int64_t eos = h.cu[b + 1];
+    for (int64_t t64 = bos; t64 < eos; ++t64) {
+      int t = static_cast<int>(t64);
       for (int d = 0; d < cfg.dkv; ++d) {
         for (int role = 0; role < 2; ++role) {
           bool is_k = role == 0;
           auto const& cache = is_k ? h.k_cache : h.v_cache;
           auto const& weight = is_k ? h.k_weight : h.v_weight;
           int x_off = is_k ? h.k_off : h.v_off;
-          float xcur = host_load(h, h.qkvr, static_cast<std::size_t>(t) * h.qkvr_stride_t + x_off + d);
+          float xcur = host_load(h.qkvr, static_cast<std::size_t>(t) * h.qkvr_stride_t + x_off + d);
           float acc = 0.0f;
           for (int iw = 0; iw < W; ++iw) {
             float tap = 0.0f;
             if (iw == W1) {
               tap = xcur;
             } else {
-              int shifted = t - W1 + iw;
+              int64_t shifted = t64 - W1 + iw;
               if (shifted >= bos) {
-                tap = host_load(h, h.qkvr, static_cast<std::size_t>(shifted) * h.qkvr_stride_t + x_off + d);
+                tap = host_load(h.qkvr, static_cast<std::size_t>(shifted) * h.qkvr_stride_t + x_off + d);
               } else {
-                int prefix_pos = shifted - bos + W1;
+                int64_t prefix_pos = shifted - bos + W1;
                 if (prefix_pos >= 0 && use_cache) {
                   tap = host_load(
-                      h,
                       cache,
                       static_cast<std::size_t>(slot) * h.cache_stride_slot
                           + static_cast<std::size_t>(prefix_pos) * h.cache_stride_w + d);
@@ -905,48 +1070,16 @@ void reference_case(CaseConfig const& cfg, HostTensors<Element>& h) {
           }
         }
       }
-
-      if (valid) {
-        for (int w = 0; w < W1; ++w) {
-          int position = tq + 1 + w;
-          for (int d = 0; d < cfg.dkv; ++d) {
-            std::size_t dst = static_cast<std::size_t>(b) * h.inter_stride_b
-                + static_cast<std::size_t>(tq) * h.inter_stride_t
-                + static_cast<std::size_t>(w) * h.inter_stride_w + d;
-            if (position < W1) {
-              std::size_t src = static_cast<std::size_t>(slot) * h.cache_stride_slot
-                  + static_cast<std::size_t>(position) * h.cache_stride_w + d;
-              h.ref_k_inter[dst] = h.k_cache[src];
-              h.ref_v_inter[dst] = h.v_cache[src];
-            } else {
-              int src_t = bos + position - W1;
-              h.ref_k_inter[dst] = h.qkvr[static_cast<std::size_t>(src_t) * h.qkvr_stride_t + h.k_off + d];
-              h.ref_v_inter[dst] = h.qkvr[static_cast<std::size_t>(src_t) * h.qkvr_stride_t + h.v_off + d];
-            }
-          }
-        }
-      }
     }
   }
 
   for (int t = 0; t < h.T; ++t) {
     for (int head = 0; head < cfg.dkv / kHeadDim; ++head) {
-      float partial[kHeadLanes];
-#pragma unroll
-      for (int lane = 0; lane < kHeadLanes; ++lane) {
-        float ss = 0.0f;
-#pragma unroll
-        for (int j = 0; j < kVecElems; ++j) {
-          int c = head * kHeadDim + lane * kVecElems + j;
-          float x = k_work[static_cast<std::size_t>(t) * cfg.dkv + c];
-          ss += x * x;
-        }
-        partial[lane] = ss;
-      }
       float ss = 0.0f;
-#pragma unroll
-      for (int lane = 0; lane < kHeadLanes; ++lane) {
-        ss += partial[lane];
+      for (int c = 0; c < kHeadDim; ++c) {
+        int d = head * kHeadDim + c;
+        float x = k_work[static_cast<std::size_t>(t) * cfg.dkv + d];
+        ss += x * x;
       }
       float inv = 1.0f / std::sqrt(ss / static_cast<float>(kHeadDim) + eps);
       for (int c = 0; c < kHeadDim; ++c) {
@@ -976,20 +1109,67 @@ void reference_case(CaseConfig const& cfg, HostTensors<Element>& h) {
       }
     }
   }
+
+  if (!cfg.do_cache_update) {
+    return;
+  }
+
+  auto update_one_cache = [&](std::vector<Element> const& old_cache, std::vector<Element>& ref_cache, bool is_k) {
+    int x_off = is_k ? h.k_off : h.v_off;
+    for (int b = 0; b < cfg.batch; ++b) {
+      int slot = h.cache_indices[b];
+      int64_t qlen = h.cu[b + 1] - h.cu[b];
+      if (slot != kPadSlot && qlen > 0) {
+        for (int w = 0; w < W1; ++w) {
+          for (int d = 0; d < cfg.dkv; ++d) {
+            std::size_t dst = static_cast<std::size_t>(slot) * h.cache_stride_slot
+                + static_cast<std::size_t>(w) * h.cache_stride_w + d;
+            if (qlen >= W1 - w) {
+              int64_t row = h.cu[b + 1] - W1 + w;
+              ref_cache[dst] = h.qkvr[static_cast<std::size_t>(row) * h.qkvr_stride_t + x_off + d];
+            } else if (h.has_init[b] != 0) {
+              int src_w = w + static_cast<int>(qlen);
+              std::size_t src = static_cast<std::size_t>(slot) * h.cache_stride_slot
+                  + static_cast<std::size_t>(src_w) * h.cache_stride_w + d;
+              ref_cache[dst] = old_cache[src];
+            } else {
+              ref_cache[dst] = Element(0.0f);
+            }
+          }
+        }
+      }
+      if (cfg.do_track && h.track_mask[b] != 0) {
+        int64_t dst_slot = h.track_dst[b];
+        for (int w = 0; w < W1; ++w) {
+          int64_t row = h.track_rows[static_cast<std::size_t>(b) * W1 + w];
+          for (int d = 0; d < cfg.dkv; ++d) {
+            std::size_t dst = static_cast<std::size_t>(dst_slot) * h.cache_stride_slot
+                + static_cast<std::size_t>(w) * h.cache_stride_w + d;
+            ref_cache[dst] = h.qkvr[static_cast<std::size_t>(row) * h.qkvr_stride_t + x_off + d];
+          }
+        }
+      }
+    }
+  };
+
+  std::vector<Element> old_k_cache = h.k_cache;
+  std::vector<Element> old_v_cache = h.v_cache;
+  update_one_cache(old_k_cache, h.ref_k_cache, true);
+  update_one_cache(old_v_cache, h.ref_v_cache, false);
 }
 
 template <typename Element>
-VerifyParams<Element> make_params(HostTensors<Element> const& h, CaseConfig const& cfg) {
-  VerifyParams<Element> params;
+ExtendParams<Element> make_main_params(HostTensors<Element> const& h, CaseConfig const& cfg) {
+  ExtendParams<Element> params;
   params.qkvr = nullptr;
   params.k_cache = nullptr;
   params.v_cache = nullptr;
   params.cache_indices = nullptr;
   params.cache_mask = nullptr;
+  params.cu = nullptr;
+  params.si = nullptr;
   params.k_weight = nullptr;
   params.v_weight = nullptr;
-  params.k_inter = nullptr;
-  params.v_inter = nullptr;
   params.q_gamma = nullptr;
   params.k_gamma = nullptr;
   params.q_out = nullptr;
@@ -1001,7 +1181,6 @@ VerifyParams<Element> make_params(HostTensors<Element> const& h, CaseConfig cons
   params.eps = 1.0e-5f;
   params.T = h.T;
   params.batch = cfg.batch;
-  params.draft_tokens = cfg.draft_tokens;
   params.dq = cfg.dq;
   params.dkv = cfg.dkv;
   params.qkvr_stride_t = h.qkvr_stride_t;
@@ -1011,10 +1190,30 @@ VerifyParams<Element> make_params(HostTensors<Element> const& h, CaseConfig cons
   params.cache_stride_slot = h.cache_stride_slot;
   params.cache_stride_w = h.cache_stride_w;
   params.weight_stride_d = h.weight_stride_d;
-  params.inter_stride_b = h.inter_stride_b;
-  params.inter_stride_t = h.inter_stride_t;
-  params.inter_stride_w = h.inter_stride_w;
   params.kv_buf_stride = h.kv_buf_stride;
+  return params;
+}
+
+template <typename Element>
+CacheUpdateParams<Element> make_update_params(HostTensors<Element> const& h, CaseConfig const& cfg) {
+  CacheUpdateParams<Element> params;
+  params.qkvr = nullptr;
+  params.k_cache = nullptr;
+  params.v_cache = nullptr;
+  params.cache_indices = nullptr;
+  params.has_init = nullptr;
+  params.cu = nullptr;
+  params.track_rows = nullptr;
+  params.track_mask = nullptr;
+  params.track_dst = nullptr;
+  params.qkvr_stride_t = h.qkvr_stride_t;
+  params.k_off = h.k_off;
+  params.v_off = h.v_off;
+  params.cache_stride_slot = h.cache_stride_slot;
+  params.cache_stride_w = h.cache_stride_w;
+  params.track_dst_stride = 1;
+  params.batch = cfg.batch;
+  params.dkv = cfg.dkv;
   return params;
 }
 
@@ -1074,23 +1273,24 @@ void print_verify_result(std::string const& label, VerifyResult const& result) {
   std::cout << "\n";
 }
 
-double estimate_bytes(CaseConfig const& cfg) {
-  double T = static_cast<double>(cfg.batch) * cfg.draft_tokens;
+double estimate_bytes(CaseConfig const& cfg, int T) {
   double elem = 2.0;
-  double q_bytes = T * cfg.dq * elem * 3.0;
-  double kv_conv_reads = T * 2.0 * cfg.dkv * elem * static_cast<double>(cfg.W * 2);
-  double kv_writes = T * 2.0 * cfg.dkv * elem;
-  double gamma_reads = T * (cfg.dq + cfg.dkv) * elem;
-  double windows = T * 2.0 * cfg.dkv * elem * static_cast<double>(cfg.W - 1);
-  double store = cfg.do_store ? T * 2.0 * cfg.dkv * elem : 0.0;
-  return q_bytes + kv_conv_reads + kv_writes + gamma_reads + windows + store;
+  double q_norm = static_cast<double>(T) * cfg.dq * elem * 3.0;
+  double kv_conv = static_cast<double>(T) * 2.0 * cfg.dkv * elem * static_cast<double>(cfg.W * 2);
+  double kv_out = static_cast<double>(T) * 2.0 * cfg.dkv * elem;
+  double gamma = static_cast<double>(T) * (cfg.dq + cfg.dkv) * elem;
+  double store = cfg.do_store ? static_cast<double>(T) * 2.0 * cfg.dkv * elem : 0.0;
+  double update = cfg.do_cache_update
+      ? static_cast<double>(cfg.batch) * 2.0 * cfg.dkv * elem * static_cast<double>(cfg.W - 1) * 2.0
+      : 0.0;
+  return q_norm + kv_conv + kv_out + gamma + store + update;
 }
 
-double estimate_flops(CaseConfig const& cfg) {
-  double T = static_cast<double>(cfg.batch) * cfg.draft_tokens;
-  double q_norm = T * cfg.dq * 4.0;
-  double kv_conv = T * 2.0 * cfg.dkv * static_cast<double>(2 * cfg.W + (cfg.use_silu ? 4 : 0) + (cfg.use_residual ? 1 : 0));
-  double k_norm = T * cfg.dkv * 4.0;
+double estimate_flops(CaseConfig const& cfg, int T) {
+  double q_norm = static_cast<double>(T) * cfg.dq * 4.0;
+  double kv_conv = static_cast<double>(T) * 2.0 * cfg.dkv
+      * static_cast<double>(2 * cfg.W + (cfg.use_silu ? 4 : 0) + (cfg.use_residual ? 1 : 0));
+  double k_norm = static_cast<double>(T) * cfg.dkv * 4.0;
   return q_norm + kv_conv + k_norm;
 }
 
@@ -1117,10 +1317,14 @@ bool run_case(
   DeviceBuffer<Element> d_v_cache(q, h.v_cache.size());
   DeviceBuffer<int32_t> d_cache_indices(q, h.cache_indices.size());
   DeviceBuffer<uint8_t> d_cache_mask(q, h.cache_mask.size());
+  DeviceBuffer<uint8_t> d_has_init(q, h.has_init.size());
+  DeviceBuffer<int64_t> d_cu(q, h.cu.size());
+  DeviceBuffer<int32_t> d_si(q, h.si.size());
   DeviceBuffer<Element> d_k_weight(q, h.k_weight.size());
   DeviceBuffer<Element> d_v_weight(q, h.v_weight.size());
-  DeviceBuffer<Element> d_k_inter(q, h.k_inter.size());
-  DeviceBuffer<Element> d_v_inter(q, h.v_inter.size());
+  DeviceBuffer<int64_t> d_track_rows(q, h.track_rows.size());
+  DeviceBuffer<uint8_t> d_track_mask(q, h.track_mask.size());
+  DeviceBuffer<int64_t> d_track_dst(q, h.track_dst.size());
   DeviceBuffer<Element> d_q_gamma(q, h.q_gamma.size());
   DeviceBuffer<Element> d_k_gamma(q, h.k_gamma.size());
   DeviceBuffer<Element> d_q_out(q, h.q_out.size());
@@ -1135,10 +1339,14 @@ bool run_case(
   d_v_cache.copy_from(h.v_cache);
   d_cache_indices.copy_from(h.cache_indices);
   d_cache_mask.copy_from(h.cache_mask);
+  d_has_init.copy_from(h.has_init);
+  d_cu.copy_from(h.cu);
+  d_si.copy_from(h.si);
   d_k_weight.copy_from(h.k_weight);
   d_v_weight.copy_from(h.v_weight);
-  d_k_inter.copy_from(h.k_inter);
-  d_v_inter.copy_from(h.v_inter);
+  d_track_rows.copy_from(h.track_rows);
+  d_track_mask.copy_from(h.track_mask);
+  d_track_dst.copy_from(h.track_dst);
   d_q_gamma.copy_from(h.q_gamma);
   d_k_gamma.copy_from(h.k_gamma);
   d_q_out.copy_from(h.q_out);
@@ -1148,39 +1356,58 @@ bool run_case(
   d_k_buf.copy_from(h.k_buf);
   d_v_buf.copy_from(h.v_buf);
 
-  VerifyParams<Element> params = make_params(h, cfg);
-  params.qkvr = d_qkvr.get();
-  params.k_cache = d_k_cache.get();
-  params.v_cache = d_v_cache.get();
-  params.cache_indices = d_cache_indices.get();
-  params.cache_mask = d_cache_mask.get();
-  params.k_weight = d_k_weight.get();
-  params.v_weight = d_v_weight.get();
-  params.k_inter = d_k_inter.get();
-  params.v_inter = d_v_inter.get();
-  params.q_gamma = d_q_gamma.get();
-  params.k_gamma = d_k_gamma.get();
-  params.q_out = d_q_out.get();
-  params.k_out = d_k_out.get();
-  params.v_out = d_v_out.get();
-  params.loc = d_loc.get();
-  params.k_buf = d_k_buf.get();
-  params.v_buf = d_v_buf.get();
+  ExtendParams<Element> main_params = make_main_params(h, cfg);
+  main_params.qkvr = d_qkvr.get();
+  main_params.k_cache = d_k_cache.get();
+  main_params.v_cache = d_v_cache.get();
+  main_params.cache_indices = d_cache_indices.get();
+  main_params.cache_mask = d_cache_mask.get();
+  main_params.cu = d_cu.get();
+  main_params.si = d_si.get();
+  main_params.k_weight = d_k_weight.get();
+  main_params.v_weight = d_v_weight.get();
+  main_params.q_gamma = d_q_gamma.get();
+  main_params.k_gamma = d_k_gamma.get();
+  main_params.q_out = d_q_out.get();
+  main_params.k_out = d_k_out.get();
+  main_params.v_out = d_v_out.get();
+  main_params.loc = d_loc.get();
+  main_params.k_buf = d_k_buf.get();
+  main_params.v_buf = d_v_buf.get();
+
+  CacheUpdateParams<Element> update_params = make_update_params(h, cfg);
+  update_params.qkvr = d_qkvr.get();
+  update_params.k_cache = d_k_cache.get();
+  update_params.v_cache = d_v_cache.get();
+  update_params.cache_indices = d_cache_indices.get();
+  update_params.has_init = d_has_init.get();
+  update_params.cu = d_cu.get();
+  update_params.track_rows = d_track_rows.get();
+  update_params.track_mask = d_track_mask.get();
+  update_params.track_dst = d_track_dst.get();
 
   auto launch = [&]() {
-    return launch_verify<Element>(
-        q, params, cfg.W, cfg.use_silu, cfg.use_residual, cfg.do_store);
+    return launch_extend<Element>(
+        q,
+        main_params,
+        update_params,
+        cfg.W,
+        cfg.use_silu,
+        cfg.use_residual,
+        cfg.do_store,
+        cfg.do_cache_update,
+        cfg.do_track);
   };
 
-  launch().wait_and_throw();
+  launch().last.wait_and_throw();
 
   bool passed = true;
   if (verify) {
     d_q_out.copy_to(h.q_out);
     d_k_out.copy_to(h.k_out);
     d_v_out.copy_to(h.v_out);
-    d_k_inter.copy_to(h.k_inter);
-    d_v_inter.copy_to(h.v_inter);
+    d_k_cache.copy_to(h.k_cache);
+    d_v_cache.copy_to(h.v_cache);
     d_k_buf.copy_to(h.k_buf);
     d_v_buf.copy_to(h.v_buf);
 
@@ -1189,18 +1416,18 @@ bool run_case(
     VerifyResult q_result = compare_close(h.q_out, h.ref_q_out, atol, rtol);
     VerifyResult k_result = compare_close(h.k_out, h.ref_k_out, atol, rtol);
     VerifyResult v_result = compare_close(h.v_out, h.ref_v_out, atol, rtol);
-    VerifyResult ki_result = compare_exact(h.k_inter, h.ref_k_inter);
-    VerifyResult vi_result = compare_exact(h.v_inter, h.ref_v_inter);
+    VerifyResult kc_result = compare_exact(h.k_cache, h.ref_k_cache);
+    VerifyResult vc_result = compare_exact(h.v_cache, h.ref_v_cache);
     VerifyResult kb_result = compare_close(h.k_buf, h.ref_k_buf, atol, rtol);
     VerifyResult vb_result = compare_close(h.v_buf, h.ref_v_buf, atol, rtol);
     passed = q_result.passed && k_result.passed && v_result.passed &&
-        ki_result.passed && vi_result.passed && kb_result.passed && vb_result.passed;
+        kc_result.passed && vc_result.passed && kb_result.passed && vb_result.passed;
     if (!passed) {
       print_verify_result("q", q_result);
       print_verify_result("k", k_result);
       print_verify_result("v", v_result);
-      print_verify_result("k_inter", ki_result);
-      print_verify_result("v_inter", vi_result);
+      print_verify_result("k_cache", kc_result);
+      print_verify_result("v_cache", vc_result);
       print_verify_result("k_buf", kb_result);
       print_verify_result("v_buf", vb_result);
     }
@@ -1208,24 +1435,24 @@ bool run_case(
 
   int warmup_iterations = std::min(10, std::max(2, iterations));
   for (int i = 0; i < warmup_iterations; ++i) {
-    launch().wait_and_throw();
+    launch().last.wait_and_throw();
   }
-  std::vector<sycl::event> events;
+  std::vector<LaunchEvents> events;
   int timing_iterations = std::max(1, iterations);
   events.reserve(timing_iterations);
   for (int i = 0; i < timing_iterations; ++i) {
     events.push_back(launch());
   }
   double total_ns = 0.0;
-  for (auto& event : events) {
-    event.wait_and_throw();
-    auto start = event.get_profiling_info<sycl::info::event_profiling::command_start>();
-    auto end = event.get_profiling_info<sycl::info::event_profiling::command_end>();
+  for (auto& event_pair : events) {
+    event_pair.last.wait_and_throw();
+    auto start = event_pair.first.get_profiling_info<sycl::info::event_profiling::command_start>();
+    auto end = event_pair.last.get_profiling_info<sycl::info::event_profiling::command_end>();
     total_ns += static_cast<double>(end - start);
   }
   double avg_s = total_ns * 1.0e-9 / static_cast<double>(timing_iterations);
-  double bytes = estimate_bytes(cfg);
-  double flops = estimate_flops(cfg);
+  double bytes = estimate_bytes(cfg, h.T);
+  double flops = estimate_flops(cfg, h.T);
   double gbps = bytes / avg_s / 1.0e9;
   double tops = flops / avg_s / 1.0e12;
   std::ostringstream target_suffix;
@@ -1236,15 +1463,18 @@ bool run_case(
   passed = passed && perf_passed;
 
   std::cout << "  [" << element_dtype_text<Element>() << "] "
-            << std::left << std::setw(28) << cfg.name << std::right
+            << std::left << std::setw(30) << cfg.name << std::right
             << " B=" << cfg.batch
-            << " q=" << cfg.draft_tokens
+            << " T=" << h.T
+            << " maxq=" << cfg.max_q
             << " dq=" << cfg.dq
             << " dkv=" << cfg.dkv
             << " W=" << cfg.W
             << " silu=" << bool_text(cfg.use_silu)
             << " residual=" << bool_text(cfg.use_residual)
             << " store=" << bool_text(cfg.do_store)
+            << " update=" << bool_text(cfg.do_cache_update)
+            << " track=" << bool_text(cfg.do_track)
             << "  " << std::fixed << std::setprecision(3)
             << (avg_s * 1.0e6) << " us"
             << "  " << std::setprecision(2) << gbps << " GB/s"
@@ -1261,49 +1491,49 @@ bool run_case(
 
 std::vector<CaseConfig> quick_suite() {
   return {
-      {"tiny_w3_no_residual", 2, 5, 128, 128, 3, 0, 0, 0, 0, 0, 4, false, false, true, false, false, false},
-      {"padded_mask_pad_loc", 7, 3, 256, 128, 4, 8, 16, 8, 8, 8, 5, false, true, true, true, true, true},
-      {"silu_no_store", 5, 4, 128, 256, 4, 0, 0, 0, 0, 0, 4, true, true, false, false, true, false},
-      {"prod_b16_q9", 16, 9, 1024, 256, 4, 0, 0, 0, 0, 0, 8, false, true, true, false, false, false},
+      {"tiny_varlen_w3_no_residual", 3, 5, 128, 128, 3, 0, 0, 0, 0, 4, false, false, true, true, false, false, false, false, false},
+      {"padded_mask_track_loc", 8, 6, 256, 128, 4, 8, 16, 8, 8, 5, false, true, true, true, true, true, true, true, true},
+      {"silu_no_store_no_update", 5, 4, 128, 256, 4, 0, 0, 0, 0, 4, true, true, false, false, false, false, true, false, false},
+      {"prod_like_varlen_small", 16, 17, 1024, 256, 4, 0, 0, 0, 0, 8, false, true, true, true, false, false, false, false, false},
   };
 }
 
-// Inkling target-verify: q = draft_token_num = 9, W = sconv_kernel_size = 4,
-// head_dim = 128, num_kv_heads = 4. dq = 128 * num_heads/tp, dkv = 128 * max(1, 4/tp).
-// hidden_size=1536 uses num_heads=12 (legal power-of-2 TP: 1,2,4); hidden_size=6144
-// uses num_heads=48 (legal TP: 1,2,4,8). Batches sized to expose real per-token work
-// while keeping host-reference times bounded.
+// Inkling extend/prefill: W=4, head_dim=128, num_kv_heads=4. dq = 128 * num_heads/tp,
+// dkv = 128 * max(1, 4/tp). Chunked prefill caps total tokens at max_prefill_tokens=16384;
+// per-seq q ranges 1..max_q from the initializer's `1 + (b*7+3) % max_q` schedule.
+// hidden_size=1536 → num_heads=12 (TP∈{1,2,4}); hidden_size=6144 → num_heads=48 (TP∈{1,2,4,8}).
 std::vector<CaseConfig> inkling_suite() {
   return {
       // hidden_size=1536 (config defaults)
-      {"verify_h1536_tp1_dq1536_dkv512",  32, 9, 1536, 512, 4, 0, 0, 0, 0, 0, 8, false, true,  true,  false, false, false},
-      {"verify_h1536_tp2_dq768_dkv256",   32, 9,  768, 256, 4, 0, 0, 0, 0, 0, 8, false, true,  true,  true,  true,  true },
-      {"verify_h1536_tp4_dq384_dkv128",   64, 9,  384, 128, 4, 0, 0, 0, 0, 0, 8, false, true,  true,  false, false, false},
+      {"extend_h1536_tp1_dq1536_dkv512",   16,  256, 1536, 512, 4, 0, 0, 0, 0, 8, false, true, true, true,  false, false, false, false, false},
+      {"extend_h1536_tp2_dq768_dkv256",    32,  128,  768, 256, 4, 0, 0, 0, 0, 8, false, true, true, true,  true,  false, true,  false, false},
+      {"extend_h1536_tp4_dq384_dkv128",    64,   96,  384, 128, 4, 0, 0, 0, 0, 8, false, true, true, true,  false, false, false, false, true },
       // hidden_size=6144 (production checkpoint)
-      {"verify_h6144_tp1_dq6144_dkv512",  32, 9, 6144, 512, 4, 0, 0, 0, 0, 0, 8, false, true,  true,  false, false, false},
-      {"verify_h6144_tp2_dq3072_dkv256",  32, 9, 3072, 256, 4, 0, 0, 0, 0, 0, 8, false, true,  true,  false, false, false},
-      {"verify_h6144_tp4_dq1536_dkv128",  64, 9, 1536, 128, 4, 0, 0, 0, 0, 0, 8, false, true,  true,  false, false, false},
-      {"verify_h6144_tp8_dq768_dkv128",  128, 9,  768, 128, 4, 0, 0, 0, 0, 0, 8, false, true,  true,  false, false, false},
-      // Behavior variants at a real shape (flagship h=1536 TP=1)
-      {"verify_h1536_silu",               16, 9, 1536, 512, 4, 0, 0, 0, 0, 0, 8, true,  true,  true,  false, false, false},
-      {"verify_h1536_no_residual",        16, 9, 1536, 512, 4, 0, 0, 0, 0, 0, 8, false, false, true,  false, false, false},
-      {"verify_h1536_no_store_swa",       16, 9, 1536, 512, 4, 0, 0, 0, 0, 0, 8, false, true,  false, false, false, true },
-      {"verify_h1536_W3",                 32, 9, 1536, 512, 3, 0, 0, 0, 0, 0, 8, false, true,  true,  false, false, false},
+      {"extend_h6144_tp1_dq6144_dkv512",    8,  256, 6144, 512, 4, 0, 0, 0, 0, 8, false, true, true, true,  false, false, false, false, false},
+      {"extend_h6144_tp2_dq3072_dkv256",   16,  256, 3072, 256, 4, 0, 0, 0, 0, 8, false, true, true, true,  false, false, false, false, false},
+      {"extend_h6144_tp4_dq1536_dkv128",   32,  256, 1536, 128, 4, 0, 0, 0, 0, 8, false, true, true, true,  false, false, false, false, false},
+      {"extend_h6144_tp8_dq768_dkv128",    64,  128,  768, 128, 4, 0, 0, 0, 0, 8, false, true, true, true,  false, false, false, false, false},
+      // Behavior variants at a real Inkling shape
+      {"extend_h1536_no_update_v2",        16,  256, 1536, 512, 4, 0, 0, 0, 0, 8, false, true, true, false, false, false, false, false, false},
+      {"extend_h1536_track",               24,  128, 1536, 512, 4, 0, 0, 0, 0, 8, false, true, true, true,  true,  true,  true,  true,  true },
+      {"extend_h1536_silu_no_residual",    16,  128, 1536, 512, 4, 0, 0, 0, 0, 8, true,  false, true, true, false, false, false, false, false},
+      {"extend_h1536_no_store_swa",        16,  128, 1536, 512, 4, 0, 0, 0, 0, 8, false, true, false, true, false, false, false, false, false},
+      {"extend_h1536_W3",                  16,  128, 1536, 512, 3, 0, 0, 0, 0, 8, false, true, true, true,  false, false, false, false, false},
   };
 }
 
-// Perf-only sweep: each case runs above the sustained working-set gate
-// (kMinSustainedTargetBytes = 32 MB) so measurements aren't dominated by L2 hits.
-// Batches are picked to hit ~64-150 MB per case at the real TP-driven dq/dkv.
+// Perf-only sweep: batch*max_q kept near max_prefill_tokens=16384 to cover the real
+// chunked prefill working set. Each case comfortably exceeds the sustained-throughput
+// gate (kMinSustainedTargetBytes = 64 MB).
 std::vector<CaseConfig> perf_suite() {
   return {
-      {"perf_h1536_tp1_dq1536_dkv512_B256",  256, 9, 1536, 512, 4, 0, 0, 0, 0, 0, 8, false, true, true, false, false, false, 350.0},
-      {"perf_h1536_tp2_dq768_dkv256_B512",   512, 9,  768, 256, 4, 0, 0, 0, 0, 0, 8, false, true, true, false, false, false, 325.0},
-      {"perf_h1536_tp4_dq384_dkv128_B1024", 1024, 9,  384, 128, 4, 0, 0, 0, 0, 0, 8, false, true, true, false, false, false, 365.0},
-      {"perf_h6144_tp1_dq6144_dkv512_B128",   128, 9, 6144, 512, 4, 0, 0, 0, 0, 0, 8, false, true, true, false, false, false, 330.0},
-      {"perf_h6144_tp2_dq3072_dkv256_B256",   256, 9, 3072, 256, 4, 0, 0, 0, 0, 0, 8, false, true, true, false, false, false, 335.0},
-      {"perf_h6144_tp4_dq1536_dkv128_B512",   512, 9, 1536, 128, 4, 0, 0, 0, 0, 0, 8, false, true, true, false, false, false, 410.0},
-      {"perf_h6144_tp8_dq768_dkv128_B1024",  1024, 9,  768, 128, 4, 0, 0, 0, 0, 0, 8, false, true, true, false, false, false, 400.0},
+      {"perf_h1536_tp1_dq1536_dkv512_B64x256",     64,  256, 1536, 512, 4, 0, 0, 0, 0, 8, false, true, true, true, false, false, false, false, false, 420.0},
+      {"perf_h1536_tp2_dq768_dkv256_B128x128",    128,  128,  768, 256, 4, 0, 0, 0, 0, 8, false, true, true, true, false, false, false, false, false, 500.0},
+      {"perf_h1536_tp4_dq384_dkv128_B256x64",     256,   64,  384, 128, 4, 0, 0, 0, 0, 8, false, true, true, true, false, false, false, false, false, 500.0},
+      {"perf_h6144_tp1_dq6144_dkv512_B32x512",     32,  512, 6144, 512, 4, 0, 0, 0, 0, 8, false, true, true, true, false, false, false, false, false, 360.0},
+      {"perf_h6144_tp2_dq3072_dkv256_B64x256",     64,  256, 3072, 256, 4, 0, 0, 0, 0, 8, false, true, true, true, false, false, false, false, false, 350.0},
+      {"perf_h6144_tp4_dq1536_dkv128_B128x128",   128,  128, 1536, 128, 4, 0, 0, 0, 0, 8, false, true, true, true, false, false, false, false, false, 420.0},
+      {"perf_h6144_tp8_dq768_dkv128_B256x64",     256,   64,  768, 128, 4, 0, 0, 0, 0, 8, false, true, true, true, false, false, false, false, false, 430.0},
   };
 }
 
@@ -1334,8 +1564,8 @@ bool parse_single_shape(std::string const& text, CaseConfig& cfg) {
     try {
       if (key == "B") {
         cfg.batch = std::stoi(value);
-      } else if (key == "q") {
-        cfg.draft_tokens = std::stoi(value);
+      } else if (key == "maxq") {
+        cfg.max_q = std::stoi(value);
       } else if (key == "dq") {
         cfg.dq = std::stoi(value);
       } else if (key == "dkv") {
@@ -1348,8 +1578,6 @@ bool parse_single_shape(std::string const& text, CaseConfig& cfg) {
         cfg.row_padding = std::stoi(value);
       } else if (key == "cachepad") {
         cfg.cache_padding = std::stoi(value);
-      } else if (key == "interpad") {
-        cfg.inter_padding = std::stoi(value);
       } else if (key == "kvpad") {
         cfg.kv_padding = std::stoi(value);
       } else if (key == "silu") {
@@ -1364,6 +1592,14 @@ bool parse_single_shape(std::string const& text, CaseConfig& cfg) {
         if (!parse_bool_value(value, cfg.do_store)) {
           return false;
         }
+      } else if (key == "update") {
+        if (!parse_bool_value(value, cfg.do_cache_update)) {
+          return false;
+        }
+      } else if (key == "track") {
+        if (!parse_bool_value(value, cfg.do_track)) {
+          return false;
+        }
       } else if (key == "pad") {
         if (!parse_bool_value(value, cfg.include_pad)) {
           return false;
@@ -1374,6 +1610,10 @@ bool parse_single_shape(std::string const& text, CaseConfig& cfg) {
         }
       } else if (key == "negloc") {
         if (!parse_bool_value(value, cfg.include_negative_loc)) {
+          return false;
+        }
+      } else if (key == "zerolen") {
+        if (!parse_bool_value(value, cfg.include_zero_length)) {
           return false;
         }
       } else if (key == "target" || key == "target_gbps" || key == "target-gbps") {
@@ -1398,10 +1638,10 @@ struct Options {
   bool target_gbps_set = false;
 };
 
-}  // namespace cutlass::examples::attn_prologue
+}  // namespace cutlass::examples::attn_prologue_extend
 
 int main(int argc, char const** argv) {
-  using namespace cutlass::examples::attn_prologue;
+  using namespace cutlass::examples::attn_prologue_extend;
 
   Options options;
   try {
@@ -1423,19 +1663,19 @@ int main(int argc, char const** argv) {
 
     if (cmd.check_cmd_line_flag("help")) {
       std::cout
-          << "Inkling target-verify attention prologue example\n\n"
+          << "Inkling extend attention prologue example\n\n"
           << "Options:\n"
           << "  --suite=<quick|inkling|perf>    Built-in shape suite (default: quick)\n"
-          << "  --shape=B=...,q=...,dq=...,dkv=...,W=...,silu=0,residual=1,store=1\n"
+          << "  --shape=B=...,maxq=...,dq=...,dkv=...,W=...,silu=0,residual=1,store=1,update=1\n"
           << "                                  Single custom shape; overrides suite\n"
           << "  --dtype=<all|bf16|fp16>         Element dtype (default: all)\n"
           << "  --iterations=<int>              Timed kernel iterations\n"
           << "  --verify=<0|1>                  Run CPU reference comparison\n"
           << "  --target-gbps=<float>           Override sustained effective GB/s gate; 0 disables\n\n"
           << "Examples:\n"
-          << "  ./examples/15_bmg_attn_prologue/15_bmg_attn_prologue_verify --suite=quick\n"
-          << "  ./examples/15_bmg_attn_prologue/15_bmg_attn_prologue_verify --suite=inkling --dtype=bf16\n"
-          << "  ./examples/15_bmg_attn_prologue/15_bmg_attn_prologue_verify --suite=perf --verify=0 --iterations=100\n";
+          << "  ./examples/15_bmg_attn_prologue/15_bmg_attn_prologue_extend --suite=quick\n"
+          << "  ./examples/15_bmg_attn_prologue/15_bmg_attn_prologue_extend --suite=inkling --dtype=bf16\n"
+          << "  ./examples/15_bmg_attn_prologue/15_bmg_attn_prologue_extend --suite=perf --verify=0 --iterations=100\n";
       return 0;
     }
   } catch (std::exception const& e) {

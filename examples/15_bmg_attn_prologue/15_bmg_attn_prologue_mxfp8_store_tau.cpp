@@ -108,6 +108,7 @@ struct CaseConfig {
   bool do_store = true;
   bool include_negative_loc = false;
   bool stress_values = false;
+  double target_gbps = 0.0;
 };
 
 template <typename Element_>
@@ -1294,6 +1295,10 @@ bool run_case(
   double flops = estimate_flops(cfg);
   double gbps = bytes / avg_s / 1.0e9;
   double tops = flops / avg_s / 1.0e12;
+  std::ostringstream target_suffix;
+  if (target_gbps > 0.0 && bytes >= kMinSustainedTargetBytes) {
+    target_suffix << " target=" << std::fixed << std::setprecision(2) << target_gbps << " GB/s";
+  }
   bool perf_passed = target_gbps <= 0.0 || bytes < kMinSustainedTargetBytes || gbps >= target_gbps;
   passed = passed && perf_passed;
 
@@ -1308,6 +1313,7 @@ bool run_case(
             << "  " << std::fixed << std::setprecision(3)
             << (avg_s * 1.0e6) << " us"
             << "  " << std::setprecision(2) << gbps << " GB/s"
+            << target_suffix.str()
             << "  " << std::setprecision(3) << tops << " TOPS"
             << "  " << (verify ? (passed ? "passed" : "FAILED") : (perf_passed ? "verification skipped" : "FAILED"))
             << "\n";
@@ -1361,13 +1367,13 @@ std::vector<CaseConfig> inkling_suite() {
 // Token counts scale to cover chunked prefill (up to 16384) and decode (long batches).
 std::vector<CaseConfig> perf_suite() {
   return {
-      {"perf_h1536_tp1_dq1536_dkv512_t8192",  8192, 1536, 512, 128, 0, 64, 16, true, true, false, false},
-      {"perf_h1536_tp2_dq768_dkv256_t16384", 16384,  768, 256, 128, 0, 64, 16, true, true, false, false},
-      {"perf_h1536_tp4_dq384_dkv128_t16384", 16384,  384, 128, 128, 0, 64, 16, true, true, false, false},
-      {"perf_h6144_tp1_dq6144_dkv512_t4096",  4096, 6144, 512, 128, 0, 64, 16, true, true, false, false},
-      {"perf_h6144_tp2_dq3072_dkv256_t8192",  8192, 3072, 256, 128, 0, 64, 16, true, true, false, false},
-      {"perf_h6144_tp4_dq1536_dkv128_t16384",16384, 1536, 128, 128, 0, 64, 16, true, true, false, false},
-      {"perf_h6144_tp8_dq768_dkv128_t16384", 16384,  768, 128, 128, 0, 64, 16, true, true, false, false},
+      {"perf_h1536_tp1_dq1536_dkv512_t8192",  8192, 1536, 512, 128, 0, 64, 16, true, true, false, false, 135.0},
+      {"perf_h1536_tp2_dq768_dkv256_t16384", 16384,  768, 256, 128, 0, 64, 16, true, true, false, false, 140.0},
+      {"perf_h1536_tp4_dq384_dkv128_t16384", 16384,  384, 128, 128, 0, 64, 16, true, true, false, false, 140.0},
+      {"perf_h6144_tp1_dq6144_dkv512_t4096",  4096, 6144, 512, 128, 0, 64, 16, true, true, false, false, 140.0},
+      {"perf_h6144_tp2_dq3072_dkv256_t8192",  8192, 3072, 256, 128, 0, 64, 16, true, true, false, false, 145.0},
+      {"perf_h6144_tp4_dq1536_dkv128_t16384",16384, 1536, 128, 128, 0, 64, 16, true, true, false, false, 130.0},
+      {"perf_h6144_tp8_dq768_dkv128_t16384", 16384,  768, 128, 128, 0, 64, 16, true, true, false, false, 130.0},
   };
 }
 
@@ -1424,6 +1430,8 @@ bool parse_single_shape(std::string const& text, CaseConfig& cfg) {
         if (!parse_bool_value(value, cfg.stress_values)) {
           return false;
         }
+      } else if (key == "target" || key == "target_gbps" || key == "target-gbps") {
+        cfg.target_gbps = std::stod(value);
       } else {
         return false;
       }
@@ -1441,6 +1449,7 @@ struct Options {
   bool verify = true;
   int iterations = 20;
   double target_gbps = 0.0;
+  bool target_gbps_set = false;
 };
 
 }  // namespace cutlass::examples::attn_prologue_mxfp8
@@ -1463,6 +1472,7 @@ int main(int argc, char const** argv) {
     cmd.get_cmd_line_argument("verify", verify_int, 1);
     options.verify = verify_int != 0;
     cmd.get_cmd_line_argument("iterations", options.iterations, 20);
+    options.target_gbps_set = cmd.check_cmd_line_flag("target-gbps");
     cmd.get_cmd_line_argument("target-gbps", options.target_gbps, 0.0);
 
     if (cmd.check_cmd_line_flag("help")) {
@@ -1475,7 +1485,7 @@ int main(int argc, char const** argv) {
           << "  --dtype=<all|bf16|fp16>         Element dtype (default: all)\n"
           << "  --iterations=<int>              Timed kernel iterations\n"
           << "  --verify=<0|1>                  Run CPU reference comparison\n"
-          << "  --target-gbps=<float>           Optional sustained effective GB/s gate\n\n"
+          << "  --target-gbps=<float>           Override sustained effective GB/s gate; 0 disables\n\n"
           << "Examples:\n"
           << "  ./examples/15_bmg_attn_prologue/15_bmg_attn_prologue_mxfp8_store_tau --suite=quick\n"
           << "  ./examples/15_bmg_attn_prologue/15_bmg_attn_prologue_mxfp8_store_tau --suite=inkling --dtype=bf16\n"
@@ -1518,13 +1528,14 @@ int main(int argc, char const** argv) {
 
     bool all_passed = true;
     for (auto const& cfg : cases) {
+      double target_gbps = options.target_gbps_set ? options.target_gbps : cfg.target_gbps;
       if (options.dtype == DType::kAll || options.dtype == DType::kBf16) {
         all_passed &= run_case<cutlass::bfloat16_t>(
-            q, cfg, options.iterations, options.verify, options.target_gbps);
+            q, cfg, options.iterations, options.verify, target_gbps);
       }
       if (options.dtype == DType::kAll || options.dtype == DType::kFp16) {
         all_passed &= run_case<cutlass::half_t>(
-            q, cfg, options.iterations, options.verify, options.target_gbps);
+            q, cfg, options.iterations, options.verify, target_gbps);
       }
     }
     return all_passed ? 0 : -1;
