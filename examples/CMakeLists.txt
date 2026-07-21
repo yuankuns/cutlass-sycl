@@ -134,6 +134,7 @@ if (CUTLASS_ENABLE_SYCL)
       18_bmg_relative_helpers
       19_bmg_comm_ar_sconv
       20_bmg_dflash
+      21_bmg_quantization
       22_bmg_hmlp
       50_xe35_block_scaled_gemm
       51_xe35_block_scaled_grouped_gemm
