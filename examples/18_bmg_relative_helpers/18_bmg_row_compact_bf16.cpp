@@ -27,12 +27,33 @@ std::vector<relh::RowCase> quick_suite() {
   };
 }
 
+// row_compact_bf16 is Inkling's strided-to-contiguous helper on the r operand
+// of RelLogitsProj._project (attn.py:158-161). It fires when T > 48 (past the
+// zero-copy strided GEMM band) so the following einsum runs on a contiguous r.
+// Shape: rows=T, inner = h_tp * d_rel, stride = qkvr row width
+//   = h_tp*head_dim + 2*kv_tp*head_dim + h_tp*d_rel.
+// Real T floors: T > 48 → cover 64 (band entry), 2048 (mid-prefill),
+// 16384 (max_prefill_tokens). Per-rank shapes at both shipped configs.
 std::vector<relh::RowCase> inkling_suite() {
   return {
-      {"inkling_t64_h16_d16", 64, 256, 320, 0.0},
-      {"inkling_t2048_h16_d16", 2048, 256, 320, 0.0},
-      {"inkling_t16k_h16_d16", 16384, 256, 320, 0.0},
-      {"inkling_tail_inner", 4096, 257, 320, 0.0},
+      // Config defaults (hidden=1536, h=12, kv=4).
+      {"cfg_tp2_t64",     64,  6*16,  6*128 + 2*2*128 +  6*16, 0.0},
+      {"cfg_tp4_t64",     64,  3*16,  3*128 + 2*1*128 +  3*16, 0.0},
+      {"cfg_tp2_t2k",   2048,  6*16,  6*128 + 2*2*128 +  6*16, 0.0},
+      {"cfg_tp4_t2k",   2048,  3*16,  3*128 + 2*1*128 +  3*16, 0.0},
+      {"cfg_tp2_t16k", 16384,  6*16,  6*128 + 2*2*128 +  6*16, 0.0},
+      {"cfg_tp4_t16k", 16384,  3*16,  3*128 + 2*1*128 +  3*16, 0.0},
+
+      // Production (hidden=6144, h=48, kv=4).
+      {"prod_tp2_t64",    64, 24*16, 24*128 + 2*2*128 + 24*16, 0.0},
+      {"prod_tp4_t64",    64, 12*16, 12*128 + 2*1*128 + 12*16, 0.0},
+      {"prod_tp8_t64",    64,  6*16,  6*128 + 2*1*128 +  6*16, 0.0},
+      {"prod_tp2_t2k",  2048, 24*16, 24*128 + 2*2*128 + 24*16, 0.0},
+      {"prod_tp4_t2k",  2048, 12*16, 12*128 + 2*1*128 + 12*16, 0.0},
+      {"prod_tp8_t2k",  2048,  6*16,  6*128 + 2*1*128 +  6*16, 0.0},
+      {"prod_tp2_t16k",16384, 24*16, 24*128 + 2*2*128 + 24*16, 0.0},
+      {"prod_tp4_t16k",16384, 12*16, 12*128 + 2*1*128 + 12*16, 0.0},
+      {"prod_tp8_t16k",16384,  6*16,  6*128 + 2*1*128 +  6*16, 0.0},
   };
 }
 
@@ -41,6 +62,11 @@ std::vector<relh::RowCase> perf_suite() {
       {"perf_64k_x256", 65536, 256, 256, 350.0},
       {"perf_64k_x256_strided", 65536, 256, 320, 340.0},
       {"perf_32k_x1024", 32768, 1024, 1024, 350.0},
+
+      // Per-rank strided-to-contiguous compact at production T = 16384.
+      {"perf_prod_tp2_t16k", 16384, 24*16, 24*128 + 2*2*128 + 24*16, 0.0},
+      {"perf_prod_tp4_t16k", 16384, 12*16, 12*128 + 2*1*128 + 12*16, 0.0},
+      {"perf_prod_tp8_t16k", 16384,  6*16,  6*128 + 2*1*128 +  6*16, 0.0},
   };
 }
 

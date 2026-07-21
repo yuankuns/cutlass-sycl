@@ -942,12 +942,14 @@ struct RowHostTensors {
 };
 
 template <typename Element>
-RowHostTensors<Element> initialize_row_case(RowCase const& cfg, bool has_tau, uint32_t seed) {
+RowHostTensors<Element> initialize_row_case(
+    RowCase const& cfg,
+    bool has_tau,
+    bool build_reference,
+    uint32_t seed) {
   RowHostTensors<Element> h;
   h.x.resize(static_cast<std::size_t>(cfg.rows) * cfg.stride);
   h.tau.resize(static_cast<std::size_t>(cfg.rows));
-  h.out.resize(static_cast<std::size_t>(cfg.rows) * cfg.inner);
-  h.ref.resize(h.out.size());
 
   std::mt19937 gen(seed);
   std::uniform_real_distribution<float> value_dist(-0.75f, 0.75f);
@@ -958,16 +960,21 @@ RowHostTensors<Element> initialize_row_case(RowCase const& cfg, bool has_tau, ui
   for (float& t : h.tau) {
     t = tau_dist(gen);
   }
-  std::fill(h.out.begin(), h.out.end(), from_float<Element>(0.0f));
 
-  for (int row = 0; row < cfg.rows; ++row) {
-    float scale = h.tau[row];
-    for (int col = 0; col < cfg.inner; ++col) {
-      Element value = h.x[static_cast<std::size_t>(row) * cfg.stride + col];
-      if (has_tau) {
-        value = from_float<Element>(to_float(value) * scale);
+  if (build_reference) {
+    h.out.resize(static_cast<std::size_t>(cfg.rows) * cfg.inner);
+    h.ref.resize(h.out.size());
+    std::fill(h.out.begin(), h.out.end(), from_float<Element>(0.0f));
+
+    for (int row = 0; row < cfg.rows; ++row) {
+      float scale = h.tau[row];
+      for (int col = 0; col < cfg.inner; ++col) {
+        Element value = h.x[static_cast<std::size_t>(row) * cfg.stride + col];
+        if (has_tau) {
+          value = from_float<Element>(to_float(value) * scale);
+        }
+        h.ref[static_cast<std::size_t>(row) * cfg.inner + col] = value;
       }
-      h.ref[static_cast<std::size_t>(row) * cfg.inner + col] = value;
     }
   }
   return h;
@@ -983,7 +990,10 @@ struct RelHostTensors {
 };
 
 template <typename Element>
-RelHostTensors<Element> initialize_rel_case(RelProjCase const& cfg, uint32_t seed) {
+RelHostTensors<Element> initialize_rel_case(
+    RelProjCase const& cfg,
+    bool build_reference,
+    uint32_t seed) {
   RelHostTensors<Element> h;
   std::size_t proj_count = static_cast<std::size_t>(cfg.proj_per_head ? cfg.h : 1) * cfg.d * cfg.e;
   std::size_t tau_count = 0;
@@ -996,8 +1006,6 @@ RelHostTensors<Element> initialize_rel_case(RelProjCase const& cfg, uint32_t see
   h.r.resize(static_cast<std::size_t>(cfg.t) * cfg.r_stride_t);
   h.proj.resize(proj_count);
   h.tau.resize(std::max<std::size_t>(tau_count, 1), 1.0f);
-  h.out.resize(static_cast<std::size_t>(cfg.t) * cfg.h * cfg.e);
-  h.ref.resize(h.out.size());
 
   std::mt19937 gen(seed);
   std::uniform_real_distribution<float> value_dist(-0.45f, 0.45f);
@@ -1011,33 +1019,38 @@ RelHostTensors<Element> initialize_rel_case(RelProjCase const& cfg, uint32_t see
   for (std::size_t i = 0; i < tau_count; ++i) {
     h.tau[i] = tau_dist(gen);
   }
-  std::fill(h.out.begin(), h.out.end(), from_float<Element>(0.0f));
 
-  for (int ti = 0; ti < cfg.t; ++ti) {
-    for (int hi = 0; hi < cfg.h; ++hi) {
-      float scale = 1.0f;
-      if (cfg.tau_mode == kTauPreToken || cfg.tau_mode == kTauPostToken) {
-        scale = h.tau[ti];
-      } else if (cfg.tau_mode == kTauPreRow || cfg.tau_mode == kTauPostRow) {
-        scale = h.tau[static_cast<std::size_t>(ti) * cfg.h + hi];
-      }
-      for (int e_col = 0; e_col < cfg.e; ++e_col) {
-        float acc = 0.0f;
-        for (int d = 0; d < cfg.d; ++d) {
-          float rv = to_float(h.r[static_cast<std::size_t>(ti) * cfg.r_stride_t + hi * cfg.d + d]);
-          if (cfg.tau_mode == kTauPreToken || cfg.tau_mode == kTauPreRow) {
-            rv = to_float(from_float<Element>(rv * scale));
-          }
-          std::size_t proj_offset = static_cast<std::size_t>(d) * cfg.e + e_col;
-          if (cfg.proj_per_head) {
-            proj_offset += static_cast<std::size_t>(hi) * cfg.d * cfg.e;
-          }
-          acc += rv * to_float(h.proj[proj_offset]);
+  if (build_reference) {
+    h.out.resize(static_cast<std::size_t>(cfg.t) * cfg.h * cfg.e);
+    h.ref.resize(h.out.size());
+    std::fill(h.out.begin(), h.out.end(), from_float<Element>(0.0f));
+
+    for (int ti = 0; ti < cfg.t; ++ti) {
+      for (int hi = 0; hi < cfg.h; ++hi) {
+        float scale = 1.0f;
+        if (cfg.tau_mode == kTauPreToken || cfg.tau_mode == kTauPostToken) {
+          scale = h.tau[ti];
+        } else if (cfg.tau_mode == kTauPreRow || cfg.tau_mode == kTauPostRow) {
+          scale = h.tau[static_cast<std::size_t>(ti) * cfg.h + hi];
         }
-        if (cfg.tau_mode == kTauPostToken || cfg.tau_mode == kTauPostRow) {
-          acc *= scale;
+        for (int e_col = 0; e_col < cfg.e; ++e_col) {
+          float acc = 0.0f;
+          for (int d = 0; d < cfg.d; ++d) {
+            float rv = to_float(h.r[static_cast<std::size_t>(ti) * cfg.r_stride_t + hi * cfg.d + d]);
+            if (cfg.tau_mode == kTauPreToken || cfg.tau_mode == kTauPreRow) {
+              rv = to_float(from_float<Element>(rv * scale));
+            }
+            std::size_t proj_offset = static_cast<std::size_t>(d) * cfg.e + e_col;
+            if (cfg.proj_per_head) {
+              proj_offset += static_cast<std::size_t>(hi) * cfg.d * cfg.e;
+            }
+            acc += rv * to_float(h.proj[proj_offset]);
+          }
+          if (cfg.tau_mode == kTauPostToken || cfg.tau_mode == kTauPostRow) {
+            acc *= scale;
+          }
+          h.ref[(static_cast<std::size_t>(ti) * cfg.h + hi) * cfg.e + e_col] = from_float<Element>(acc);
         }
-        h.ref[(static_cast<std::size_t>(ti) * cfg.h + hi) * cfg.e + e_col] = from_float<Element>(acc);
       }
     }
   }
@@ -1052,14 +1065,20 @@ bool run_row_case(
     char const* op_name) {
   validate_row_case(cfg);
   RowHostTensors<Element> h = initialize_row_case<Element>(
-      cfg, HasTau, 1337u + static_cast<uint32_t>(cfg.rows * 13 + cfg.inner * 17 + cfg.stride));
+      cfg,
+      HasTau,
+      options.verify,
+      1337u + static_cast<uint32_t>(cfg.rows * 13 + cfg.inner * 17 + cfg.stride));
+  std::size_t out_count = static_cast<std::size_t>(cfg.rows) * cfg.inner;
 
   DeviceBuffer<Element> d_x(queue, h.x.size());
   DeviceBuffer<float> d_tau(queue, h.tau.size());
-  DeviceBuffer<Element> d_out(queue, h.out.size());
+  DeviceBuffer<Element> d_out(queue, out_count);
   d_x.copy_from(h.x);
   d_tau.copy_from(h.tau);
-  d_out.copy_from(h.out);
+  if (options.verify) {
+    d_out.copy_from(h.out);
+  }
 
   RowParams<Element> params{};
   params.x = d_x.get();
@@ -1153,16 +1172,21 @@ template <typename Element>
 bool run_rel_case(sycl::queue& queue, RelProjCase cfg, Options const& options) {
   validate_rel_case(cfg);
   RelHostTensors<Element> h = initialize_rel_case<Element>(
-      cfg, 2027u + static_cast<uint32_t>(cfg.t * 19 + cfg.h * 23 + cfg.d * 29 + cfg.e));
+      cfg,
+      options.verify,
+      2027u + static_cast<uint32_t>(cfg.t * 19 + cfg.h * 23 + cfg.d * 29 + cfg.e));
+  std::size_t out_count = static_cast<std::size_t>(cfg.t) * cfg.h * cfg.e;
 
   DeviceBuffer<Element> d_r(queue, h.r.size());
   DeviceBuffer<Element> d_proj(queue, h.proj.size());
   DeviceBuffer<float> d_tau(queue, h.tau.size());
-  DeviceBuffer<Element> d_out(queue, h.out.size());
+  DeviceBuffer<Element> d_out(queue, out_count);
   d_r.copy_from(h.r);
   d_proj.copy_from(h.proj);
   d_tau.copy_from(h.tau);
-  d_out.copy_from(h.out);
+  if (options.verify) {
+    d_out.copy_from(h.out);
+  }
 
   RelProjParams<Element> params{};
   params.r = d_r.get();

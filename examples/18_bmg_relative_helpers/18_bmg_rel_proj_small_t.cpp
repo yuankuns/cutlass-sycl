@@ -32,13 +32,47 @@ std::vector<relh::RelProjCase> quick_suite() {
   };
 }
 
+// Inkling rel_proj_small_t is only reached inside the tau-fused small-t band
+// (T <= _REL_PROJ_TAU_KERNEL_MAX_T = 32); real invocations are:
+//   * decode: T = 1
+//   * target-verify: T = draft_token_num = 9
+//   * extend head/tail into the small band: T = 32
+// Every real call passes d_rel = 16 and e = rel_extent = 1024 (local layers use
+// local_extent = sliding_window_size = 512). Per-rank head geometry:
+//   config defaults (hidden=1536): H = 12/6/3 for TP=1/2/4 (TP=8 skipped, 12%8)
+//   production      (hidden=6144): H = 48/24/12/6 for TP=1/2/4/8
+// r is a strided view into the packed [q||k||v||r] qkvr row, so r_stride_t is
+// the whole qkvr row width per token: h*head_dim + 2*kv*head_dim + h*d_rel.
 std::vector<relh::RelProjCase> inkling_suite() {
   return {
-      {"inkling_decode_t1", 1, 16, 16, 1024, 256, false, relh::kTauPreToken, 0.0},
-      {"inkling_decode_t16", 16, 16, 16, 1024, 256, false, relh::kTauPreToken, 0.0},
-      {"inkling_small_t_limit", 32, 16, 16, 1024, 256, false, relh::kTauPreToken, 0.0},
-      {"inkling_strided_rows", 32, 16, 16, 1024, 320, false, relh::kTauPreToken, 0.0},
-      {"inkling_no_tau", 32, 16, 16, 1024, 256, false, relh::kTauNone, 0.0},
+      // Config defaults, decode T=1.
+      {"cfg_tp1_decode_t1",     1, 12, 16, 1024, 12*128 + 2*4*128 + 12*16, false, relh::kTauPreToken, 0.0},
+      {"cfg_tp2_decode_t1",     1,  6, 16, 1024,  6*128 + 2*2*128 +  6*16, false, relh::kTauPreToken, 0.0},
+      {"cfg_tp4_decode_t1",     1,  3, 16, 1024,  3*128 + 2*1*128 +  3*16, false, relh::kTauPreToken, 0.0},
+      // Config defaults, target-verify T=9 (draft_token_num).
+      {"cfg_tp2_verify_t9",     9,  6, 16, 1024,  6*128 + 2*2*128 +  6*16, false, relh::kTauPreToken, 0.0},
+      {"cfg_tp4_verify_t9",     9,  3, 16, 1024,  3*128 + 2*1*128 +  3*16, false, relh::kTauPreToken, 0.0},
+      // Config defaults, small-t band max T=32.
+      {"cfg_tp2_extend_t32",   32,  6, 16, 1024,  6*128 + 2*2*128 +  6*16, false, relh::kTauPreToken, 0.0},
+      {"cfg_tp4_extend_t32",   32,  3, 16, 1024,  3*128 + 2*1*128 +  3*16, false, relh::kTauPreToken, 0.0},
+
+      // Production, decode T=1.
+      {"prod_tp1_decode_t1",    1, 48, 16, 1024, 48*128 + 2*4*128 + 48*16, false, relh::kTauPreToken, 0.0},
+      {"prod_tp2_decode_t1",    1, 24, 16, 1024, 24*128 + 2*2*128 + 24*16, false, relh::kTauPreToken, 0.0},
+      {"prod_tp4_decode_t1",    1, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 0.0},
+      {"prod_tp8_decode_t1",    1,  6, 16, 1024,  6*128 + 2*1*128 +  6*16, false, relh::kTauPreToken, 0.0},
+      // Production, target-verify T=9.
+      {"prod_tp2_verify_t9",    9, 24, 16, 1024, 24*128 + 2*2*128 + 24*16, false, relh::kTauPreToken, 0.0},
+      {"prod_tp4_verify_t9",    9, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 0.0},
+      {"prod_tp8_verify_t9",    9,  6, 16, 1024,  6*128 + 2*1*128 +  6*16, false, relh::kTauPreToken, 0.0},
+      // Production, small-t band max T=32.
+      {"prod_tp2_extend_t32",  32, 24, 16, 1024, 24*128 + 2*2*128 + 24*16, false, relh::kTauPreToken, 0.0},
+      {"prod_tp4_extend_t32",  32, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 0.0},
+      {"prod_tp8_extend_t32",  32,  6, 16, 1024,  6*128 + 2*1*128 +  6*16, false, relh::kTauPreToken, 0.0},
+
+      // Tau OFF path still lands in the kernel when the caller opts out of
+      // fused-tau (SGLANG_OPT_USE_INKLING_FUSED_LOG_TAU=0); cover it at prod TP=4.
+      {"prod_tp4_no_tau_t9",    9, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, relh::kTauNone,     0.0},
   };
 }
 
@@ -47,6 +81,11 @@ std::vector<relh::RelProjCase> perf_suite() {
       {"perf_t1_h16_d16_e1024", 1, 16, 16, 1024, 256, false, relh::kTauPreToken, 0.0},
       {"perf_t16_h16_d16_e1024", 16, 16, 16, 1024, 256, false, relh::kTauPreToken, 0.0},
       {"perf_t32_h16_d16_e1024", 32, 16, 16, 1024, 256, false, relh::kTauPreToken, 0.0},
+
+      // Production per-rank shapes at T=32 (the tau-fused band's max T).
+      {"perf_prod_tp2_t32", 32, 24, 16, 1024, 24*128 + 2*2*128 + 24*16, false, relh::kTauPreToken, 0.0},
+      {"perf_prod_tp4_t32", 32, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 0.0},
+      {"perf_prod_tp8_t32", 32,  6, 16, 1024,  6*128 + 2*1*128 +  6*16, false, relh::kTauPreToken, 0.0},
   };
 }
 

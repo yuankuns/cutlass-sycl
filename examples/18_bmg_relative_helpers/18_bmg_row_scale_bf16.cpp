@@ -27,12 +27,51 @@ std::vector<relh::RowCase> quick_suite() {
   };
 }
 
+// row_scale_bf16 is Inkling's per-token log-scaling helper (log_scaling_tau.py).
+// It runs in two positions:
+//   (a) prescale the r operand of RelLogitsProj outside the small-t kernel
+//       band (T > 32). Shape: rows=T, inner = h_tp*d_rel, stride = qkvr row
+//       width (h_tp*head_dim + 2*kv_tp*head_dim + h_tp*d_rel).
+//   (b) post-scale the projected rel logits when the fused-tau flag is off.
+//       Shape: rows=T, inner = h_tp*rel_extent, contiguous.
+// Configs (see [[inkling_model_shapes]]):
+//   config defaults hidden=1536 -> h=12, kv=4  |  h_tp = 12/6/3 (TP=1/2/4)
+//   production       hidden=6144 -> h=48, kv=4  |  h_tp = 48/24/12/6 (TP=1/2/4/8)
+// A prefill chunk in Inkling caps at max_prefill_tokens=16384, so pick T at the
+// upper end of the "t > 32" band (T = 16384) plus a mid-band T = 2048.
 std::vector<relh::RowCase> inkling_suite() {
   return {
-      {"inkling_t1_h16_d16", 1, 256, 256, 0.0},
-      {"inkling_t32_h16_d16", 32, 256, 256, 0.0},
-      {"inkling_t2048_strided", 2048, 256, 320, 0.0},
-      {"inkling_tail_inner", 4096, 257, 320, 0.0},
+      // (a) prescale r-operand path (strided from qkvr), T just above small-t band.
+      {"cfg_tp2_rop_t64",    64,  6*16,  6*128 + 2*2*128 +  6*16, 0.0},
+      {"cfg_tp4_rop_t64",    64,  3*16,  3*128 + 2*1*128 +  3*16, 0.0},
+      {"prod_tp2_rop_t64",   64, 24*16, 24*128 + 2*2*128 + 24*16, 0.0},
+      {"prod_tp4_rop_t64",   64, 12*16, 12*128 + 2*1*128 + 12*16, 0.0},
+      {"prod_tp8_rop_t64",   64,  6*16,  6*128 + 2*1*128 +  6*16, 0.0},
+
+      // (a) prescale r-operand at prefill mid-chunk T = 2048.
+      {"cfg_tp2_rop_t2k",   2048,  6*16,  6*128 + 2*2*128 +  6*16, 0.0},
+      {"prod_tp2_rop_t2k",  2048, 24*16, 24*128 + 2*2*128 + 24*16, 0.0},
+      {"prod_tp4_rop_t2k",  2048, 12*16, 12*128 + 2*1*128 + 12*16, 0.0},
+      {"prod_tp8_rop_t2k",  2048,  6*16,  6*128 + 2*1*128 +  6*16, 0.0},
+
+      // (a) prescale r-operand at the max_prefill_tokens=16384 chunk cap.
+      {"prod_tp2_rop_t16k",16384, 24*16, 24*128 + 2*2*128 + 24*16, 0.0},
+      {"prod_tp4_rop_t16k",16384, 12*16, 12*128 + 2*1*128 + 12*16, 0.0},
+      {"prod_tp8_rop_t16k",16384,  6*16,  6*128 + 2*1*128 +  6*16, 0.0},
+
+      // (b) post-scale rel-logits path, contiguous inner = h_tp * rel_extent.
+      // Cover TP=2/4/8 at decode T=1, target-verify T=9, and prefill T=2048.
+      {"cfg_tp2_post_t1",       1,  6*1024,  6*1024, 0.0},
+      {"cfg_tp4_post_t9",       9,  3*1024,  3*1024, 0.0},
+      {"prod_tp2_post_t1",      1, 24*1024, 24*1024, 0.0},
+      {"prod_tp4_post_t9",      9, 12*1024, 12*1024, 0.0},
+      {"prod_tp8_post_t9",      9,  6*1024,  6*1024, 0.0},
+      {"prod_tp2_post_t2k",  2048, 24*1024, 24*1024, 0.0},
+      {"prod_tp4_post_t2k",  2048, 12*1024, 12*1024, 0.0},
+      {"prod_tp8_post_t2k",  2048,  6*1024,  6*1024, 0.0},
+
+      // Local-layer variant: rel_extent = local_extent = sliding_window_size = 512.
+      {"prod_tp4_local_post_t2k", 2048, 12*512, 12*512, 0.0},
   };
 }
 
@@ -41,6 +80,16 @@ std::vector<relh::RowCase> perf_suite() {
       {"perf_64k_x256", 65536, 256, 256, 350.0},
       {"perf_64k_x256_strided", 65536, 256, 320, 340.0},
       {"perf_32k_x1024", 32768, 1024, 1024, 350.0},
+
+      // Post-scale rel-logits at production T = 16384 across TP=2/4/8.
+      {"perf_prod_tp2_post_t16k", 16384, 24*1024, 24*1024, 0.0},
+      {"perf_prod_tp4_post_t16k", 16384, 12*1024, 12*1024, 0.0},
+      {"perf_prod_tp8_post_t16k", 16384,  6*1024,  6*1024, 0.0},
+
+      // Prescale r-operand at production T = 16384 across TP=2/4/8 (strided).
+      {"perf_prod_tp2_rop_t16k", 16384, 24*16, 24*128 + 2*2*128 + 24*16, 0.0},
+      {"perf_prod_tp4_rop_t16k", 16384, 12*16, 12*128 + 2*1*128 + 12*16, 0.0},
+      {"perf_prod_tp8_rop_t16k", 16384,  6*16,  6*128 + 2*1*128 +  6*16, 0.0},
   };
 }
 
