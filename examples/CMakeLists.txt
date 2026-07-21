@@ -136,6 +136,7 @@ if (CUTLASS_ENABLE_SYCL)
       20_bmg_dflash
       21_bmg_quantization
       22_bmg_hmlp
+      23_bmg_mel_embedding_sum
       50_xe35_block_scaled_gemm
       51_xe35_block_scaled_grouped_gemm
       )
