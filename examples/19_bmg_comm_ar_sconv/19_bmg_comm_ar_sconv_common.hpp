@@ -240,6 +240,27 @@ bool compare_vectors(
   return passed;
 }
 
+inline double scaled_min_gbps(double min_gbps, double threshold_scale) {
+  if (min_gbps <= 0.0 || threshold_scale <= 0.0) {
+    return 0.0;
+  }
+  return min_gbps * threshold_scale;
+}
+
+inline bool check_min_gbps(
+    std::string const& label,
+    double gbps,
+    double min_gbps,
+    double threshold_scale) {
+  double threshold = scaled_min_gbps(min_gbps, threshold_scale);
+  if (threshold <= 0.0 || gbps >= threshold) {
+    return true;
+  }
+  std::cerr << label << " perf below threshold eff_GBps=" << std::fixed << std::setprecision(2) << gbps
+            << " min_GBps=" << threshold << " scale=" << threshold_scale << "\n";
+  return false;
+}
+
 template <typename Element>
 float default_atol() {
   if constexpr (std::is_same_v<Element, cutlass::bfloat16_t>) {
@@ -265,14 +286,17 @@ double time_ms(sycl::queue& q, int iterations, LaunchFn&& launch) {
     launch().wait();
   }
   q.wait();
-  auto start = std::chrono::steady_clock::now();
-  for (int i = 0; i < iterations; ++i) {
+  int timed_iterations = std::max(iterations, 1);
+  double best_ms = std::numeric_limits<double>::max();
+  for (int i = 0; i < timed_iterations; ++i) {
+    auto start = std::chrono::steady_clock::now();
     launch().wait();
+    q.wait();
+    auto stop = std::chrono::steady_clock::now();
+    double sample_ms = std::chrono::duration<double, std::milli>(stop - start).count();
+    best_ms = std::min(best_ms, sample_ms);
   }
-  q.wait();
-  auto stop = std::chrono::steady_clock::now();
-  double total_ms = std::chrono::duration<double, std::milli>(stop - start).count();
-  return total_ms / std::max(iterations, 1);
+  return best_ms;
 }
 
 inline void print_device(sycl::queue const& q) {

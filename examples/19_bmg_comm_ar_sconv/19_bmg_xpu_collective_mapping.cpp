@@ -37,6 +37,7 @@ struct Options {
   DType dtype = DType::kAll;
   int iterations = 5;
   bool verify = true;
+  double perf_threshold_scale = 1.0;
 };
 
 struct CaseConfig {
@@ -45,6 +46,7 @@ struct CaseConfig {
   int rows = 0;
   int cols = 0;
   int parts = 4;
+  double min_gbps = 0.0;
 };
 
 template <typename Element_>
@@ -246,10 +248,38 @@ std::vector<CaseConfig> stress_suite() {
 }
 
 std::vector<CaseConfig> perf_suite() {
+  // The mapping validates the scattered_sconv comm contract (all-reduce +
+  // reduce-scatter/all-gather round-trip). Cover both shipped Inkling
+  // configurations at TP=2/4/8 and the two decode bands (T=96 max decode,
+  // T=144 target-verify) that the fused kernels actually consume.
   return {
-      {"perf_world4_rows4096_cols1536_parts4", 4, 4096, 1536, 4},
-      {"perf_world8_rows4096_cols768_parts8", 8, 4096, 768, 8},
-      {"perf_world8_rows2048_cols1536_parts8", 8, 2048, 1536, 8},
+      // 4k-token prefill chunk, config defaults (cols = hidden_size = 1536).
+      // parts = tp so the reduce-scatter shards hidden by tp exactly.
+      {"perf_world2_rows4096_cols1536_parts2", 2, 4096, 1536, 2, 200.0},
+      {"perf_world4_rows4096_cols1536_parts4", 4, 4096, 1536, 4, 80.0},
+      {"perf_world8_rows4096_cols1536_parts8", 8, 4096, 1536, 8, 110.0},
+
+      // Same chunk at production hidden=6144.
+      {"perf_world2_rows4096_cols6144_parts2", 2, 4096, 6144, 2, 100.0},
+      {"perf_world4_rows4096_cols6144_parts4", 4, 4096, 6144, 4, 100.0},
+      {"perf_world8_rows4096_cols6144_parts8", 8, 4096, 6144, 8, 100.0},
+
+      // Decode band (T=96 max decode rows) at both configs across TP=2/4/8.
+      {"perf_decode_world2_rows96_cols1536_parts2", 2, 96, 1536, 2, 70.0},
+      {"perf_decode_world4_rows96_cols1536_parts4", 4, 96, 1536, 4, 90.0},
+      {"perf_decode_world8_rows96_cols1536_parts8", 8, 96, 1536, 8, 130.0},
+      {"perf_decode_world2_rows96_cols6144_parts2", 2, 96, 6144, 2, 200.0},
+      {"perf_decode_world4_rows96_cols6144_parts4", 4, 96, 6144, 4, 230.0},
+      {"perf_decode_world8_rows96_cols6144_parts8", 8, 96, 6144, 8, 270.0},
+
+      // Target-verify band (T=144 = bs=16 * draft_token_num=9) at both
+      // configs across TP=2/4/8.
+      {"perf_verify_world2_rows144_cols1536_parts2", 2, 144, 1536, 2, 90.0},
+      {"perf_verify_world4_rows144_cols1536_parts4", 4, 144, 1536, 4, 120.0},
+      {"perf_verify_world8_rows144_cols1536_parts8", 8, 144, 1536, 8, 160.0},
+      {"perf_verify_world2_rows144_cols6144_parts2", 2, 144, 6144, 2, 230.0},
+      {"perf_verify_world4_rows144_cols6144_parts4", 4, 144, 6144, 4, 280.0},
+      {"perf_verify_world8_rows144_cols6144_parts8", 8, 144, 6144, 8, 320.0},
   };
 }
 
@@ -304,11 +334,14 @@ bool run_case(sycl::queue& q, CaseConfig const& cfg, Options const& options) {
 
   double ms = time_ms(q, options.iterations, launch);
   double gbps = effective_bytes<Element>(cfg) / (ms * 1.0e6);
+  std::string perf_label = cfg.name + "/" + element_dtype_text<Element>();
+  passed &= check_min_gbps(perf_label, gbps, cfg.min_gbps, options.perf_threshold_scale);
+  double min_gbps = scaled_min_gbps(cfg.min_gbps, options.perf_threshold_scale);
   std::cout << "[xpu_collective_mapping] " << std::left << std::setw(38) << cfg.name << " dtype=" << std::setw(4)
             << element_dtype_text<Element>() << " world=" << cfg.world << " rows=" << cfg.rows
             << " cols=" << cfg.cols << " parts=" << cfg.parts << " time_ms=" << std::fixed
-            << std::setprecision(4) << ms << " eff_GBps=" << std::setprecision(2) << gbps << " "
-            << (passed ? "PASSED" : "FAILED") << "\n";
+            << std::setprecision(4) << ms << " eff_GBps=" << std::setprecision(2) << gbps
+            << " min_GBps=" << min_gbps << " " << (passed ? "PASSED" : "FAILED") << "\n";
   return passed;
 }
 
@@ -334,7 +367,8 @@ void print_usage(char const* name) {
             << "  --suite=<quick|stress|perf>\n"
             << "  --dtype=<all|bf16|fp16>\n"
             << "  --iterations=<int>\n"
-            << "  --verify=<0|1>\n";
+            << "  --verify=<0|1>\n"
+            << "  --perf-threshold-scale=<float> (0 disables perf thresholds)\n";
 }
 
 }  // namespace cutlass::examples::comm_ar_sconv
@@ -346,6 +380,7 @@ int main(int argc, char const** argv) {
   Options options;
   cmd.get_cmd_line_argument("suite", options.suite, options.suite);
   cmd.get_cmd_line_argument("iterations", options.iterations, options.iterations);
+  cmd.get_cmd_line_argument("perf-threshold-scale", options.perf_threshold_scale, options.perf_threshold_scale);
   int verify = options.verify ? 1 : 0;
   cmd.get_cmd_line_argument("verify", verify, verify);
   options.verify = verify != 0;

@@ -40,6 +40,7 @@ struct Options {
   DType dtype = DType::kAll;
   int iterations = 5;
   bool verify = true;
+  double perf_threshold_scale = 1.0;
 };
 
 struct CaseConfig {
@@ -53,6 +54,7 @@ struct CaseConfig {
   bool use_shared = false;
   bool include_pad_slots = false;
   bool include_false_masks = false;
+  double min_gbps = 0.0;
 };
 
 template <typename Element_>
@@ -632,11 +634,47 @@ std::vector<CaseConfig> stress_suite() {
 }
 
 std::vector<CaseConfig> perf_suite() {
+  // Real Inkling decode AR+sconv per-rank shapes: sconv D is the full
+  // hidden_size for the non-scattered path (kept the same across TP), or
+  // hidden_size / tp when --enable-scattered-sconv is on. Cover both configs
+  // at TP=2/4/8 so no rank population is missing a perf gate.
   return {
-      {"perf_tp4_t128_d1536_w4", 4, 128, 1536, 4, true, true, true, false, false},
-      {"perf_tp4_t128_d6144_w4", 4, 128, 6144, 4, true, true, true, false, false},
-      {"perf_tp8_t256_d768_w4", 8, 256, 768, 4, true, true, true, false, false},
-      {"perf_tp8_t256_d1536_w4", 8, 256, 1536, 4, true, true, true, false, false},
+      // Non-scattered decode path: D == hidden_size (same across TP).
+      {"perf_tp2_t128_d1536_w4", 2, 128, 1536, 4, true, true, true, false, false, 120.0},
+      {"perf_tp4_t128_d1536_w4", 4, 128, 1536, 4, true, true, true, false, false, 250.0},
+      {"perf_tp2_t128_d6144_w4", 2, 128, 6144, 4, true, true, true, false, false, 300.0},
+      {"perf_tp4_t128_d6144_w4", 4, 128, 6144, 4, true, true, true, false, false, 300.0},
+      {"perf_tp8_t128_d6144_w4", 8, 128, 6144, 4, true, true, true, false, false, 220.0},
+
+      // Scattered decode path: D = hidden_size / tp.
+      // Config defaults hidden=1536: 768, 384 for TP=2, 4.
+      {"perf_tp2_scattered_cfg_d768_w4", 2, 128,  768, 4, true, true, true, false, false, 100.0},
+      {"perf_tp4_scattered_cfg_d384_w4", 4, 128,  384, 4, true, true, true, false, false, 90.0},
+      // Production hidden=6144: 3072, 1536, 768 for TP=2, 4, 8.
+      {"perf_tp2_scattered_prod_d3072_w4", 2, 128, 3072, 4, true, true, true, false, false, 220.0},
+      {"perf_tp4_scattered_prod_d1536_w4", 4, 128, 1536, 4, true, true, true, false, false, 250.0},
+      {"perf_tp8_scattered_prod_d768_w4",  8, 128,  768, 4, true, true, true, false, false, 180.0},
+      {"perf_tp8_t256_d768_w4", 8, 256, 768, 4, true, true, true, false, false, 280.0},
+      {"perf_tp8_t256_d1536_w4", 8, 256, 1536, 4, true, true, true, false, false, 350.0},
+
+      // Target-verify band: T = batch * draft_token_num (144 at bs=16, Q=9),
+      // full-hidden decode fusion (non-scattered path). Cache indices/masks
+      // exercised to model the real target-verify batch mix.
+      {"perf_tp2_verify_t144_d1536_w4", 2, 144, 1536, 4, true, true, true, true, true, 180.0},
+      {"perf_tp4_verify_t144_d1536_w4", 4, 144, 1536, 4, true, true, true, true, true, 260.0},
+      {"perf_tp8_verify_t144_d1536_w4", 8, 144, 1536, 4, true, true, true, true, true, 280.0},
+      {"perf_tp2_verify_t144_d6144_w4", 2, 144, 6144, 4, true, true, true, true, true, 300.0},
+      {"perf_tp4_verify_t144_d6144_w4", 4, 144, 6144, 4, true, true, true, true, true, 300.0},
+      {"perf_tp8_verify_t144_d6144_w4", 8, 144, 6144, 4, true, true, true, true, true, 240.0},
+
+      // Max-decode band T=96 (the JIT's _INKLING_AR_FUSED_MAX_TOKENS) for
+      // non-scattered decode at both configs.
+      {"perf_tp2_decode_t96_d1536_w4", 2, 96, 1536, 4, true, true, true, false, false, 130.0},
+      {"perf_tp4_decode_t96_d1536_w4", 4, 96, 1536, 4, true, true, true, false, false, 200.0},
+      {"perf_tp8_decode_t96_d1536_w4", 8, 96, 1536, 4, true, true, true, false, false, 190.0},
+      {"perf_tp2_decode_t96_d6144_w4", 2, 96, 6144, 4, true, true, true, false, false, 260.0},
+      {"perf_tp4_decode_t96_d6144_w4", 4, 96, 6144, 4, true, true, true, false, false, 280.0},
+      {"perf_tp8_decode_t96_d6144_w4", 8, 96, 6144, 4, true, true, true, false, false, 190.0},
   };
 }
 
@@ -728,12 +766,15 @@ bool run_case(sycl::queue& q, CaseConfig const& cfg, Options const& options) {
   d_cache.copy_from(initial_cache);
   double ms = time_ms(q, options.iterations, launch_kernel);
   double gbps = effective_bytes<Element>(cfg) / (ms * 1.0e6);
+  std::string perf_label = cfg.name + "/" + element_dtype_text<Element>();
+  passed &= check_min_gbps(perf_label, gbps, cfg.min_gbps, options.perf_threshold_scale);
+  double min_gbps = scaled_min_gbps(cfg.min_gbps, options.perf_threshold_scale);
   std::cout << "[ar_fused_decode] " << std::left << std::setw(32) << cfg.name << " dtype=" << std::setw(4)
             << element_dtype_text<Element>() << " world=" << cfg.world << " T=" << cfg.T << " D=" << cfg.D
             << " W=" << cfg.W << " silu=" << bool_text(cfg.use_silu)
             << " residual=" << bool_text(cfg.use_residual) << " shared=" << bool_text(cfg.use_shared)
             << " time_ms=" << std::fixed << std::setprecision(4) << ms << " eff_GBps=" << std::setprecision(2)
-            << gbps << " " << (passed ? "PASSED" : "FAILED") << "\n";
+            << gbps << " min_GBps=" << min_gbps << " " << (passed ? "PASSED" : "FAILED") << "\n";
   return passed;
 }
 
@@ -751,7 +792,8 @@ void print_usage(char const* name) {
             << "  --suite=<quick|stress|perf>\n"
             << "  --dtype=<all|bf16|fp16>\n"
             << "  --iterations=<int>\n"
-            << "  --verify=<0|1>\n";
+            << "  --verify=<0|1>\n"
+            << "  --perf-threshold-scale=<float> (0 disables perf thresholds)\n";
 }
 
 }  // namespace cutlass::examples::comm_ar_sconv
@@ -763,6 +805,7 @@ int main(int argc, char const** argv) {
   Options options;
   cmd.get_cmd_line_argument("suite", options.suite, options.suite);
   cmd.get_cmd_line_argument("iterations", options.iterations, options.iterations);
+  cmd.get_cmd_line_argument("perf-threshold-scale", options.perf_threshold_scale, options.perf_threshold_scale);
   int verify = options.verify ? 1 : 0;
   cmd.get_cmd_line_argument("verify", verify, verify);
   options.verify = verify != 0;

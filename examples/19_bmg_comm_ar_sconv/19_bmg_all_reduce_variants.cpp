@@ -42,12 +42,20 @@ enum class Variant {
   kDirect
 };
 
+struct VariantPerfThresholds {
+  double two_shot = 0.0;
+  double full_oneshot = 0.0;
+  double push_oneshot = 0.0;
+  double direct = 0.0;
+};
+
 struct Options {
   std::string suite = "quick";
   DType dtype = DType::kAll;
   Variant variant = Variant::kAll;
   int iterations = 5;
   bool verify = true;
+  double perf_threshold_scale = 1.0;
 };
 
 struct CaseConfig {
@@ -55,6 +63,7 @@ struct CaseConfig {
   int world = 4;
   int n = 0;
   bool use_shared = false;
+  VariantPerfThresholds min_gbps;
 };
 
 template <typename Element_>
@@ -471,12 +480,52 @@ std::vector<CaseConfig> stress_suite() {
 }
 
 std::vector<CaseConfig> perf_suite() {
+  // Inkling AR feeds hidden-sized tensors. Perf points cover TP=2/4/8 at
+  // sizes that model per-token decode residency (n = hidden) up through
+  // per-chunk prefill (n = 4096 * hidden, i.e. one 4k-token chunk of a
+  // 16384-cap prefill). Larger sizes are avoided because the example holds
+  // (world+1)*n resident on ONE XPU (simulating world ranks).
   return {
-      {"perf_tp4_n1048576", 4, 1024 * 1024, false},
-      {"perf_tp4_n1048576_shared", 4, 1024 * 1024, true},
-      {"perf_tp8_n1048576", 8, 1024 * 1024, false},
-      {"perf_tp8_n2097152", 8, 2 * 1024 * 1024, false},
+      {"perf_tp2_n1048576", 2, 1024 * 1024, false, {150.0, 150.0, 150.0, 150.0}},
+      {"perf_tp4_n1048576", 4, 1024 * 1024, false, {250.0, 250.0, 250.0, 250.0}},
+      {"perf_tp4_n1048576_shared", 4, 1024 * 1024, true, {250.0, 250.0, 250.0, 250.0}},
+      {"perf_tp8_n1048576", 8, 1024 * 1024, false, {250.0, 250.0, 250.0, 250.0}},
+      {"perf_tp8_n2097152", 8, 2 * 1024 * 1024, false, {250.0, 250.0, 150.0, 250.0}},
+
+      // Per-4k-token-chunk residual reduce shapes.
+      // cfg hidden=1536 → 4096*1536 = 6291456 elements.
+      {"perf_tp2_chunk_cfg",  2, 4096 * 1536, false, {200.0, 200.0, 200.0, 200.0}},
+      {"perf_tp4_chunk_cfg",  4, 4096 * 1536, false, {250.0, 250.0, 150.0, 250.0}},
+      {"perf_tp8_chunk_cfg",  8, 4096 * 1536, false, {250.0, 150.0, 150.0, 150.0}},
+      // prod hidden=6144 → 4096*6144 = 25165824 elements.
+      {"perf_tp2_chunk_prod", 2, 4096 * 6144, false, {120.0, 120.0, 150.0, 120.0}},
+      {"perf_tp4_chunk_prod", 4, 4096 * 6144, false, {180.0, 160.0, 160.0, 160.0}},
+
+      // Target-verify decode band residency (batch=16 * draft_token_num=9 = 144
+      // rows; residual is one row per token). Reduce n = 144 * hidden.
+      {"perf_tp2_verify_cfg",  2, 144 * 1536, false, {90.0, 90.0, 90.0, 90.0}},
+      {"perf_tp4_verify_cfg",  4, 144 * 1536, false, {150.0, 150.0, 150.0, 150.0}},
+      {"perf_tp8_verify_cfg",  8, 144 * 1536, false, {200.0, 200.0, 200.0, 200.0}},
+      {"perf_tp2_verify_prod", 2, 144 * 6144, false, {180.0, 180.0, 180.0, 180.0}},
+      {"perf_tp4_verify_prod", 4, 144 * 6144, false, {250.0, 250.0, 250.0, 250.0}},
+      {"perf_tp8_verify_prod", 8, 144 * 6144, false, {250.0, 250.0, 250.0, 250.0}},
   };
+}
+
+double variant_min_gbps(Variant variant, VariantPerfThresholds const& thresholds) {
+  switch (variant) {
+    case Variant::kTwoShot:
+      return thresholds.two_shot;
+    case Variant::kFullOneShot:
+      return thresholds.full_oneshot;
+    case Variant::kPushOneShot:
+      return thresholds.push_oneshot;
+    case Variant::kDirect:
+      return thresholds.direct;
+    case Variant::kAll:
+      break;
+  }
+  return 0.0;
 }
 
 double variant_effective_bytes(Variant variant, CaseConfig const& cfg, std::size_t element_bytes) {
@@ -533,11 +582,16 @@ bool run_variant(
   double ms = time_ms(q, options.iterations, launch);
   double bytes = variant_effective_bytes(variant, cfg, sizeof(Element));
   double gbps = bytes / (ms * 1.0e6);
+  std::ostringstream perf_label;
+  perf_label << cfg.name << "/" << variant_text(variant) << "/" << element_dtype_text<Element>();
+  double min_gbps = variant_min_gbps(variant, cfg.min_gbps);
+  passed &= check_min_gbps(perf_label.str(), gbps, min_gbps, options.perf_threshold_scale);
+  min_gbps = scaled_min_gbps(min_gbps, options.perf_threshold_scale);
   std::cout << "[allreduce] " << std::left << std::setw(30) << cfg.name << " variant=" << std::setw(13)
             << variant_text(variant) << " dtype=" << std::setw(4) << element_dtype_text<Element>()
             << " world=" << cfg.world << " n=" << cfg.n << " shared=" << bool_text(cfg.use_shared)
             << " time_ms=" << std::fixed << std::setprecision(4) << ms << " eff_GBps=" << std::setprecision(2)
-            << gbps << " " << (passed ? "PASSED" : "FAILED") << "\n";
+            << gbps << " min_GBps=" << min_gbps << " " << (passed ? "PASSED" : "FAILED") << "\n";
   return passed;
 }
 
@@ -598,7 +652,8 @@ void print_usage(char const* name) {
             << "  --dtype=<all|bf16|fp16>\n"
             << "  --variant=<all|two_shot|full_oneshot|push_oneshot|direct>\n"
             << "  --iterations=<int>\n"
-            << "  --verify=<0|1>\n";
+            << "  --verify=<0|1>\n"
+            << "  --perf-threshold-scale=<float> (0 disables perf thresholds)\n";
 }
 
 }  // namespace cutlass::examples::comm_ar_sconv
@@ -610,6 +665,7 @@ int main(int argc, char const** argv) {
   Options options;
   cmd.get_cmd_line_argument("suite", options.suite, options.suite);
   cmd.get_cmd_line_argument("iterations", options.iterations, options.iterations);
+  cmd.get_cmd_line_argument("perf-threshold-scale", options.perf_threshold_scale, options.perf_threshold_scale);
   int verify = options.verify ? 1 : 0;
   cmd.get_cmd_line_argument("verify", verify, verify);
   options.verify = verify != 0;

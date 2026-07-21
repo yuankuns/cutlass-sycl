@@ -17,3 +17,11 @@ Build and run inside the required container:
 docker exec sglang-syk bash -lc 'source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1; ninja -C /workspace/cutlass-sycl/build-syk 19_bmg_all_reduce_variants 19_bmg_ar_fused_decode 19_bmg_ar_scattered_sconv 19_bmg_xpu_collective_mapping'
 docker exec sglang-syk bash -lc 'source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1; ctest --test-dir /workspace/cutlass-sycl/build-syk -R "19_bmg_(all_reduce_variants|ar_fused_decode|ar_scattered_sconv|xpu_collective_mapping)" --output-on-failure'
 ```
+
+The `perf` suites enforce per-case `min_GBps` thresholds in addition to
+correctness checks. Use `--perf-threshold-scale=0` only when collecting new
+baseline numbers without gating.
+
+```bash
+docker exec sglang-syk bash -lc 'source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1; cd /workspace/cutlass-sycl/build-syk/examples/19_bmg_comm_ar_sconv; for exe in 19_bmg_all_reduce_variants 19_bmg_ar_fused_decode 19_bmg_ar_scattered_sconv 19_bmg_xpu_collective_mapping; do ./$exe --suite=perf --iterations=3 --verify=1 || exit 1; done'
+```

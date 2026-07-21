@@ -44,6 +44,7 @@ struct Options {
   DType dtype = DType::kAll;
   int iterations = 5;
   bool verify = true;
+  double perf_threshold_scale = 1.0;
 };
 
 struct CaseConfig {
@@ -58,6 +59,7 @@ struct CaseConfig {
   bool use_residual = true;
   bool include_empty = false;
   bool include_false_masks = false;
+  double min_gbps = 0.0;
 };
 
 template <typename Element_>
@@ -521,10 +523,36 @@ std::vector<CaseConfig> stress_suite() {
 }
 
 std::vector<CaseConfig> perf_suite() {
+  // ar_scattered_sconv fires only when --enable-scattered-sconv is on, so
+  // sconv D is always hidden_size / tp. Cover both shipped configs at TP=2/4/8.
+  //   config defaults hidden=1536 → D = 768/384 for TP=2/4
+  //   production      hidden=6144 → D = 3072/1536/768 for TP=2/4/8
   return {
-      {"perf_tp4_b64_l1024_d1536_w4", 4, 64, 1024, 1536, 4, false, true, true, false, false},
-      {"perf_tp8_b64_l1024_d768_w4", 8, 64, 1024, 768, 4, false, true, true, false, false},
-      {"perf_tp4_b128_l512_d3072_w4", 4, 128, 512, 3072, 4, false, true, true, false, false},
+      // Config defaults per-rank D across TP=2/4 at a max_prefill_tokens/8 chunk.
+      {"perf_tp2_cfg_b64_l1024_d768_w4",  2, 64, 1024,  768, 4, false, true, true, false, false, 180.0},
+      {"perf_tp4_cfg_b64_l1024_d384_w4",  4, 64, 1024,  384, 4, false, true, true, false, false, 150.0},
+
+      // Production per-rank D across TP=2/4/8.
+      {"perf_tp2_prod_b64_l1024_d3072_w4", 2, 64, 1024, 3072, 4, false, true, true, false, false, 180.0},
+      {"perf_tp4_b64_l1024_d1536_w4", 4, 64, 1024, 1536, 4, false, true, true, false, false, 180.0},
+      {"perf_tp8_b64_l1024_d768_w4", 8, 64, 1024, 768, 4, false, true, true, false, false, 150.0},
+
+      // Larger token chunk (l=512, batch=128) at production TP=2/4.
+      {"perf_tp2_prod_b128_l512_d3072_w4", 2, 128, 512, 3072, 4, false, true, true, false, false, 180.0},
+      {"perf_tp4_b128_l512_d1536_w4", 4, 128, 512, 1536, 4, false, true, true, false, false, 180.0},
+      // Same 64k-token shape at production TP=8 (D=hidden/tp=768).
+      {"perf_tp8_prod_b128_l512_d768_w4", 8, 128, 512, 768, 4, false, true, true, false, false, 150.0},
+
+      // Config defaults (hidden=1536) 64k-token shape across TP=2/4/8.
+      // D = 1536/tp = 768, 384, 192.
+      {"perf_tp2_cfg_b128_l512_d768_w4", 2, 128, 512, 768, 4, false, true, true, false, false, 180.0},
+      {"perf_tp4_cfg_b128_l512_d384_w4", 4, 128, 512, 384, 4, false, true, true, false, false, 150.0},
+      {"perf_tp8_cfg_b128_l512_d192_w4", 8, 128, 512, 192, 4, false, true, true, false, false, 140.0},
+
+      // Chunked-prefill max chunk (b=1, l=16384 = max_prefill_tokens) at cfg
+      // TP=2/4 to exercise the long-tokens-per-seq path.
+      {"perf_prefill_cap_tp2_cfg_l16384_d768_w4", 2, 1, 16384, 768, 4, false, true, true, false, false, 220.0},
+      {"perf_prefill_cap_tp4_cfg_l16384_d384_w4", 4, 1, 16384, 384, 4, false, true, true, false, false, 110.0},
   };
 }
 
@@ -626,11 +654,14 @@ bool run_case(sycl::queue& q, CaseConfig const& cfg, Options const& options) {
   d_new_cache.copy_from(initial_new_cache);
   double ms = time_ms(q, options.iterations, launch_kernels);
   double gbps = effective_bytes<Element>(cfg, h.T) / (ms * 1.0e6);
+  std::string perf_label = cfg.name + "/" + element_dtype_text<Element>();
+  passed &= check_min_gbps(perf_label, gbps, cfg.min_gbps, options.perf_threshold_scale);
+  double min_gbps = scaled_min_gbps(cfg.min_gbps, options.perf_threshold_scale);
   std::cout << "[ar_scattered_sconv] " << std::left << std::setw(34) << cfg.name << " dtype=" << std::setw(4)
             << element_dtype_text<Element>() << " world=" << cfg.world << " T=" << h.T << " D=" << cfg.D
             << " W=" << cfg.W << " varied=" << bool_text(cfg.varied_lengths)
             << " time_ms=" << std::fixed << std::setprecision(4) << ms << " eff_GBps=" << std::setprecision(2)
-            << gbps << " " << (passed ? "PASSED" : "FAILED") << "\n";
+            << gbps << " min_GBps=" << min_gbps << " " << (passed ? "PASSED" : "FAILED") << "\n";
   return passed;
 }
 
@@ -648,7 +679,8 @@ void print_usage(char const* name) {
             << "  --suite=<quick|stress|perf>\n"
             << "  --dtype=<all|bf16|fp16>\n"
             << "  --iterations=<int>\n"
-            << "  --verify=<0|1>\n";
+            << "  --verify=<0|1>\n"
+            << "  --perf-threshold-scale=<float> (0 disables perf thresholds)\n";
 }
 
 }  // namespace cutlass::examples::comm_ar_sconv
@@ -660,6 +692,7 @@ int main(int argc, char const** argv) {
   Options options;
   cmd.get_cmd_line_argument("suite", options.suite, options.suite);
   cmd.get_cmd_line_argument("iterations", options.iterations, options.iterations);
+  cmd.get_cmd_line_argument("perf-threshold-scale", options.perf_threshold_scale, options.perf_threshold_scale);
   int verify = options.verify ? 1 : 0;
   cmd.get_cmd_line_argument("verify", verify, verify);
   options.verify = verify != 0;
