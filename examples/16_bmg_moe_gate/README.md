@@ -31,7 +31,7 @@ Top-k roofline and performance notes:
 - Per token, the large-stream payload is 258 fp32 logits read plus 56 B of non-packed output or 32 B of packed output. Bias is 1 KiB and is reused by all rows, so it is effectively cache-resident for production token counts.
 - This is the MoE gate postprocess, not the expert GEMM. It performs 258 sigmoid operations plus top-6 subgroup reductions per token, so a plain FLOP/byte roofline is misleading: `exp` throughput and subgroup shuffles are a significant part of the limit.
 - The practical optimization target is reducing redundant logits traffic, keeping occupancy high enough to hide sigmoid latency, and avoiding extra subgroup communication. The kernel uses one 32-lane subgroup per token row, loads each routed logit once, keeps the selected sigmoid values in registers on lane 0 for the compact epilogue, and shares the same code path for packed and non-packed modes.
-- The default launch policy is mode-aware: non-packed uses one subgroup per workgroup, while packed uses two for smaller token counts and one for larger token counts. Explicit `--rows-per-wg=1|2|4|8` remains available for local tuning.
+- The default launch policy uses two token rows per workgroup through 16k tokens and one row per workgroup for larger streams. Explicit `--rows-per-wg=1|2|4|8` remains available for local tuning.
 
 Gate GEMV roofline and performance notes:
 

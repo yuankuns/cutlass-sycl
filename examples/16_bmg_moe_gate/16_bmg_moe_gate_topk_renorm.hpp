@@ -120,7 +120,12 @@ inline void gate_topk_renorm_row(
 
     if (lane == 0) {
       selected_idx[k] = best_idx;
-      selected_sigmoid[k] = best_score - params.bias[best_idx];
+      float bias = params.bias[best_idx];
+      float sigmoid = best_score - bias;
+      if (bias > 256.0f || bias < -256.0f) {
+        sigmoid = sigmoid_device(params.logits[row_base + best_idx]);
+      }
+      selected_sigmoid[k] = sigmoid;
     }
 
     int owner_lane = best_idx / kValuesPerLane;
@@ -201,11 +206,7 @@ sycl::event launch_gate_topk_renorm_static(sycl::queue& queue, GateParams const&
 template <bool Packed>
 sycl::event launch_gate_topk_renorm(sycl::queue& queue, GateParams const& params, int rows_per_workgroup = 0) {
   if (rows_per_workgroup == 0) {
-    if constexpr (Packed) {
-      rows_per_workgroup = params.tokens <= 8192 ? 2 : 1;
-    } else {
-      rows_per_workgroup = 1;
-    }
+    rows_per_workgroup = params.tokens <= 16384 ? 2 : 1;
   }
 
   switch (rows_per_workgroup) {

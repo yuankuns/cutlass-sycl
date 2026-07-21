@@ -154,6 +154,7 @@ struct CaseConfig {
   int64_t tokens = 0;
   int64_t stride = moe::kTotalExperts;
   bool ties = false;
+  bool large_bias = false;
 };
 
 struct HostInputs {
@@ -185,6 +186,12 @@ HostInputs make_inputs(CaseConfig const& cfg, uint32_t seed) {
   if (cfg.ties) {
     std::fill(inputs.logits.begin(), inputs.logits.end(), 0.0f);
     std::fill(inputs.bias.begin(), inputs.bias.end(), 0.0f);
+    return inputs;
+  }
+
+  if (cfg.large_bias) {
+    std::fill(inputs.logits.begin(), inputs.logits.end(), 0.0f);
+    std::fill(inputs.bias.begin(), inputs.bias.end(), 1.0e8f);
     return inputs;
   }
 
@@ -442,9 +449,13 @@ std::vector<CaseConfig> verification_cases(std::string const& suite, Options con
   std::vector<CaseConfig> cases = {
       {"zero", 0, moe::kTotalExperts, false},
       {"tie", 1, moe::kTotalExperts, true},
+      {"decode1", 1, 264, false},
+      {"largebias", 2, 264, false, true},
       {"small258", 3, moe::kTotalExperts, false},
       {"decode", 8, 264, false},
+      {"draft9", 9, 264, false},
       {"tail", 17, 264, false},
+      {"fusedcap64", 64, 264, false},
       {"oddstride", 65, 300, false},
       {"extend", 127, 264, false},
       {"medium", 512, 264, false},
@@ -461,7 +472,10 @@ std::vector<CaseConfig> benchmark_cases(std::string const& suite, Options const&
     return {{"custom", options.tokens, options.stride, false}};
   }
   std::vector<CaseConfig> cases = {
+      {"decode1", 1, 264, false},
+      {"draft9", 9, 264, false},
       {"prod4096", 4096, 264, false},
+      {"prefill16k", 16384, 264, false},
       {"large65536", 65536, 264, false},
   };
   if (suite == "full") {
