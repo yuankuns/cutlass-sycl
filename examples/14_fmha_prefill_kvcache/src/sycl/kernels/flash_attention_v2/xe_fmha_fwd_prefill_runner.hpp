@@ -175,6 +175,8 @@ struct Arguments {
   int page_size;
   int num_pages;
   bool pagedkv_tma;
+  bool page_table_contiguous;
+  bool page_table_identity;
 
   // The dropout probability (probability of keeping an activation).
   float p_dropout;
@@ -284,7 +286,15 @@ struct PrefillRunner {
       shape = problem_shape_launch;
     } else {
       problem_size = problem_shape_in;
-      shape = problem_shape_in;
+      shape = ProblemShapeType{
+          get<0>(problem_shape_in),
+          get<1>(problem_shape_in),
+          get<2>(problem_shape_in),
+          get<3>(problem_shape_in),
+          get<4>(problem_shape_in),
+          get<5>(problem_shape_in),
+          get<6>(problem_shape_in),
+          get<7>(problem_shape_in)};
     }
 
     auto [batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, seq_len_kv_cache, head_size_qk, head_size_vo] =
@@ -322,6 +332,7 @@ struct PrefillRunner {
         params.max_num_pages_per_seq,
         params.window_size_left,
         params.window_size_right};
+    mainloop_args.page_table_contiguous = params.page_table_contiguous;
     if constexpr (CollectiveMainloop::AppendKV) {
       mainloop_args.append.ptr_K_new = static_cast<const ElementK*>(params.knew_ptr);
       mainloop_args.append.ptr_V_new = static_cast<const ElementV*>(params.vnew_ptr);
@@ -421,7 +432,15 @@ struct FMHAConfig {
       decltype(cutlass::fmha::collective::get_sg_layout_pv(SubgroupLayoutQK{})),
       SubgroupLayoutPV_>;
 
-  template <bool isVarLen, bool CachedKV, bool PagedKV, bool AppendKV, class Scheduler>
+  template <
+      bool isVarLen,
+      bool CachedKV,
+      bool PagedKV,
+      bool AppendKV,
+      class Scheduler,
+      bool ContiguousPagedKV = false,
+      bool IdentityPagedKV = false,
+      bool SingleAppendKV = false>
   static int run(const Arguments& params) {
     // The KernelHardwareInfo struct holds the number of EUs on the GPU with a given device ID. This
     // information is used by the underlying kernel.
@@ -473,7 +492,10 @@ struct FMHAConfig {
         GmemTiledCopyV_cache,
         LocalMask,
         false,
-        AppendKV>;
+        AppendKV,
+        ContiguousPagedKV,
+        IdentityPagedKV,
+        SingleAppendKV>;
 
     // Epilogue
     using CollectiveEpilogue =
@@ -517,6 +539,69 @@ struct FMHAConfig {
       return run<true, true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
     }
     return run<true, true, true, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+  }
+
+  static int run_paged_identity_single_append(const Arguments& params) {
+    TORCH_CHECK(params.page_table_identity, "identity paged single-append prefill requires page_table_identity");
+    TORCH_CHECK(params.cu_seqlens_q != nullptr, "paged prefill requires cu_seqlens_q");
+    TORCH_CHECK(params.cu_seqlens_k != nullptr, "paged prefill requires per-batch cache lengths in cu_seqlens_k");
+    TORCH_CHECK(params.page_table != nullptr, "paged prefill requires page_table");
+    TORCH_CHECK(params.page_size > 0, "paged prefill requires a positive page_size");
+    TORCH_CHECK(params.max_num_pages_per_seq > 0, "paged prefill requires max_num_pages_per_seq");
+    TORCH_CHECK(params.seqlen_q > 0 && params.seqlen_k > 0, "paged prefill requires positive max sequence lengths");
+    TORCH_CHECK(params.total_q > 0 && params.total_k > 0, "paged prefill requires positive total sequence lengths");
+    TORCH_CHECK(
+        params.b == 1 && params.total_q == params.seqlen_q && params.total_k == params.seqlen_k,
+        "identity paged single-append fixed prefill requires batch-1 fixed lengths");
+    TORCH_CHECK(
+        params.total_knew == 1 && params.seqlen_knew == 1 && params.cu_seqlens_knew == nullptr &&
+            params.knew_ptr != nullptr && params.vnew_ptr != nullptr && params.cache_seqlens_old != nullptr,
+        "identity paged single-append prefill requires exactly one fixed-length appended token");
+    return run<
+        false,
+        true,
+        true,
+        true,
+        cutlass::fmha::kernel::XeFHMAIndividualTileScheduler,
+        true,
+        true,
+        true>(params);
+  }
+
+  static int run_paged_identity_append(const Arguments& params) {
+    TORCH_CHECK(params.page_table_identity, "identity paged prefill requires page_table_identity");
+    TORCH_CHECK(params.cu_seqlens_q != nullptr, "paged prefill requires cu_seqlens_q");
+    TORCH_CHECK(params.cu_seqlens_k != nullptr, "paged prefill requires per-batch cache lengths in cu_seqlens_k");
+    TORCH_CHECK(params.page_table != nullptr, "paged prefill requires page_table");
+    TORCH_CHECK(params.page_size > 0, "paged prefill requires a positive page_size");
+    TORCH_CHECK(params.max_num_pages_per_seq > 0, "paged prefill requires max_num_pages_per_seq");
+    TORCH_CHECK(params.seqlen_q > 0 && params.seqlen_k > 0, "paged prefill requires positive max sequence lengths");
+    TORCH_CHECK(params.total_q > 0 && params.total_k > 0, "paged prefill requires positive total sequence lengths");
+    TORCH_CHECK(
+        params.total_knew > 0 && params.knew_ptr != nullptr && params.vnew_ptr != nullptr &&
+            params.cache_seqlens_old != nullptr,
+        "identity paged append prefill requires appended KV");
+    if (params.b == 1 && params.total_knew == 1 && params.seqlen_knew == 1 &&
+        params.cu_seqlens_knew == nullptr) {
+      return run<
+          true,
+          true,
+          true,
+          true,
+          cutlass::fmha::kernel::XeFHMAIndividualTileScheduler,
+          true,
+          true,
+          true>(params);
+    }
+    return run<
+        true,
+        true,
+        true,
+        true,
+        cutlass::fmha::kernel::XeFHMAIndividualTileScheduler,
+        true,
+        true,
+        false>(params);
   }
 
   // Non-paged (contiguous ragged) KV cache: addressed via cu_seqlens_k offsets.

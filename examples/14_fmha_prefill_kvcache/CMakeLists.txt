@@ -60,7 +60,9 @@ set(FMHA_PREFILL_TILED_KV_NP_128 32)
 set(FMHA_PREFILL_NUM_SG_NP_128 16)
 
 set(FMHA_PREFILL_TEMPLATE "${FMHA_PREFILL_SRC_DIR}/sycl/xe_fmha_fwd_prefill_kernel.cpp.in")
+set(FMHA_DECODE_TEMPLATE "${FMHA_PREFILL_SRC_DIR}/sycl/xe_fmha_fwd_decode_kernel.cpp.in")
 set(FMHA_PREFILL_GENERATED)
+set(FMHA_DECODE_GENERATED)
 set(FMHA_STANDALONE_HEAD_DIM_DEFS)
 
 foreach(HEAD_DIM ${FMHA_STANDALONE_HEAD_DIMS})
@@ -108,8 +110,20 @@ foreach(HEAD_DIM ${FMHA_STANDALONE_HEAD_DIMS})
   list(APPEND FMHA_STANDALONE_HEAD_DIM_DEFS "FMHA_STANDALONE_HAS_HD_${HEAD_DIM}=1")
 endforeach()
 
+list(FIND FMHA_STANDALONE_HEAD_DIMS "64" _fmha_has_hd64)
+if(NOT _fmha_has_hd64 EQUAL -1)
+  set(QG_SZ 4)
+  set(HEAD_DIM 64)
+  set(PAGE_SIZE 128)
+  set(EMIT_PAGED 1)
+  set(GENERATED_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/xe_fmha_fwd_decode_qg4_hd64_ps128.cpp")
+  configure_file("${FMHA_DECODE_TEMPLATE}" "${GENERATED_FILE}" @ONLY)
+  list(APPEND FMHA_DECODE_GENERATED "${GENERATED_FILE}")
+endif()
+
 add_library(fmha_prefill_kvcache_kernels STATIC
   ${FMHA_PREFILL_GENERATED}
+  ${FMHA_DECODE_GENERATED}
   standalone_runtime.cpp
 )
 

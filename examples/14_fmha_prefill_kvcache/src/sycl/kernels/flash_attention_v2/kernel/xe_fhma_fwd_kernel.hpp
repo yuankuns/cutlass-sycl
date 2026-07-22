@@ -240,6 +240,11 @@ class XeFMHAFwdKernel {
   CUTLASS_DEVICE
   int get_k_new_len(MainloopParams const& mainloop, int batch) {
     if constexpr (CollectiveMainloop::AppendKV) {
+      if constexpr (CollectiveMainloop::SingleAppendKV) {
+        (void)mainloop;
+        (void)batch;
+        return 1;
+      }
       if (mainloop.append.ptr_K_new == nullptr || mainloop.append.ptr_V_new == nullptr ||
           mainloop.append.ptr_cache_seqlens == nullptr || mainloop.append.total_k_new <= 0 ||
           (mainloop.append.ptr_cu_seqlens_k_new == nullptr && mainloop.append.seq_len_kv_new <= 0)) {
@@ -292,9 +297,13 @@ class XeFMHAFwdKernel {
       auto [seq_len_qo, seq_len_kv, seq_len_kv_cache] = sequence_length_shape;
       int seq_k_eff = seq_len_kv_cache;
       if constexpr (CollectiveMainloop::AppendKV) {
-        int const seq_k_new = get_k_new_len(params.mainloop, idx_b);
-        if (seq_k_new > 0) {
-          seq_k_eff = params.mainloop.append.ptr_cache_seqlens[idx_b] + seq_k_new;
+        if constexpr (CollectiveMainloop::SingleAppendKV) {
+          seq_k_eff = seq_len_kv_cache;
+        } else {
+          int const seq_k_new = get_k_new_len(params.mainloop, idx_b);
+          if (seq_k_new > 0) {
+            seq_k_eff = params.mainloop.append.ptr_cache_seqlens[idx_b] + seq_k_new;
+          }
         }
       }
       // M extent of the Q/O tile: the packed GQA group for decode, otherwise the
@@ -327,18 +336,26 @@ class XeFMHAFwdKernel {
           CollectiveMainloop::CausalMask ? (seq_coord + full_tile_offset) / get<1>(TileShapeQK{}) : 0;
       int append_store_len = -1;
       if constexpr (CollectiveMainloop::AppendKV) {
-        int const seq_k_new = get_k_new_len(params.mainloop, idx_b);
-        if (seq_k_new > 0) {
-          append_store_len = seq_k_new;
+        if constexpr (CollectiveMainloop::SingleAppendKV) {
+          append_store_len = 1;
           if constexpr (CollectiveMainloop::CausalMask && !PackGQA_) {
-            // Without a grid-wide barrier, each WG must write every appended
-            // token it may read; causal tiles only need the visible prefix.
-            int const cache_len_old = params.mainloop.append.ptr_cache_seqlens[idx_b];
             int const tile_q = get<0>(TileShapeQK{});
-            int const q_tile_end = cute::min(seq_len_qo, (blk_q + 1) * tile_q);
-            int const visible_k_end = cute::min(seq_k_eff, full_tile_offset + q_tile_end);
-            append_store_len = cute::max(0, visible_k_end - cache_len_old);
-            append_store_len = cute::min(append_store_len, seq_k_new);
+            append_store_len = (blk_q + 1) * tile_q >= seq_len_qo ? 1 : 0;
+          }
+        } else {
+          int const seq_k_new = get_k_new_len(params.mainloop, idx_b);
+          if (seq_k_new > 0) {
+            append_store_len = seq_k_new;
+            if constexpr (CollectiveMainloop::CausalMask && !PackGQA_) {
+              // Without a grid-wide barrier, each WG must write every appended
+              // token it may read; causal tiles only need the visible prefix.
+              int const cache_len_old = params.mainloop.append.ptr_cache_seqlens[idx_b];
+              int const tile_q = get<0>(TileShapeQK{});
+              int const q_tile_end = cute::min(seq_len_qo, (blk_q + 1) * tile_q);
+              int const visible_k_end = cute::min(seq_k_eff, full_tile_offset + q_tile_end);
+              append_store_len = cute::max(0, visible_k_end - cache_len_old);
+              append_store_len = cute::min(append_store_len, seq_k_new);
+            }
           }
         }
       }
@@ -391,7 +408,10 @@ class XeFMHAFwdKernel {
       // sequence extent is the global total. Non-paged KV points at a single batch's
       // contiguous region, so the extent must be this batch's KV length to keep the
       // 2D block loads in-bounds.
-      int kv_seq_extent = CollectiveMainloop::PagedKV ? int(s.seq_len_kv_cache.total_length) : int(seq_len_kv_cache);
+      int kv_seq_extent = int(seq_len_kv_cache);
+      if constexpr (CollectiveMainloop::PagedKV && is_var_len) {
+        kv_seq_extent = int(s.seq_len_kv_cache.total_length);
+      }
       // PackGQA folds the head_group_q query heads into M and grids over KV
       // heads, so the Q/O head extent collapses to num_heads_kv.
       auto q_head_count = PackGQA_ ? s.num_heads_kv : s.num_heads_q;
