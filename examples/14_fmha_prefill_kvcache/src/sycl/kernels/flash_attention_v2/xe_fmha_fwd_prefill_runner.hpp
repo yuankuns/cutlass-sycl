@@ -438,7 +438,6 @@ struct FMHAConfig {
       bool PagedKV,
       bool AppendKV,
       class Scheduler,
-      bool ContiguousPagedKV = false,
       bool IdentityPagedKV = false,
       bool SingleAppendKV = false>
   static int run(const Arguments& params) {
@@ -493,7 +492,6 @@ struct FMHAConfig {
         LocalMask,
         false,
         AppendKV,
-        ContiguousPagedKV,
         IdentityPagedKV,
         SingleAppendKV>;
 
@@ -541,33 +539,6 @@ struct FMHAConfig {
     return run<true, true, true, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
   }
 
-  static int run_paged_identity_single_append(const Arguments& params) {
-    TORCH_CHECK(params.page_table_identity, "identity paged single-append prefill requires page_table_identity");
-    TORCH_CHECK(params.cu_seqlens_q != nullptr, "paged prefill requires cu_seqlens_q");
-    TORCH_CHECK(params.cu_seqlens_k != nullptr, "paged prefill requires per-batch cache lengths in cu_seqlens_k");
-    TORCH_CHECK(params.page_table != nullptr, "paged prefill requires page_table");
-    TORCH_CHECK(params.page_size > 0, "paged prefill requires a positive page_size");
-    TORCH_CHECK(params.max_num_pages_per_seq > 0, "paged prefill requires max_num_pages_per_seq");
-    TORCH_CHECK(params.seqlen_q > 0 && params.seqlen_k > 0, "paged prefill requires positive max sequence lengths");
-    TORCH_CHECK(params.total_q > 0 && params.total_k > 0, "paged prefill requires positive total sequence lengths");
-    TORCH_CHECK(
-        params.b == 1 && params.total_q == params.seqlen_q && params.total_k == params.seqlen_k,
-        "identity paged single-append fixed prefill requires batch-1 fixed lengths");
-    TORCH_CHECK(
-        params.total_knew == 1 && params.seqlen_knew == 1 && params.cu_seqlens_knew == nullptr &&
-            params.knew_ptr != nullptr && params.vnew_ptr != nullptr && params.cache_seqlens_old != nullptr,
-        "identity paged single-append prefill requires exactly one fixed-length appended token");
-    return run<
-        false,
-        true,
-        true,
-        true,
-        cutlass::fmha::kernel::XeFHMAIndividualTileScheduler,
-        true,
-        true,
-        true>(params);
-  }
-
   static int run_paged_identity_append(const Arguments& params) {
     TORCH_CHECK(params.page_table_identity, "identity paged prefill requires page_table_identity");
     TORCH_CHECK(params.cu_seqlens_q != nullptr, "paged prefill requires cu_seqlens_q");
@@ -590,7 +561,6 @@ struct FMHAConfig {
           true,
           cutlass::fmha::kernel::XeFHMAIndividualTileScheduler,
           true,
-          true,
           true>(params);
     }
     return run<
@@ -599,7 +569,6 @@ struct FMHAConfig {
         true,
         true,
         cutlass::fmha::kernel::XeFHMAIndividualTileScheduler,
-        true,
         true,
         false>(params);
   }

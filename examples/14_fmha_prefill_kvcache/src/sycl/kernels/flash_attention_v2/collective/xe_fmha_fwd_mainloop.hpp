@@ -95,7 +95,6 @@ template <
     // false keeps prefill (and non-packed decode) unaffected.
     bool PackGQA_ = false,
     bool AppendKV_ = false,
-    bool ContiguousPagedKV_ = false,
     bool IdentityPagedKV_ = false,
     bool SingleAppendKV_ = false>
 struct FMHAFwdMainloop {
@@ -125,7 +124,6 @@ template <
     bool LocalMask_,
     bool PackGQA_,
     bool AppendKV_,
-    bool ContiguousPagedKV_,
     bool IdentityPagedKV_,
     bool SingleAppendKV_>
 struct FMHAFwdMainloop<
@@ -149,7 +147,6 @@ struct FMHAFwdMainloop<
     LocalMask_,
     PackGQA_,
     AppendKV_,
-    ContiguousPagedKV_,
     IdentityPagedKV_,
     SingleAppendKV_> {
   //
@@ -222,9 +219,11 @@ struct FMHAFwdMainloop<
   static constexpr bool LocalMask = LocalMask_;
   static constexpr bool PackGQA = PackGQA_;
   static constexpr bool AppendKV = AppendKV_;
-  static constexpr bool ContiguousPagedKV = ContiguousPagedKV_;
   static constexpr bool IdentityPagedKV = IdentityPagedKV_;
+  static constexpr bool ReuseQFragments = IdentityPagedKV;
   static constexpr bool SingleAppendKV = SingleAppendKV_;
+  static_assert(!SingleAppendKV || (AppendKV && IdentityPagedKV),
+                "SingleAppendKV is only defined for the identity paged append path");
   using AppendKVStorage = AppendKVParams<AppendKV, typename TensorK_cache::element_type, typename TensorV_cache::element_type>;
 
   // User-facing arguments
@@ -682,18 +681,13 @@ struct FMHAFwdMainloop<
       batch_page_offset = l_coord * params.max_num_pages_per_seq;
       logical_page_idx = blk_k0 / tiles_per_page;
       tile_in_page = blk_k0 - logical_page_idx * tiles_per_page;
-      if constexpr (ContiguousPagedKV) {
+      if (params.page_table_contiguous) {
         physical_page_tile_base = get_physical_page_tile_base(batch_page_offset, 0, tiles_per_page);
         next_page_idx = physical_page_tile_base + blk_k0;
       } else {
-        if (params.page_table_contiguous) {
-          physical_page_tile_base = get_physical_page_tile_base(batch_page_offset, 0, tiles_per_page);
-          next_page_idx = physical_page_tile_base + blk_k0;
-        } else {
-          physical_page_tile_base =
-              get_physical_page_tile_base(batch_page_offset, logical_page_idx, tiles_per_page);
-          next_page_idx = physical_page_tile_base + tile_in_page;
-        }
+        physical_page_tile_base =
+            get_physical_page_tile_base(batch_page_offset, logical_page_idx, tiles_per_page);
+        next_page_idx = physical_page_tile_base + tile_in_page;
       }
     }
     for (int D = 0; D < size<3>(pQgQ); D++) {
@@ -707,7 +701,7 @@ struct FMHAFwdMainloop<
       }
     }
 
-    if constexpr (IdentityPagedKV) {
+    if constexpr (ReuseQFragments) {
       copy(copy_q, tQgQ(_, _, _, 0), tQrQ);
       reorder(tQrQ, tSrQ);
       copy(copy_q, tQgQ(_, _, _, 1), tQrQ);
@@ -744,31 +738,27 @@ struct FMHAFwdMainloop<
       if constexpr (PagedKV && !IdentityPagedKV) {
         next_page_idx = next_k;
         if (has_next_k) {
-          if constexpr (ContiguousPagedKV) {
+          if (params.page_table_contiguous) {
             next_page_idx = physical_page_tile_base + next_k;
           } else {
-            if (params.page_table_contiguous) {
-              next_page_idx = physical_page_tile_base + next_k;
-            } else {
-              int next_tile_in_page = tile_in_page + 1;
-              int next_logical_page_idx = logical_page_idx;
-              if (next_tile_in_page == tiles_per_page) {
-                next_tile_in_page = 0;
-                ++next_logical_page_idx;
-                physical_page_tile_base =
-                    get_physical_page_tile_base(batch_page_offset, next_logical_page_idx, tiles_per_page);
-              }
-              next_page_idx = physical_page_tile_base + next_tile_in_page;
-              logical_page_idx = next_logical_page_idx;
-              tile_in_page = next_tile_in_page;
+            int next_tile_in_page = tile_in_page + 1;
+            int next_logical_page_idx = logical_page_idx;
+            if (next_tile_in_page == tiles_per_page) {
+              next_tile_in_page = 0;
+              ++next_logical_page_idx;
+              physical_page_tile_base =
+                  get_physical_page_tile_base(batch_page_offset, next_logical_page_idx, tiles_per_page);
             }
+            next_page_idx = physical_page_tile_base + next_tile_in_page;
+            logical_page_idx = next_logical_page_idx;
+            tile_in_page = next_tile_in_page;
           }
         }
       }
 
       /* GEMM 1: S = K * Q */
       clear(tSrS);
-      if constexpr (IdentityPagedKV) {
+      if constexpr (ReuseQFragments) {
         copy(copy_k_cache, tKgK_cache(_, _, _, page_idx, 0), tKrK);
         reorder(tKrK, tSrK);
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
@@ -795,7 +785,7 @@ struct FMHAFwdMainloop<
       /* Causal masking */
       if constexpr (CausalMask) {
         if (need_causal) {
-          if constexpr (IdentityPagedKV && SingleAppendKV) {
+          if constexpr (ReuseQFragments && SingleAppendKV) {
             auto cS_thread = thr_mma_qk.partition_C(cP);
             int const row_base = get<0>(blk_qv) * get<0>(TileShapeQK{});
             int const col_base = K * get<1>(TileShapeQK{});
