@@ -30,16 +30,10 @@
  **************************************************************************************************/
 #pragma once
 
-#ifdef SGL_KERNEL_STANDALONE_NO_TORCH
-#include <sstream>
-#include <stdexcept>
-#include <utility>
-#else
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
-#endif
 
 #include <cute/tensor.hpp>
 #include <random>
@@ -198,9 +192,7 @@ struct Arguments {
   // If non-null, the kernel skips batches where mask[idx_b] is true.
   void* skip_batch_mask_ptr = nullptr;
 
-#ifndef SGL_KERNEL_STANDALONE_NO_TORCH
   torch::TensorOptions tensor_opts;
-#endif
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -341,28 +333,17 @@ struct DecodeRunner {
 
     // Define device-global scratch memory
     size_t workspace_size = FMHADecodeKernel::get_workspace_size(arguments);
-#ifdef SGL_KERNEL_STANDALONE_NO_TORCH
-    void* workspace = sgl_standalone::workspace(workspace_size);
-#else
     auto workspace = torch::empty(workspace_size, params.tensor_opts);
-#endif
 
     if (!FMHADecodeKernel::can_implement(arguments)) {
       return cutlass::Status::kErrorInvalidProblem;
     }
 
     // Initialize the workspace
-#ifdef SGL_KERNEL_STANDALONE_NO_TORCH
-    FMHADecodeKernel::initialize_workspace(arguments, workspace);
-
-    // Convert host-side arguments to device-side arguments to be passed to the kernel
-    auto kernel_params = FMHADecodeKernel::to_underlying_arguments(arguments, workspace);
-#else
     FMHADecodeKernel::initialize_workspace(arguments, workspace.data_ptr());
 
     // Convert host-side arguments to device-side arguments to be passed to the kernel
     auto kernel_params = FMHADecodeKernel::to_underlying_arguments(arguments, workspace.data_ptr());
-#endif
 
     // Run
     launch<FMHADecodeKernel>(kernel_params);
@@ -533,14 +514,9 @@ struct SplitDecodeKernelRunner {
     // Define device-global scratch memory
     size_t workspace_size = FMHAKernel::get_workspace_size(arguments);
     size_t reduce_workspace_size = ReductionSplitKernel::get_workspace_size(reduce_arg);
-#ifdef SGL_KERNEL_STANDALONE_NO_TORCH
-    uint8_t* workspace_ptr =
-        static_cast<uint8_t*>(sgl_standalone::workspace(workspace_size + reduce_workspace_size));
-#else
     torch::Tensor workspace = torch::empty(
         {static_cast<int64_t>(workspace_size + reduce_workspace_size)}, torch::device(torch::kXPU).dtype(torch::kByte));
     uint8_t* workspace_ptr = static_cast<uint8_t*>(workspace.data_ptr());
-#endif
 
     if (!FMHAKernel::can_implement(arguments)) {
       // std::cout << "Invalid Problem Size: " << params.batch_size << 'x'

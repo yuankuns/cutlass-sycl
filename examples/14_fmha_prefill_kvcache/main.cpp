@@ -17,7 +17,6 @@
 #include <vector>
 
 #include "standalone_runtime.hpp"
-#include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp"
 #include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_dispatch.hpp"
 
 namespace {
@@ -46,8 +45,6 @@ struct Config {
   double atol = 5e-2;
   double rtol = 5e-2;
   bool verify = true;
-  bool profile_breakdown = false;
-  std::string mode = "fused";
   bool past_kv_set = false;
   std::vector<int> past_kv_list;
   std::vector<int> seqlen_q_list;
@@ -153,8 +150,7 @@ Config parse_args(int argc, char** argv) {
           << "  --head-dim N --head-dim-v N --paged 0|1 --page-size N\n"
           << "  --page-table-random 0|1\n"
           << "  --causal 0|1 --window-left N --window-right N --sink 0|1\n"
-          << "  --warmup N --iters N --seed N --verify 0|1 --profile-breakdown 0|1 --atol F --rtol F\n"
-          << "  --mode fused|split-baseline\n";
+          << "  --warmup N --iters N --seed N --verify 0|1 --atol F --rtol F\n";
       std::exit(0);
     }
     if (arg.rfind("--", 0) != 0 || i + 1 >= argc) {
@@ -224,15 +220,9 @@ Config parse_args(int argc, char** argv) {
   get_double("atol", cfg.atol);
   get_double("rtol", cfg.rtol);
   get_bool("verify", cfg.verify);
-  get_bool("profile-breakdown", cfg.profile_breakdown);
-  auto mode_it = kv.find("mode");
-  if (mode_it != kv.end()) cfg.mode = mode_it->second;
 
   if (cfg.batch <= 0 || cfg.seqlen_q <= 0 || cfg.seqlen_k <= 0) {
     throw std::runtime_error("batch, seqlen_q, and seqlen_k must be positive");
-  }
-  if (cfg.mode != "fused" && cfg.mode != "split-baseline") {
-    throw std::runtime_error("--mode must be fused or split-baseline");
   }
   if (cfg.past_kv_set && !cfg.past_kv_list.empty()) {
     throw std::runtime_error("--past-kv and --past-kv-list are mutually exclusive");
@@ -601,15 +591,6 @@ void dispatch_prefill(const prefill::Arguments& params) {
   }
 }
 
-void dispatch_decode(const decode::Arguments& params) {
-  if (params.d == 64 && params.dv == 64 && params.page_size == 128 && params.q_group_size == 4 &&
-      !params.use_split_kv) {
-    decode::FmhaDecodeRunner<4, 64, 128>{}(params);
-    return;
-  }
-  throw std::runtime_error("standalone split baseline only instantiates decode q_group=4 head_dim=64 page_size=128");
-}
-
 void run_prefill(
     const Config& cfg,
     const LengthInfo& lengths,
@@ -680,114 +661,6 @@ void run_prefill(
   params.vnew_ptr = v_new;
 
   dispatch_prefill(params);
-}
-
-void run_decode(
-    const Config& cfg,
-    const LengthInfo& lengths,
-    bf16_t* q,
-    bf16_t* k,
-    bf16_t* v,
-    bf16_t* out,
-    int32_t* cu_q,
-    int32_t* cu_k_or_cache_lens,
-    int32_t* page_table,
-    bf16_t* sinks) {
-  decode::Arguments params{};
-  params.is_bf16 = true;
-  params.is_fp32 = false;
-  params.is_e4m3 = false;
-  params.q_ptr = q;
-  params.k_ptr = k;
-  params.v_ptr = v;
-  params.o_ptr = out;
-  params.softmax_sink_ptr = cfg.sink ? sinks : nullptr;
-  params.skip_batch_mask_ptr = nullptr;
-  params.cu_seqlens_q = reinterpret_cast<int*>(cu_q);
-  params.cu_seqlens_k = reinterpret_cast<int*>(cu_k_or_cache_lens);
-  params.cu_seqlens_knew = nullptr;
-  params.b = cfg.batch;
-  params.h = cfg.heads_q;
-  params.h_k = cfg.heads_kv;
-  params.q_group_size = cfg.heads_q / cfg.heads_kv;
-  params.num_kv_splits = -1;
-  params.use_split_kv = false;
-  params.use_sink = cfg.sink;
-  params.is_causal = false;
-  params.is_local = false;
-  params.seqlen_q = lengths.max_q;
-  params.seqlen_k = lengths.max_k;
-  params.seqlen_knew = 0;
-  params.total_q = lengths.total_q;
-  params.total_k = lengths.total_k;
-  params.total_knew = 0;
-  params.b_k = cfg.batch;
-  params.d = cfg.head_dim;
-  params.d_rounded = round_up_headdim_standalone(cfg.head_dim);
-  params.dv = cfg.head_dim_v;
-  params.dv_rounded = round_up_headdim_standalone(cfg.head_dim_v);
-  params.softmax_scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim));
-  params.softcap = 0.0f;
-  params.p_dropout = 1.0f;
-  params.page_table = cfg.paged ? reinterpret_cast<int*>(page_table) : nullptr;
-  params.page_table_batch_stride = cfg.paged ? lengths.page_table_stride : 0;
-  params.max_num_pages_per_seq = cfg.paged ? lengths.page_table_stride : 0;
-  params.page_size = cfg.paged ? cfg.page_size : 0;
-  params.num_pages = cfg.paged ? lengths.total_pages : 0;
-  params.window_size_left = lengths.max_k - 1;
-  params.window_size_right = 0;
-  params.rotary_dim = 0;
-
-  dispatch_decode(params);
-}
-
-sycl::event launch_append_kv(
-    sycl::queue& q,
-    const Config& cfg,
-    const LengthInfo& lengths,
-    bf16_t* k_cache,
-    bf16_t* v_cache,
-    bf16_t* k_new,
-    bf16_t* v_new,
-    int32_t* cache_seqlens_old,
-    int32_t* page_table) {
-  const int heads_kv = cfg.heads_kv;
-  const int head_dim = cfg.head_dim;
-  const int head_dim_v = cfg.head_dim_v;
-  const int page_size = cfg.page_size;
-  const int k_elems = lengths.total_k_new * heads_kv * head_dim;
-  const int v_elems = lengths.total_k_new * heads_kv * head_dim_v;
-  const int total = k_elems + v_elems;
-
-  return q.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for(sycl::range<1>(static_cast<std::size_t>(total)), [=](sycl::id<1> item) {
-      const int linear = static_cast<int>(item[0]);
-      if (linear < k_elems) {
-        const int d = linear % head_dim;
-        const int tmp = linear / head_dim;
-        const int h = tmp % heads_kv;
-        const int nt = tmp / heads_kv;
-        const int dst_tok = cache_seqlens_old[0] + nt;
-        const int page = page_table[dst_tok / page_size];
-        const int offset = dst_tok % page_size;
-        const std::size_t dst =
-            ((static_cast<std::size_t>(page) * page_size + offset) * heads_kv + h) * head_dim + d;
-        k_cache[dst] = k_new[linear];
-      } else {
-        const int v_linear = linear - k_elems;
-        const int d = v_linear % head_dim_v;
-        const int tmp = v_linear / head_dim_v;
-        const int h = tmp % heads_kv;
-        const int nt = tmp / heads_kv;
-        const int dst_tok = cache_seqlens_old[0] + nt;
-        const int page = page_table[dst_tok / page_size];
-        const int offset = dst_tok % page_size;
-        const std::size_t dst =
-            ((static_cast<std::size_t>(page) * page_size + offset) * heads_kv + h) * head_dim_v + d;
-        v_cache[dst] = v_new[v_linear];
-      }
-    });
-  });
 }
 
 std::vector<float> reference_prefill(
@@ -987,52 +860,6 @@ int main(int argc, char** argv) {
 
     std::mt19937 rng(cfg.seed);
     const LengthInfo lengths = make_lengths(cfg);
-    const bool split_baseline = cfg.mode == "split-baseline";
-    Config split_prefill_cfg;
-    Config split_decode_cfg;
-    LengthInfo split_prefill_lengths;
-    LengthInfo split_decode_lengths;
-
-    if (split_baseline) {
-      if (!lengths.append_kv || cfg.batch != 1 || lengths.total_k_new != 1 || lengths.max_k_new != 1 ||
-          lengths.cache_lens_old[0] != lengths.k_lens[0] - 1) {
-        throw std::runtime_error("split-baseline requires batch-1 fixed single-token append at the final KV slot");
-      }
-      if (!cfg.paged || cfg.page_size != 128 || cfg.page_table_random || cfg.head_dim != 64 || cfg.head_dim_v != 64 ||
-          cfg.heads_q % cfg.heads_kv != 0 || cfg.heads_q / cfg.heads_kv != 4) {
-        throw std::runtime_error("split-baseline requires paged identity page128 hd64/dv64 with q_group_size=4");
-      }
-      if (!cfg.causal || cfg.window_left != -1 || cfg.window_right != -1 || cfg.sink) {
-        throw std::runtime_error("split-baseline currently supports only causal no-local no-sink attention");
-      }
-      if (cfg.seqlen_q <= 1) {
-        throw std::runtime_error("split-baseline requires seqlen_q > 1");
-      }
-
-      split_prefill_cfg = cfg;
-      split_prefill_cfg.mode = "fused";
-      split_prefill_cfg.seqlen_q = cfg.seqlen_q - 1;
-      split_prefill_cfg.seqlen_k = lengths.cache_lens_old[0];
-      split_prefill_cfg.k_new_seqlens.clear();
-      split_prefill_cfg.cu_seqlens_k_new.clear();
-      split_prefill_cfg.cache_seqlens_old.clear();
-      split_prefill_cfg.past_kv_set = false;
-      split_prefill_cfg.past_kv_list.clear();
-      split_prefill_cfg.seqlen_q_list.clear();
-      split_prefill_lengths = make_lengths(split_prefill_cfg);
-
-      split_decode_cfg = cfg;
-      split_decode_cfg.mode = "fused";
-      split_decode_cfg.seqlen_q = 1;
-      split_decode_cfg.seqlen_k = lengths.k_lens[0];
-      split_decode_cfg.k_new_seqlens.clear();
-      split_decode_cfg.cu_seqlens_k_new.clear();
-      split_decode_cfg.cache_seqlens_old.clear();
-      split_decode_cfg.past_kv_set = false;
-      split_decode_cfg.past_kv_list.clear();
-      split_decode_cfg.seqlen_q_list.clear();
-      split_decode_lengths = make_lengths(split_decode_cfg);
-    }
 
     std::vector<bf16_t> q_host =
         make_random_bf16(static_cast<std::size_t>(lengths.total_q) * cfg.heads_q * cfg.head_dim, rng);
@@ -1070,26 +897,12 @@ int main(int argc, char** argv) {
     DeviceBuffer<int32_t> cache_seqlens_old_dev;
     DeviceBuffer<int32_t> page_table_dev;
     DeviceBuffer<bf16_t> sinks_dev;
-    DeviceBuffer<int32_t> split_prefill_cu_q_dev;
-    DeviceBuffer<int32_t> split_prefill_cu_k_dev;
-    DeviceBuffer<int32_t> split_decode_cu_q_dev;
-    DeviceBuffer<int32_t> split_decode_cu_k_dev;
 
     q_dev.copy_from_host(q_host);
     k_dev.copy_from_host(k_host);
     v_dev.copy_from_host(v_host);
     cu_q_dev.copy_from_host(lengths.cu_q);
     cu_k_dev.copy_from_host(cu_k_or_cache_lens_host);
-    if (split_baseline) {
-      split_prefill_cu_q_dev = DeviceBuffer<int32_t>(q, split_prefill_lengths.cu_q.size());
-      split_prefill_cu_k_dev = DeviceBuffer<int32_t>(q, split_prefill_lengths.k_lens.size());
-      split_decode_cu_q_dev = DeviceBuffer<int32_t>(q, split_decode_lengths.cu_q.size());
-      split_decode_cu_k_dev = DeviceBuffer<int32_t>(q, split_decode_lengths.k_lens.size());
-      split_prefill_cu_q_dev.copy_from_host(split_prefill_lengths.cu_q);
-      split_prefill_cu_k_dev.copy_from_host(split_prefill_lengths.k_lens);
-      split_decode_cu_q_dev.copy_from_host(split_decode_lengths.cu_q);
-      split_decode_cu_k_dev.copy_from_host(split_decode_lengths.k_lens);
-    }
     if (lengths.append_kv) {
       k_new_dev = DeviceBuffer<bf16_t>(q, k_new_host.size());
       v_new_dev = DeviceBuffer<bf16_t>(q, v_new_host.size());
@@ -1112,7 +925,7 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "device: " << q.get_device().get_info<sycl::info::device::name>() << "\n";
-    std::cout << "shape: mode=" << cfg.mode << " batch=" << cfg.batch << " sq=" << lengths.max_q << " sk=" << lengths.max_k
+    std::cout << "shape: batch=" << cfg.batch << " sq=" << lengths.max_q << " sk=" << lengths.max_k
               << " total_q=" << lengths.total_q << " total_k=" << lengths.total_k
               << " append=" << lengths.append_kv << " total_k_new=" << lengths.total_k_new
               << " hq=" << cfg.heads_q << " hkv=" << cfg.heads_kv << " d=" << cfg.head_dim
@@ -1122,82 +935,26 @@ int main(int argc, char** argv) {
               << ") sink=" << cfg.sink << "\n";
 
     auto launch_once = [&] {
-      std::vector<sycl::event> events;
-      if (!split_baseline) {
-        run_prefill(
-            cfg,
-            lengths,
-            q_dev.data(),
-            k_dev.data(),
-            v_dev.data(),
-            lengths.append_kv ? k_new_dev.data() : nullptr,
-            lengths.append_kv ? v_new_dev.data() : nullptr,
-            out_dev.data(),
-            cu_q_dev.data(),
-            cu_k_dev.data(),
-            lengths.k_new_uses_cu ? cu_k_new_dev.data() : nullptr,
-            lengths.append_kv ? cache_seqlens_old_dev.data() : nullptr,
-            cfg.paged ? page_table_dev.data() : nullptr,
-            cfg.sink ? sinks_dev.data() : nullptr);
-        events.push_back(sgl_standalone::last_event());
-        return events;
-      }
-
-      events.reserve(3);
       run_prefill(
-          split_prefill_cfg,
-          split_prefill_lengths,
+          cfg,
+          lengths,
           q_dev.data(),
           k_dev.data(),
           v_dev.data(),
-          nullptr,
-          nullptr,
+          lengths.append_kv ? k_new_dev.data() : nullptr,
+          lengths.append_kv ? v_new_dev.data() : nullptr,
           out_dev.data(),
-          split_prefill_cu_q_dev.data(),
-          split_prefill_cu_k_dev.data(),
-          nullptr,
-          nullptr,
-          page_table_dev.data(),
-          nullptr);
-      events.push_back(sgl_standalone::last_event());
-      events.push_back(launch_append_kv(
-          q,
-          cfg,
-          lengths,
-          k_dev.data(),
-          v_dev.data(),
-          k_new_dev.data(),
-          v_new_dev.data(),
-          cache_seqlens_old_dev.data(),
-          page_table_dev.data()));
-
-      const std::size_t q_offset =
-          static_cast<std::size_t>(split_prefill_lengths.total_q) * cfg.heads_q * cfg.head_dim;
-      const std::size_t o_offset =
-          static_cast<std::size_t>(split_prefill_lengths.total_q) * cfg.heads_q * cfg.head_dim_v;
-      run_decode(
-          split_decode_cfg,
-          split_decode_lengths,
-          q_dev.data() + q_offset,
-          k_dev.data(),
-          v_dev.data(),
-          out_dev.data() + o_offset,
-          split_decode_cu_q_dev.data(),
-          split_decode_cu_k_dev.data(),
-          page_table_dev.data(),
-          nullptr);
-      events.push_back(sgl_standalone::last_event());
-      return events;
+          cu_q_dev.data(),
+          cu_k_dev.data(),
+          lengths.k_new_uses_cu ? cu_k_new_dev.data() : nullptr,
+          lengths.append_kv ? cache_seqlens_old_dev.data() : nullptr,
+          cfg.paged ? page_table_dev.data() : nullptr,
+          cfg.sink ? sinks_dev.data() : nullptr);
+      return sgl_standalone::last_event();
     };
 
-    auto wait_all = [](const std::vector<sycl::event>& events) {
-      for (auto event : events) {
-        event.wait();
-      }
-    };
-
-    auto first_events = launch_once();
-    wait_all(first_events);
+    auto first_event = launch_once();
+    first_event.wait();
     q.wait();
 
     if (cfg.verify) {
@@ -1219,17 +976,17 @@ int main(int argc, char** argv) {
     }
 
     for (int i = 0; i < cfg.warmup; ++i) {
-      auto events = launch_once();
-      wait_all(events);
+      auto event = launch_once();
+      event.wait();
     }
 
     std::vector<sycl::event> measured_events;
-    measured_events.reserve(static_cast<std::size_t>(std::max(cfg.iters, 0)) * (split_baseline ? 3 : 1));
+    measured_events.reserve(std::max(cfg.iters, 0));
     const auto start = std::chrono::steady_clock::now();
     for (int i = 0; i < cfg.iters; ++i) {
-      auto events = launch_once();
-      wait_all(events);
-      measured_events.insert(measured_events.end(), events.begin(), events.end());
+      auto event = launch_once();
+      event.wait();
+      measured_events.push_back(event);
     }
     const auto end = std::chrono::steady_clock::now();
     const double total_ms = std::chrono::duration<double, std::milli>(end - start).count();
@@ -1242,20 +999,6 @@ int main(int argc, char** argv) {
     std::cout << "profile: kernel_avg_ms=" << kernel_avg_ms << " host_avg_ms=" << host_avg_ms
               << " iters=" << cfg.iters << " estimated_tflops=" << estimate_tflops(cfg, lengths, kernel_avg_ms)
               << "\n";
-    if (cfg.profile_breakdown) {
-      const std::size_t events_per_iter = split_baseline ? 3 : 1;
-      std::vector<double> event_sums(events_per_iter, 0.0);
-      for (std::size_t i = 0; i < measured_events.size(); ++i) {
-        event_sums[i % events_per_iter] += event_duration_ms(measured_events[i]);
-      }
-      if (split_baseline) {
-        std::cout << "profile_breakdown: prefill_ms=" << event_sums[0] / std::max(cfg.iters, 1)
-                  << " append_ms=" << event_sums[1] / std::max(cfg.iters, 1)
-                  << " decode_ms=" << event_sums[2] / std::max(cfg.iters, 1) << "\n";
-      } else {
-        std::cout << "profile_breakdown: fused_ms=" << event_sums[0] / std::max(cfg.iters, 1) << "\n";
-      }
-    }
 
     sgl_standalone::release_workspace();
     return 0;
