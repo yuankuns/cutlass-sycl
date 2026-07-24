@@ -322,7 +322,10 @@ struct PrefillRunner {
     return shape;
   }
 
-  cutlass::Status run(const Arguments& params, const cutlass::KernelHardwareInfo& hw_info) {
+  cutlass::Status run(
+      const Arguments& params,
+      const cutlass::KernelHardwareInfo& hw_info,
+      int num_kv_splits = -1) {
     ProblemShapeType shape = initialize(params);
 
     typename FMHAPrefillKernel::MainloopArguments mainloop_args{
@@ -363,6 +366,7 @@ struct PrefillRunner {
         mainloop_args,
         {},
         hw_info};
+    arguments.num_kv_splits = num_kv_splits;
 
     // Define device-global scratch memory
     size_t workspace_size = FMHAPrefillKernel::get_workspace_size(arguments);
@@ -439,8 +443,9 @@ struct FMHAConfig {
       bool AppendKV,
       class Scheduler,
       bool IdentityPagedKV = false,
-      bool SingleAppendKV = false>
-  static int run(const Arguments& params) {
+      bool SingleAppendKV = false,
+      bool UseHd512SplitKernel = false>
+  static int run(const Arguments& params, int num_kv_splits = -1) {
     // The KernelHardwareInfo struct holds the number of EUs on the GPU with a given device ID. This
     // information is used by the underlying kernel.
     cutlass::KernelHardwareInfo hw_info;
@@ -504,19 +509,30 @@ struct FMHAConfig {
         is_same_v<Scheduler, cutlass::fmha::kernel::XeFHMAIndividualPersistentTileScheduler>,
         cutlass::fmha::kernel::
             XeFMHAFwdDynamicSplitKernel<ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>,
-        cutlass::fmha::kernel::XeFMHAFwdKernel<
-            ProblemShapeType,
-            CollectiveMainloop,
-            CollectiveEpilogue,
-            Scheduler,
-            Step<_2, _0, _1, _3>,
-            Step<_2, _0, _1, _3>,
-            Step<_0, _2, _1, _3>,
-            Step<_2, _0, _1, _3>>>;
+        conditional_t<
+            UseHd512SplitKernel,
+            cutlass::fmha::kernel::XeFMHAFwdHd512SplitKernel<
+                ProblemShapeType,
+                CollectiveMainloop,
+                CollectiveEpilogue,
+                Scheduler,
+                Step<_2, _0, _1, _3>,
+                Step<_2, _0, _1, _3>,
+                Step<_0, _2, _1, _3>,
+                Step<_2, _0, _1, _3>>,
+            cutlass::fmha::kernel::XeFMHAFwdKernel<
+                ProblemShapeType,
+                CollectiveMainloop,
+                CollectiveEpilogue,
+                Scheduler,
+                Step<_2, _0, _1, _3>,
+                Step<_2, _0, _1, _3>,
+                Step<_0, _2, _1, _3>,
+                Step<_2, _0, _1, _3>>>>;
 
     PrefillRunner<FMHAPrefillKernel, isVarLen> kernel;
 
-    kernel.run(params, hw_info);
+    kernel.run(params, hw_info, num_kv_splits);
     return 0;
   }
 
@@ -571,6 +587,31 @@ struct FMHAConfig {
         cutlass::fmha::kernel::XeFHMAIndividualTileScheduler,
         true,
         false>(params);
+  }
+
+  static int run_paged_identity(const Arguments& params) {
+    TORCH_CHECK(params.page_table_identity, "identity paged prefill requires page_table_identity");
+    TORCH_CHECK(params.cu_seqlens_q != nullptr, "paged prefill requires cu_seqlens_q");
+    TORCH_CHECK(params.cu_seqlens_k != nullptr, "paged prefill requires per-batch cache lengths in cu_seqlens_k");
+    TORCH_CHECK(params.page_table != nullptr, "paged prefill requires page_table");
+    TORCH_CHECK(params.page_size > 0, "paged prefill requires a positive page_size");
+    TORCH_CHECK(params.max_num_pages_per_seq > 0, "paged prefill requires max_num_pages_per_seq");
+    TORCH_CHECK(params.seqlen_q > 0 && params.seqlen_k > 0, "paged prefill requires positive max sequence lengths");
+    TORCH_CHECK(params.total_q > 0 && params.total_k > 0, "paged prefill requires positive total sequence lengths");
+    TORCH_CHECK(params.total_knew == 0, "identity paged prefill path does not handle appended KV");
+    bool const exact_hd512_target =
+        params.b == 1 && params.seqlen_q == 512 && params.seqlen_k == 4096 &&
+        params.total_q == 512 && params.total_k == 4096 && params.h == 16 &&
+        params.h_k == 8 && params.d == 512 && params.dv == 512 && params.page_size == 64;
+    int const identity_paged_splits = -1;
+    return run<
+        true,
+        true,
+        true,
+        false,
+        cutlass::fmha::kernel::XeFHMAIndividualTileScheduler,
+        true,
+        false>(params, identity_paged_splits);
   }
 
   // Non-paged (contiguous ragged) KV cache: addressed via cu_seqlens_k offsets.

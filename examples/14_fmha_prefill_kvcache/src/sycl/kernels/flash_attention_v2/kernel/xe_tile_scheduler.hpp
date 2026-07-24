@@ -39,6 +39,10 @@
 namespace cutlass::fmha::kernel {
 
 struct XeFHMAIndividualTileScheduler {
+  static constexpr int StaticNumKVSplits = -1;
+  static constexpr int StaticLeaderKVSplits = -1;
+  static constexpr bool StaticHd512Target = false;
+
   struct Params {
     dim3 grid;
     FastDivmod divmod_num_heads;
@@ -108,7 +112,70 @@ struct XeFHMAIndividualTileScheduler {
   }
 };
 
+struct XeFHMAHd512TargetSplit4TileScheduler {
+  static constexpr int StaticNumKVSplits = 4;
+  static constexpr int StaticLeaderKVSplits = 3;
+  static constexpr bool StaticHd512Target = true;
+
+  struct Params {
+    dim3 grid;
+    int num_kv_splits_ = StaticNumKVSplits;
+  };
+
+  bool valid_ = true;
+  Params params;
+
+  CUTLASS_DEVICE
+  XeFHMAHd512TargetSplit4TileScheduler(Params const& params) : params(params) {}
+
+  template <class ProblemShape, class TileShape>
+  static Params to_underlying_arguments(
+      ProblemShape const& shape,
+      KernelHardwareInfo hw_info,
+      TileShape const& tile_shape,
+      const int& num_kv_splits = StaticNumKVSplits) {
+    using namespace cute;
+    (void)hw_info;
+    (void)num_kv_splits;
+
+    dim3 grid(
+        size(ceil_div(shape.head_size_vo, get<1>(tile_shape))),  // V
+        size(ceil_div(shape.seq_len_qo, get<0>(tile_shape))),    // Q
+        size(shape.batch * shape.num_heads_q * StaticNumKVSplits));
+    return Params{grid, StaticNumKVSplits};
+  }
+
+  template <int Num_SGs>
+  static dim3 get_grid_shape(Params const& params) {
+    return params.grid;
+  }
+
+  CUTLASS_DEVICE
+  bool is_valid() {
+    return valid_;
+  }
+
+  CUTLASS_DEVICE
+  auto get_block_coord() {
+    using namespace cute;
+    int const z = BlockIdxZ();
+    int const idx_kv_split = z & (StaticNumKVSplits - 1);
+    int const head = z >> 2;
+    return make_coord(BlockIdxY(), BlockIdxX(), head, 0, idx_kv_split);
+  }
+
+  CUTLASS_DEVICE
+  XeFHMAHd512TargetSplit4TileScheduler& operator++() {
+    valid_ = false;
+    return *this;
+  }
+};
+
 struct XeFHMAIndividualPersistentTileScheduler {
+  static constexpr int StaticNumKVSplits = -1;
+  static constexpr int StaticLeaderKVSplits = -1;
+  static constexpr bool StaticHd512Target = false;
+
   struct Params {
     dim3 grid;
     FastDivmod divmod_num_heads;
@@ -178,6 +245,10 @@ struct XeFHMAIndividualPersistentTileScheduler {
 };
 
 struct XeReduceSplitKTileScheduler {
+  static constexpr int StaticNumKVSplits = -1;
+  static constexpr int StaticLeaderKVSplits = -1;
+  static constexpr bool StaticHd512Target = false;
+
   struct Params {
     dim3 grid;
     FastDivmod divmod_num_heads;

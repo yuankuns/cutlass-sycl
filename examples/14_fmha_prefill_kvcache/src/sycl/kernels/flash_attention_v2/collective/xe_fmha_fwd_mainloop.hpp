@@ -220,8 +220,8 @@ struct FMHAFwdMainloop<
   static constexpr bool PackGQA = PackGQA_;
   static constexpr bool AppendKV = AppendKV_;
   static constexpr bool IdentityPagedKV = IdentityPagedKV_;
-  static constexpr bool ReuseQFragments = IdentityPagedKV;
   static constexpr bool SingleAppendKV = SingleAppendKV_;
+  static constexpr bool ReuseQFragments = IdentityPagedKV;
   static_assert(!SingleAppendKV || (AppendKV && IdentityPagedKV),
                 "SingleAppendKV is only defined for the identity paged append path");
   using AppendKVStorage = AppendKVParams<AppendKV, typename TensorK_cache::element_type, typename TensorV_cache::element_type>;
