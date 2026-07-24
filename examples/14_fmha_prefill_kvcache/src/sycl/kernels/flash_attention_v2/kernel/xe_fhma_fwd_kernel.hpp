@@ -41,6 +41,10 @@
 #include "sycl/kernels/flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp"
 #include "sycl/kernels/flash_attention_v2/kernel/xe_tile_scheduler.hpp"
 
+#ifndef FMHA_ENABLE_HD512_SPLIT
+#define FMHA_ENABLE_HD512_SPLIT 0
+#endif
+
 namespace cutlass::fmha::kernel {
 
 using namespace cute;
@@ -431,6 +435,1069 @@ class XeFMHAFwdKernel {
         epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id);
       }
     }
+  }
+};
+
+
+template <
+    class ProblemShape_,
+    class CollectiveMainloop_,
+    class CollectiveEpilogue_,
+    class TileScheduler_,
+    class VarLenQLayoutStep_,
+    class VarLenKLayoutStep_,
+    class VarLenVLayoutStep_,
+    class VarLenOLayoutStep_ = VarLenQLayoutStep_,
+    // PackGQA: fold the head_group_q query heads that share a KV head into the
+    // M (q) tile, so a single work-group computes the whole GQA group for one
+    // decode step. Only enabled by the decode runner for the plain attention
+    // case (no causal/local mask, no sink); prefill keeps the default (false)
+    // and is therefore unaffected.
+    bool PackGQA_ = false>
+class XeFMHAFwdHd512SplitKernel {
+ public:
+  //
+  // Type Aliases
+  //
+  using ProblemShape = ProblemShape_;
+  using VariableLength = cutlass::fmha::collective::VariableLength;
+  static constexpr bool is_var_len = cutlass::fmha::collective::is_variable_length_v<typename ProblemShape::SeqLenType>;
+  // Mainloop derived types
+  using CollectiveMainloop = CollectiveMainloop_;
+  using MainloopArguments = typename CollectiveMainloop::Arguments;
+  using MainloopParams = typename CollectiveMainloop::Params;
+
+  using TiledMMAQK = typename CollectiveMainloop::TiledMMAQK;
+  using TiledMMAPV = typename CollectiveMainloop::TiledMMAPV;
+  using TileShapeQK = typename CollectiveMainloop::TileShapeQK;
+  using TileShapePV = typename CollectiveMainloop::TileShapePV;
+  using SubgroupLayoutQK = typename CollectiveMainloop::SubgroupLayoutQK;
+  using ElementQ = typename CollectiveMainloop::TensorQ::element_type;
+  using ElementK = typename CollectiveMainloop::TensorK::element_type;
+  using ElementV = typename CollectiveMainloop::TensorV::element_type;
+
+  using StrideQ = decltype(stride(typename CollectiveMainloop::TensorQ{}));
+  using StrideK = decltype(stride(typename CollectiveMainloop::TensorK{}));
+  using StrideV = decltype(stride(typename CollectiveMainloop::TensorV{}));
+
+  using SGPerWG = typename CollectiveMainloop::SGPerWG;
+
+  using FragA = typename CollectiveMainloop::FragA;
+  using FragARow = typename CollectiveMainloop::FragARow;
+  using ElementA = typename CollectiveMainloop::ElementA;
+
+  static constexpr int max_num_kv_splits = 8;
+  static constexpr int num_elem_per_thread = (size(FragA{}.shape()) + 2 * size(FragARow{}.shape()) + 15) / 16 * 16;
+
+  // Tile scheduler derived types
+  using TileScheduler = TileScheduler_;
+  using TileSchedulerParams = typename TileScheduler::Params;
+  static constexpr int StaticNumKVSplits = TileScheduler::StaticNumKVSplits;
+  static constexpr bool EnableStaticKVSplits = FMHA_ENABLE_HD512_SPLIT && (StaticNumKVSplits > 1);
+
+  // Epilogue derived types
+  using CollectiveEpilogue = CollectiveEpilogue_;
+  using EpilogueArguments = typename CollectiveEpilogue::Arguments;
+  using EpilogueParams = typename CollectiveEpilogue::Params;
+
+  using TileShapeO = typename CollectiveEpilogue::TileShapeO;
+  using ElementO = typename CollectiveEpilogue::TensorO::element_type;
+  using StrideO = decltype(stride(typename CollectiveEpilogue::TensorO{}));
+  static constexpr int TargetTileQ = get<0>(TileShapeQK{})();
+  static constexpr int TargetTileV = get<1>(TileShapeO{})();
+  static constexpr int TargetQTiles = (512 + TargetTileQ - 1) / TargetTileQ;
+  static constexpr int TargetVTilesO = (512 + TargetTileV - 1) / TargetTileV;
+
+  using ElementLSE = void;
+
+  // Sink support from epilogue
+  static constexpr bool Sink = CollectiveEpilogue::Sink;
+  using ElementSink = typename CollectiveEpilogue::ElementSink;
+
+  // Kernel level shared memory storage
+  using MainloopSharedStorage = typename CollectiveMainloop::SharedStorage;
+  using EpilogueSharedStorage = typename CollectiveEpilogue::SharedStorage;
+  union SharedStorage {
+    MainloopSharedStorage mainloop;
+    EpilogueSharedStorage epilogue;
+  };
+
+  static constexpr int SharedStorageSize = is_empty_v<SharedStorage> ? size_t(0) : sizeof(SharedStorage);
+
+  // Device side arguments
+  struct KernelArguments {
+    ProblemShape shape;
+    const ElementQ* Q;
+    StrideQ dQ;
+    const ElementK* K;
+    StrideK dK;
+    const ElementV* V;
+    StrideV dV;
+    ElementO* O;
+    StrideO dO;
+    const ElementK* K_cache;
+    StrideK dK_cache{};
+    const ElementV* V_cache;
+    StrideV dV_cache{};
+    const ElementSink* sm_sink = nullptr;  // Per-head sink logits (nheads,), null if no sink
+    // Per-batch skip mask for two-kernel mix-batch dispatch
+    // If non-null, the tile loop skips batches where mask[idx_b] is true.
+    const bool* skip_batch_mask = nullptr;
+  };
+  using KernelParams = KernelArguments;
+
+  struct Arguments {
+    KernelArguments kernel{};
+    MainloopArguments mainloop{};
+    EpilogueArguments epilogue{};
+    KernelHardwareInfo hw_info{};
+    int num_kv_splits = -1;
+  };
+
+  // Kernel entry point API
+  struct ParamsNoSplit {
+    KernelParams kernel;
+    MainloopParams mainloop;
+    EpilogueParams epilogue;
+    TileSchedulerParams scheduler;
+  };
+
+  struct ParamsSplit {
+    KernelParams kernel;
+    MainloopParams mainloop;
+    EpilogueParams epilogue;
+    TileSchedulerParams scheduler;
+    ElementA* partial_results_ptr = nullptr;
+    int32_t* atomic_reduce_cnt_ptr = nullptr;
+  };
+  using Params = cute::conditional_t<EnableStaticKVSplits, ParamsSplit, ParamsNoSplit>;
+
+  //
+  // Methods
+  //
+
+  static Params to_underlying_arguments(Arguments const& args, void* workspace) {
+    // When packing GQA into M, grid over KV heads instead of Q heads by reusing
+    // the scheduler's num_heads_kv path (num_kv_splits == 1, no actual split).
+    const int sched_num_kv_splits = PackGQA_ ? 1 : -1;
+    auto scheduler = TileScheduler::to_underlying_arguments(
+        args.kernel.shape, args.hw_info, TileShapeO{}, sched_num_kv_splits);
+
+    int32_t* atomic_reduce_cnt_ptr = nullptr;
+    ElementA* partial_results_ptr = nullptr;
+    if constexpr (EnableStaticKVSplits) {
+      constexpr int effective_num_kv_splits = StaticNumKVSplits;
+      int const q_tiles = (int(args.kernel.shape.seq_len_qo) + get<0>(TileShapeO{}) - 1) / get<0>(TileShapeO{});
+      int const v_tiles = (args.kernel.shape.head_size_vo + get<1>(TileShapeO{}) - 1) / get<1>(TileShapeO{});
+      int const output_tiles = args.kernel.shape.batch * args.kernel.shape.num_heads_q * q_tiles * v_tiles;
+      atomic_reduce_cnt_ptr = reinterpret_cast<int32_t*>(workspace);
+      partial_results_ptr = reinterpret_cast<ElementA*>(atomic_reduce_cnt_ptr + output_tiles * SGPerWG::value);
+    }
+
+    if constexpr (EnableStaticKVSplits) {
+      return {
+          args.kernel,
+          CollectiveMainloop::to_underlying_arguments(args.mainloop, workspace),
+          CollectiveEpilogue::to_underlying_arguments(args.epilogue, workspace),
+          scheduler,
+          partial_results_ptr,
+          atomic_reduce_cnt_ptr};
+    } else {
+      return {
+          args.kernel,
+          CollectiveMainloop::to_underlying_arguments(args.mainloop, workspace),
+          CollectiveEpilogue::to_underlying_arguments(args.epilogue, workspace),
+          scheduler};
+    }
+  }
+
+  static bool can_implement(Arguments const& args) {
+    if constexpr (EnableStaticKVSplits) {
+      if (StaticNumKVSplits > max_num_kv_splits) {
+        return false;
+      }
+    } else {
+      if (args.num_kv_splits > 1) {
+        return false;
+      }
+    }
+    return CollectiveMainloop::can_implement(args.mainloop) && CollectiveEpilogue::can_implement(args.epilogue);
+  }
+
+  static int get_workspace_size(Arguments const& args) {
+    if constexpr (!EnableStaticKVSplits) {
+      return 0;
+    } else {
+      constexpr int effective_num_kv_splits = StaticNumKVSplits;
+      int const q_tiles = (int(args.kernel.shape.seq_len_qo) + get<0>(TileShapeO{}) - 1) / get<0>(TileShapeO{});
+      int const v_tiles = (args.kernel.shape.head_size_vo + get<1>(TileShapeO{}) - 1) / get<1>(TileShapeO{});
+      int const output_tiles = args.kernel.shape.batch * args.kernel.shape.num_heads_q * q_tiles * v_tiles;
+      int const wg_size = SGPerWG::value * intel::sg_size;
+      int ws_size = output_tiles * SGPerWG::value * sizeof(int32_t);
+      ws_size += output_tiles * effective_num_kv_splits * wg_size * num_elem_per_thread * sizeof(ElementA);
+      return ws_size;
+    }
+  }
+
+  static cutlass::Status initialize_workspace(
+      Arguments const& args,
+      void* workspace = nullptr,
+      cudaStream_t stream = nullptr,
+      CudaHostAdapter* cuda_adapter = nullptr) {
+    if constexpr (EnableStaticKVSplits) {
+      int const q_tiles = (int(args.kernel.shape.seq_len_qo) + get<0>(TileShapeO{}) - 1) / get<0>(TileShapeO{});
+      int const v_tiles = (args.kernel.shape.head_size_vo + get<1>(TileShapeO{}) - 1) / get<1>(TileShapeO{});
+      int const output_tiles = args.kernel.shape.batch * args.kernel.shape.num_heads_q * q_tiles * v_tiles;
+      compat::fill(reinterpret_cast<int32_t*>(workspace), (int32_t)0, output_tiles * SGPerWG::value);
+    }
+    return Status::kSuccess;
+  }
+
+#if FMHA_ENABLE_HD512_SPLIT
+  CUTLASS_DEVICE
+  void reduce_split2(
+      FragA& out1,
+      FragARow& max_val1,
+      FragARow& exp_sum_val1,
+      FragA& out2,
+      FragARow& max_val2,
+      FragARow& exp_sum_val2) {
+    FragARow max_prev1 = max_val1;
+    FragARow max_prev2 = max_val2;
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < max_val1.size(); i++) {
+      max_val1(i) = sycl::max(max_val1(i), max_val2(i));
+    }
+
+    FragARow rescale1, rescale2;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < max_val1.size(); i++) {
+      rescale1(i) = sycl::native::exp2(max_prev1(i) - max_val1(i));
+      rescale2(i) = sycl::native::exp2(max_prev2(i) - max_val1(i));
+    }
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < exp_sum_val1.size(); i++) {
+      exp_sum_val1(i) = exp_sum_val1(i) * rescale1(i) + exp_sum_val2(i) * rescale2(i);
+    }
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < out1.size(); i++) {
+      out1(i) = out1(i) * broadcast<0>(rescale1, out1, i) + out2(i) * broadcast<0>(rescale2, out2, i);
+    }
+  }
+
+  CUTLASS_DEVICE
+  void reduce_workspace_split(
+      Params const& params,
+      FragA& tArA,
+      FragARow& tA_max,
+      FragARow& tA_sum,
+      int tile_linear,
+      int split_id,
+      int wg_size,
+      int thr_id,
+      int num_kv_splits) {
+    int const read_offset =
+        (tile_linear * num_kv_splits + split_id) * wg_size * num_elem_per_thread +
+        thr_id * num_elem_per_thread;
+    Tensor tPartialRead =
+        make_tensor(params.partial_results_ptr + read_offset, make_shape(Int<num_elem_per_thread>{}));
+    Tensor partial_res = make_tensor<ElementA>(Int<num_elem_per_thread>{});
+    copy(tPartialRead, partial_res);
+
+    FragA split_A;
+    FragARow split_max, split_sum;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(FragA{}.shape()); ++i) {
+      split_A(i) = partial_res(i);
+    }
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(FragARow{}.shape()); ++i) {
+      split_max(i) = partial_res(2 * i + size(FragA{}.shape()));
+      split_sum(i) = partial_res(2 * i + 1 + size(FragA{}.shape()));
+    }
+
+    reduce_split2(tArA, tA_max, tA_sum, split_A, split_max, split_sum);
+  }
+
+  CUTLASS_DEVICE
+  ElementA const* workspace_split_ptr(
+      Params const& params,
+      int tile_linear,
+      int split_id,
+      int wg_size,
+      int thr_id,
+      int num_kv_splits) {
+    int const offset =
+        (tile_linear * num_kv_splits + split_id) * wg_size * num_elem_per_thread +
+        thr_id * num_elem_per_thread;
+    return params.partial_results_ptr + offset;
+  }
+
+  CUTLASS_DEVICE
+  void load_workspace_split_rows(ElementA const* __restrict__ partial_ptr, FragARow& split_max, FragARow& split_sum) {
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(FragARow{}.shape()); ++i) {
+      split_max(i) = partial_ptr[size(FragA{}.shape()) + 2 * i];
+      split_sum(i) = partial_ptr[size(FragA{}.shape()) + 2 * i + 1];
+    }
+  }
+
+  CUTLASS_DEVICE
+  void accumulate_workspace_split_A(ElementA const* __restrict__ partial_ptr, FragA& tArA, FragARow const& scale) {
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tArA.size(); ++i) {
+      tArA(i) += partial_ptr[i] * broadcast<0>(scale, tArA, i);
+    }
+  }
+
+  CUTLASS_DEVICE
+  void reduce_workspace_split4_leader0(
+      Params const& params,
+      FragA& tArA,
+      FragARow& tA_max,
+      FragARow& tA_sum,
+      int tile_linear,
+      int wg_size,
+      int thr_id,
+      int num_kv_splits) {
+    ElementA const* __restrict__ partial1 =
+        workspace_split_ptr(params, tile_linear, 1, wg_size, thr_id, num_kv_splits);
+    ElementA const* __restrict__ partial2 =
+        workspace_split_ptr(params, tile_linear, 2, wg_size, thr_id, num_kv_splits);
+    ElementA const* __restrict__ partial3 =
+        workspace_split_ptr(params, tile_linear, 3, wg_size, thr_id, num_kv_splits);
+
+    FragARow max0 = tA_max;
+    FragARow max1, max2, max3;
+    FragARow sum1, sum2, sum3;
+    load_workspace_split_rows(partial1, max1, sum1);
+    load_workspace_split_rows(partial2, max2, sum2);
+    load_workspace_split_rows(partial3, max3, sum3);
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tA_max.size(); ++i) {
+      tA_max(i) = sycl::max(sycl::max(max0(i), max1(i)), sycl::max(max2(i), max3(i)));
+    }
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tA_max.size(); ++i) {
+      max0(i) = sycl::native::exp2(max0(i) - tA_max(i));
+      max1(i) = sycl::native::exp2(max1(i) - tA_max(i));
+      max2(i) = sycl::native::exp2(max2(i) - tA_max(i));
+      max3(i) = sycl::native::exp2(max3(i) - tA_max(i));
+    }
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tA_sum.size(); ++i) {
+      tA_sum(i) = tA_sum(i) * max0(i) + sum1(i) * max1(i) + sum2(i) * max2(i) + sum3(i) * max3(i);
+    }
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tArA.size(); ++i) {
+      tArA(i) *= broadcast<0>(max0, tArA, i);
+    }
+    accumulate_workspace_split_A(partial1, tArA, max1);
+    accumulate_workspace_split_A(partial2, tArA, max2);
+    accumulate_workspace_split_A(partial3, tArA, max3);
+  }
+
+  CUTLASS_DEVICE
+  void reduce_workspace_split4_leader3(
+      Params const& params,
+      FragA& tArA,
+      FragARow& tA_max,
+      FragARow& tA_sum,
+      int tile_linear,
+      int wg_size,
+      int thr_id,
+      int num_kv_splits) {
+    ElementA const* __restrict__ partial0 =
+        workspace_split_ptr(params, tile_linear, 0, wg_size, thr_id, num_kv_splits);
+    ElementA const* __restrict__ partial1 =
+        workspace_split_ptr(params, tile_linear, 1, wg_size, thr_id, num_kv_splits);
+    ElementA const* __restrict__ partial2 =
+        workspace_split_ptr(params, tile_linear, 2, wg_size, thr_id, num_kv_splits);
+
+    FragARow max0, max1, max2;
+    FragARow sum0, sum1, sum2;
+    FragARow max3 = tA_max;
+    load_workspace_split_rows(partial0, max0, sum0);
+    load_workspace_split_rows(partial1, max1, sum1);
+    load_workspace_split_rows(partial2, max2, sum2);
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tA_max.size(); ++i) {
+      tA_max(i) = sycl::max(sycl::max(max0(i), max1(i)), sycl::max(max2(i), max3(i)));
+    }
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tA_max.size(); ++i) {
+      max0(i) = sycl::native::exp2(max0(i) - tA_max(i));
+      max1(i) = sycl::native::exp2(max1(i) - tA_max(i));
+      max2(i) = sycl::native::exp2(max2(i) - tA_max(i));
+      max3(i) = sycl::native::exp2(max3(i) - tA_max(i));
+    }
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tA_sum.size(); ++i) {
+      tA_sum(i) = sum0(i) * max0(i) + sum1(i) * max1(i) + sum2(i) * max2(i) + tA_sum(i) * max3(i);
+    }
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tArA.size(); ++i) {
+      tArA(i) *= broadcast<0>(max3, tArA, i);
+    }
+    accumulate_workspace_split_A(partial0, tArA, max0);
+    accumulate_workspace_split_A(partial1, tArA, max1);
+    accumulate_workspace_split_A(partial2, tArA, max2);
+  }
+#endif
+
+  static dim3 get_grid_shape(Params const& params) {
+    return TileScheduler::template get_grid_shape<SGPerWG::value>(params.scheduler);
+  }
+
+  static dim3 get_block_shape() {
+    return dim3(SGPerWG::value * intel::sg_size, 1, 1);
+  }
+
+  CUTLASS_DEVICE
+  Shape<int, int, int> get_sequence_length_shape(ProblemShape const& problem_shape, int const& batch) {
+    if constexpr (is_var_len) {
+      // return cutlass::fmha::collective::apply_variable_length(
+      //     Shape<VariableLength, VariableLength, VariableLength>{
+      //         problem_shape.seq_len_qo, problem_shape.seq_len_kv, problem_shape.seq_len_kv_cache},
+      //     batch);
+
+      int seq_len_q =
+          problem_shape.seq_len_qo.cumulative_length[batch + 1] - problem_shape.seq_len_qo.cumulative_length[batch];
+      int seq_len_k_new = 0;
+      // Paged KV passes per-batch cache lengths in cu_seqlens_k (cumulative_length[b]
+      // already holds this batch's KV length). Non-paged KV passes a cumulative
+      // prefix-sum array (b+1 entries), so the per-batch length is the difference.
+      int seq_len_k_cache;
+      if constexpr (CollectiveMainloop::PagedKV) {
+        seq_len_k_cache = problem_shape.seq_len_kv_cache.cumulative_length[batch];
+      } else {
+        seq_len_k_cache = problem_shape.seq_len_kv_cache.cumulative_length[batch + 1] -
+                          problem_shape.seq_len_kv_cache.cumulative_length[batch];
+      }
+      return cute::make_tuple<int, int, int>(seq_len_q, seq_len_k_new, seq_len_k_cache);
+
+    } else {
+      return Shape<int, int, int>{problem_shape.seq_len_qo, problem_shape.seq_len_kv, problem_shape.seq_len_kv_cache};
+    }
+  }
+
+  CUTLASS_DEVICE
+  int get_k_new_len(MainloopParams const& mainloop, int batch) {
+    if constexpr (CollectiveMainloop::AppendKV) {
+      if constexpr (CollectiveMainloop::SingleAppendKV) {
+        (void)mainloop;
+        (void)batch;
+        return 1;
+      }
+      if (mainloop.append.ptr_K_new == nullptr || mainloop.append.ptr_V_new == nullptr ||
+          mainloop.append.ptr_cache_seqlens == nullptr || mainloop.append.total_k_new <= 0 ||
+          (mainloop.append.ptr_cu_seqlens_k_new == nullptr && mainloop.append.seq_len_kv_new <= 0)) {
+        return 0;
+      }
+      if (mainloop.append.ptr_cu_seqlens_k_new != nullptr) {
+        return mainloop.append.ptr_cu_seqlens_k_new[batch + 1] -
+               mainloop.append.ptr_cu_seqlens_k_new[batch];
+      }
+      return mainloop.append.seq_len_kv_new;
+    } else {
+      (void)mainloop;
+      (void)batch;
+      return 0;
+    }
+  }
+
+  CUTLASS_DEVICE
+  void operator()(Params const& params, char* smem_buf) {
+    using namespace sycl::ext::oneapi::this_work_item;
+
+    SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
+
+    if constexpr (!TileScheduler::StaticHd512Target) {
+      auto& p = params.kernel;
+      ProblemShape const& s = p.shape;
+      int head_group_q = s.num_heads_q / s.num_heads_kv;
+
+      int thr_id = int(ThreadIdxX());
+      int q_sg_tile = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})));
+
+      auto cS = make_identity_tensor(take<0, 2>(TiledMMAQK{}.tile_mnk()));
+      auto tScS = TiledMMAQK{}.get_slice(thr_id).partition_C(cS);
+      auto q_offset_wi = get<0>(tScS(0));
+      auto q_offset_sg = group_broadcast(sycl::ext::oneapi::this_work_item::get_sub_group(), q_offset_wi, 0);
+
+      TileScheduler tile_scheduler{params.scheduler};
+
+      CUTLASS_PRAGMA_NO_UNROLL
+      for (; tile_scheduler.is_valid(); ++tile_scheduler) {
+        auto [blk_q, blk_v, head_q, idx_b, unused] = tile_scheduler.get_block_coord();  // (Q,V,h,b)
+        // Mix-batch dispatch: skip batches not owned by this kernel launch.
+        if (p.skip_batch_mask != nullptr && p.skip_batch_mask[idx_b]) continue;
+        auto blk_qv = make_coord(blk_q, blk_v);
+        // PackGQA: the scheduler grids over KV heads, so head_q already is the KV
+        // head index and the head_group_q query heads are folded into the M tile.
+        int head = PackGQA_ ? head_q : head_q / head_group_q;
+
+        auto sequence_length_shape = get_sequence_length_shape(s, idx_b);
+        auto [seq_len_qo, seq_len_kv, seq_len_kv_cache] = sequence_length_shape;
+        int seq_k_eff = seq_len_kv_cache;
+        if constexpr (CollectiveMainloop::AppendKV) {
+          if constexpr (CollectiveMainloop::SingleAppendKV) {
+            seq_k_eff = seq_len_kv_cache;
+          } else {
+            int const seq_k_new = get_k_new_len(params.mainloop, idx_b);
+            if (seq_k_new > 0) {
+              seq_k_eff = params.mainloop.append.ptr_cache_seqlens[idx_b] + seq_k_new;
+            }
+          }
+        }
+        // M extent of the Q/O tile: the packed GQA group for decode, otherwise the
+        // query sequence length. Masking below still uses the real seq_len_qo so
+        // the decode KV position (seq_len_kv_cache - seq_len_qo) stays correct.
+        const int m_extent = PackGQA_ ? head_group_q : seq_len_qo;
+        if (blk_q * get<0>(TileShapeQK{}) >= m_extent) continue;
+        // auto offset = cute::min(seq_len_qo, seq_len_kv);
+        // auto discard_seq_coord = seq_len_qo - offset;
+        // auto full_tile_offset = seq_len_kv - offset;
+        // auto offset = cute::min(seq_len_qo, seq_len_kv_cache);
+        auto offset = seq_len_qo;
+        auto discard_seq_coord = seq_len_qo - offset;
+        auto full_tile_offset = seq_k_eff - offset;
+        int seq_coord = cute::min(seq_len_qo, (blk_q * get<0>(TileShapeQK{}) + q_offset_sg));
+
+        // if (CollectiveMainloop::CausalMask && seq_coord < discard_seq_coord) continue;
+
+        // const int seq_len_new = CollectiveMainloop::CausalMask
+        //                             ? full_tile_offset + cute::min(seq_len_kv, seq_coord - discard_seq_coord) +
+        //                             q_sg_tile : seq_len_kv;
+        // const int seq_len = seq_len_new + seq_len_kv_cache;
+        // const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
+
+        const int seq_len = CollectiveMainloop::CausalMask
+                                ? cute::min(seq_k_eff, full_tile_offset + seq_coord + q_sg_tile)
+                                : seq_k_eff;
+        const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
+        const int k_blocks_causal =
+            CollectiveMainloop::CausalMask ? (seq_coord + full_tile_offset) / get<1>(TileShapeQK{}) : 0;
+        int append_store_len = -1;
+        if constexpr (CollectiveMainloop::AppendKV) {
+          if constexpr (CollectiveMainloop::SingleAppendKV) {
+            append_store_len = 1;
+            if constexpr (CollectiveMainloop::CausalMask && !PackGQA_) {
+              int const tile_q = get<0>(TileShapeQK{});
+              append_store_len = (blk_q + 1) * tile_q >= seq_len_qo ? 1 : 0;
+            }
+          } else {
+            int const seq_k_new = get_k_new_len(params.mainloop, idx_b);
+            if (seq_k_new > 0) {
+              append_store_len = seq_k_new;
+              if constexpr (CollectiveMainloop::CausalMask && !PackGQA_) {
+                // Without a grid-wide barrier, each WG must write every appended
+                // token it may read; causal tiles only need the visible prefix.
+                int const cache_len_old = params.mainloop.append.ptr_cache_seqlens[idx_b];
+                int const tile_q = get<0>(TileShapeQK{});
+                int const q_tile_end = cute::min(seq_len_qo, (blk_q + 1) * tile_q);
+                int const visible_k_end = cute::min(seq_k_eff, full_tile_offset + q_tile_end);
+                append_store_len = cute::max(0, visible_k_end - cache_len_old);
+                append_store_len = cute::min(append_store_len, seq_k_new);
+              }
+            }
+          }
+        }
+
+        // Sliding-window pruning: skip K blocks that are entirely outside the
+        // [row - window_size_left, row + window_size_right] band for all rows in
+        // this Q-tile. Mirrors the LocalMask optimization on the decode path.
+        // Use Q-tile granularity so all subgroups in the WG agree on the loop
+        // count (avoids per-SG barrier mismatch).
+        int blk_k0 = 0;
+        int blk_k1 = k_blocks;
+        if constexpr (CollectiveMainloop::LocalMask) {
+          const int tile_q = get<0>(TileShapeQK{});
+          const int tile_k = get<1>(TileShapeQK{});
+          // PackGQA decode folds query heads (not sequence positions) into the M
+          // tile, so every row is the single decode token at KV position
+          // full_tile_offset; the sliding-window band is independent of blk_q.
+          const int q_tile_min_row_kv = PackGQA_ ? full_tile_offset : (blk_q * tile_q + full_tile_offset);
+          const int q_tile_max_row_kv = PackGQA_ ? full_tile_offset : (q_tile_min_row_kv + tile_q - 1);
+          const int lo_kv = cute::max(0, q_tile_min_row_kv - params.mainloop.window_size_left);
+          const int hi_kv_plus_one = q_tile_max_row_kv + params.mainloop.window_size_right + 1;
+          blk_k0 = lo_kv / tile_k;
+          blk_k1 = cute::min(k_blocks, cute::ceil_div(hi_kv_plus_one, tile_k));
+          if (blk_k0 >= blk_k1) continue;
+        }
+
+        int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
+        int offset_k_cache = 0, offset_v_cache = 0;
+        if constexpr (is_var_len) {
+          auto qo_cumulative = s.seq_len_qo.cumulative_length;
+          auto kv_cumulative = s.seq_len_kv.cumulative_length;
+          offset_q = s.num_heads_q * s.head_size_qk * qo_cumulative[idx_b];
+          // offset_k = s.num_heads_kv * s.head_size_qk * kv_cumulative[idx_b];
+          // offset_v = s.num_heads_kv * s.head_size_vo * kv_cumulative[idx_b];
+          offset_o = s.num_heads_q * s.head_size_vo * qo_cumulative[idx_b];
+          if (s.seq_len_kv_cache.cumulative_length) {
+            auto kv_cumulative_cache = s.seq_len_kv_cache.cumulative_length;
+            // Non-paged KV stores all batches in one contiguous ragged buffer, so each
+            // batch starts at its cumulative KV offset. Paged KV uses the page table for
+            // absolute addressing, so no base offset is applied here.
+            if constexpr (!CollectiveMainloop::PagedKV) {
+              offset_k_cache = s.num_heads_kv * s.head_size_qk * kv_cumulative_cache[idx_b];
+              offset_v_cache = s.num_heads_kv * s.head_size_vo * kv_cumulative_cache[idx_b];
+            }
+          }
+        }
+
+        auto batch_dim = is_var_len ? 1 : s.batch;
+        // Paged KV addresses the whole cache buffer (page table remaps tiles), so the
+        // sequence extent is the global total. Non-paged KV points at a single batch's
+        // contiguous region, so the extent must be this batch's KV length to keep the
+        // 2D block loads in-bounds.
+        int kv_seq_extent = int(seq_len_kv_cache);
+        if constexpr (CollectiveMainloop::PagedKV && is_var_len) {
+          kv_seq_extent = int(s.seq_len_kv_cache.total_length);
+        }
+        // PackGQA folds the head_group_q query heads into M and grids over KV
+        // heads, so the Q/O head extent collapses to num_heads_kv.
+        auto q_head_count = PackGQA_ ? s.num_heads_kv : s.num_heads_q;
+        auto shape_Q = make_shape(m_extent, s.head_size_qk, q_head_count, batch_dim);
+        auto shape_K = make_shape(kv_seq_extent, s.head_size_qk, s.num_heads_kv, batch_dim);
+        auto shape_V = make_shape(s.head_size_vo, kv_seq_extent, s.num_heads_kv, batch_dim);
+        auto shape_O = make_shape(m_extent, s.head_size_vo, q_head_count, batch_dim);
+
+        auto dcQ = const_cast<ElementQ*>(p.Q + offset_q);
+        auto dcK_cache = const_cast<ElementK*>(p.K_cache + offset_k_cache);
+        auto dcV_cache = const_cast<ElementV*>(p.V_cache + offset_v_cache);
+        auto dcO = const_cast<ElementO*>(p.O + offset_o);
+        // NHD layout for GQA
+        auto layout_q = is_var_len ? make_ordered_layout(shape_Q, VarLenQLayoutStep_{}) : make_layout(shape_Q, p.dQ);
+        auto layout_k = is_var_len ? make_ordered_layout(shape_K, VarLenKLayoutStep_{}) : make_layout(shape_K, p.dK);
+        auto layout_v = is_var_len ? make_ordered_layout(shape_V, VarLenVLayoutStep_{}) : make_layout(shape_V, p.dV);
+
+        // NHD layout for GQA
+        auto layout_o = is_var_len ? make_ordered_layout(shape_O, VarLenOLayoutStep_{}) : make_layout(shape_O, p.dO);
+
+        Tensor Q = make_tensor(make_gmem_ptr(dcQ), layout_q);
+        Tensor K_cache = make_tensor(make_gmem_ptr(dcK_cache), layout_k);
+        Tensor V_cache = make_tensor(make_gmem_ptr(dcV_cache), layout_v);
+        Tensor O = make_tensor(make_gmem_ptr(dcO), layout_o);
+        // O accumulator types
+        FragA tArA;
+        FragARow tA_max, tA_sum;
+
+        // Main loop
+        int l_coord = is_var_len ? 0 : idx_b;
+        // With PackGQA the Q/O head dimension is indexed by the KV head; otherwise
+        // by the (un-grouped) query head.
+        int q_head_idx = PackGQA_ ? head : head_q;
+        CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
+        mainloop(
+            Q(_, _, q_head_idx, l_coord),
+            K_cache(_, _, head, l_coord),
+            V_cache(_, _, head, l_coord),
+            tArA,
+            tA_max,
+            tA_sum,
+            blk_qv,
+            blk_k0,
+            blk_k1,
+            k_blocks,
+            k_blocks_causal,
+            thr_id,
+            seq_len,
+            seq_k_eff,
+            idx_b,
+            head,
+            s.num_heads_kv,
+            full_tile_offset,
+            discard_seq_coord,
+            append_store_len,
+            K_cache(_, _, head, l_coord),
+            V_cache(_, _, head, l_coord));
+
+        if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
+          sycl::group_barrier(get_work_group<3>());
+        }
+
+        // Epilogue
+        CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
+        if constexpr (Sink) {
+          if constexpr (PackGQA_) {
+            // Packed decode: pass the per-row sink base for this KV head's group
+            // (heads head*head_group_q .. +head_group_q-1), applied per row in the
+            // epilogue.
+            epilogue(
+                O(_, _, q_head_idx, l_coord),
+                tArA,
+                tA_max,
+                tA_sum,
+                blk_qv,
+                thr_id,
+                ElementSink{},
+                p.sm_sink + head * head_group_q,
+                head_group_q);
+          } else {
+            epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, p.sm_sink[q_head_idx]);
+          }
+        } else {
+          epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id);
+        }
+      }
+    }
+#if FMHA_ENABLE_HD512_SPLIT
+    else {
+    auto& p = params.kernel;
+    ProblemShape const& s = p.shape;
+    int const head_group_q = TileScheduler::StaticHd512Target ? 2 : s.num_heads_q / s.num_heads_kv;
+
+    int thr_id = int(ThreadIdxX());
+    int sub_group_id = thr_id / intel::sg_size;
+    int q_sg_tile = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})));
+
+    auto cS = make_identity_tensor(take<0, 2>(TiledMMAQK{}.tile_mnk()));
+    auto tScS = TiledMMAQK{}.get_slice(thr_id).partition_C(cS);
+    auto q_offset_wi = get<0>(tScS(0));
+    auto q_offset_sg = group_broadcast(sycl::ext::oneapi::this_work_item::get_sub_group(), q_offset_wi, 0);
+
+    TileScheduler tile_scheduler{params.scheduler};
+
+    CUTLASS_PRAGMA_NO_UNROLL
+    for (; tile_scheduler.is_valid(); ++tile_scheduler) {
+      auto [blk_q, blk_v, head_q, idx_b, idx_kv_split] = tile_scheduler.get_block_coord();  // (Q,V,h,b,split)
+      // Mix-batch dispatch: skip batches not owned by this kernel launch.
+      if constexpr (!TileScheduler::StaticHd512Target) {
+        if (p.skip_batch_mask != nullptr && p.skip_batch_mask[idx_b]) continue;
+      }
+      auto blk_qv = make_coord(blk_q, blk_v);
+      // PackGQA: the scheduler grids over KV heads, so head_q already is the KV
+      // head index and the head_group_q query heads are folded into the M tile.
+      int const head = TileScheduler::StaticHd512Target ? (head_q >> 1) : (PackGQA_ ? head_q : head_q / head_group_q);
+
+      int seq_len_qo = 0;
+      int seq_len_kv = 0;
+      int seq_len_kv_cache = 0;
+      if constexpr (TileScheduler::StaticHd512Target) {
+        seq_len_qo = 512;
+        seq_len_kv_cache = 4096;
+      } else {
+        auto sequence_length_shape = get_sequence_length_shape(s, idx_b);
+        seq_len_qo = get<0>(sequence_length_shape);
+        seq_len_kv = get<1>(sequence_length_shape);
+        seq_len_kv_cache = get<2>(sequence_length_shape);
+      }
+      int seq_k_eff = TileScheduler::StaticHd512Target ? 4096 : seq_len_kv_cache;
+      if constexpr (CollectiveMainloop::AppendKV) {
+        if constexpr (CollectiveMainloop::SingleAppendKV) {
+          seq_k_eff = seq_len_kv_cache;
+        } else {
+          int const seq_k_new = get_k_new_len(params.mainloop, idx_b);
+          if (seq_k_new > 0) {
+            seq_k_eff = params.mainloop.append.ptr_cache_seqlens[idx_b] + seq_k_new;
+          }
+        }
+      }
+      // M extent of the Q/O tile: the packed GQA group for decode, otherwise the
+      // query sequence length. Masking below still uses the real seq_len_qo so
+      // the decode KV position (seq_len_kv_cache - seq_len_qo) stays correct.
+      const int m_extent = TileScheduler::StaticHd512Target ? 512 : (PackGQA_ ? head_group_q : seq_len_qo);
+      if constexpr (!TileScheduler::StaticHd512Target) {
+        if (blk_q * get<0>(TileShapeQK{}) >= m_extent) continue;
+      }
+      // auto offset = cute::min(seq_len_qo, seq_len_kv);
+      // auto discard_seq_coord = seq_len_qo - offset;
+      // auto full_tile_offset = seq_len_kv - offset;
+      // auto offset = cute::min(seq_len_qo, seq_len_kv_cache);
+      int discard_seq_coord = 0;
+      int full_tile_offset = 0;
+      int seq_coord = 0;
+      if constexpr (TileScheduler::StaticHd512Target) {
+        discard_seq_coord = 0;
+        full_tile_offset = 3584;
+        seq_coord = int(blk_q) * 256 + q_offset_sg;
+      } else {
+        auto offset = seq_len_qo;
+        discard_seq_coord = seq_len_qo - offset;
+        full_tile_offset = seq_k_eff - offset;
+        seq_coord = cute::min(seq_len_qo, (blk_q * get<0>(TileShapeQK{}) + q_offset_sg));
+      }
+
+      // if (CollectiveMainloop::CausalMask && seq_coord < discard_seq_coord) continue;
+
+      // const int seq_len_new = CollectiveMainloop::CausalMask
+      //                             ? full_tile_offset + cute::min(seq_len_kv, seq_coord - discard_seq_coord) +
+      //                             q_sg_tile : seq_len_kv;
+      // const int seq_len = seq_len_new + seq_len_kv_cache;
+      // const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
+
+      int seq_len = 0;
+      int k_blocks = 0;
+      int k_blocks_causal = 0;
+      if constexpr (TileScheduler::StaticHd512Target) {
+        int const q_end = int(blk_q) * TargetTileQ + q_offset_sg + q_sg_tile;
+        seq_len = q_end >= 512 ? 4096 : 3584 + q_end;
+        k_blocks = q_end >= 512 ? 64 : 56 + ((q_end + 63) >> 6);
+        k_blocks_causal = 56 + ((int(blk_q) * TargetTileQ + q_offset_sg) >> 6);
+      } else {
+        seq_len = CollectiveMainloop::CausalMask
+            ? cute::min(seq_k_eff, full_tile_offset + seq_coord + q_sg_tile)
+            : seq_k_eff;
+        k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
+        k_blocks_causal =
+            CollectiveMainloop::CausalMask ? (seq_coord + full_tile_offset) / get<1>(TileShapeQK{}) : 0;
+      }
+      int append_store_len = -1;
+      if constexpr (CollectiveMainloop::AppendKV) {
+        if constexpr (CollectiveMainloop::SingleAppendKV) {
+          append_store_len = 1;
+          if constexpr (CollectiveMainloop::CausalMask && !PackGQA_) {
+            int const tile_q = get<0>(TileShapeQK{});
+            append_store_len = (blk_q + 1) * tile_q >= seq_len_qo ? 1 : 0;
+          }
+        } else {
+          int const seq_k_new = get_k_new_len(params.mainloop, idx_b);
+          if (seq_k_new > 0) {
+            append_store_len = seq_k_new;
+            if constexpr (CollectiveMainloop::CausalMask && !PackGQA_) {
+              // Without a grid-wide barrier, each WG must write every appended
+              // token it may read; causal tiles only need the visible prefix.
+              int const cache_len_old = params.mainloop.append.ptr_cache_seqlens[idx_b];
+              int const tile_q = get<0>(TileShapeQK{});
+              int const q_tile_end = cute::min(seq_len_qo, (blk_q + 1) * tile_q);
+              int const visible_k_end = cute::min(seq_k_eff, full_tile_offset + q_tile_end);
+              append_store_len = cute::max(0, visible_k_end - cache_len_old);
+              append_store_len = cute::min(append_store_len, seq_k_new);
+            }
+          }
+        }
+      }
+
+      // Sliding-window pruning: skip K blocks that are entirely outside the
+      // [row - window_size_left, row + window_size_right] band for all rows in
+      // this Q-tile. Mirrors the LocalMask optimization on the decode path.
+      // Use Q-tile granularity so all subgroups in the WG agree on the loop
+      // count (avoids per-SG barrier mismatch).
+      int blk_k0 = 0;
+      int blk_k1 = k_blocks;
+      if constexpr (CollectiveMainloop::LocalMask) {
+        const int tile_q = get<0>(TileShapeQK{});
+        const int tile_k = get<1>(TileShapeQK{});
+        // PackGQA decode folds query heads (not sequence positions) into the M
+        // tile, so every row is the single decode token at KV position
+        // full_tile_offset; the sliding-window band is independent of blk_q.
+        const int q_tile_min_row_kv = PackGQA_ ? full_tile_offset : (blk_q * tile_q + full_tile_offset);
+        const int q_tile_max_row_kv = PackGQA_ ? full_tile_offset : (q_tile_min_row_kv + tile_q - 1);
+        const int lo_kv = cute::max(0, q_tile_min_row_kv - params.mainloop.window_size_left);
+        const int hi_kv_plus_one = q_tile_max_row_kv + params.mainloop.window_size_right + 1;
+        blk_k0 = lo_kv / tile_k;
+        blk_k1 = cute::min(k_blocks, cute::ceil_div(hi_kv_plus_one, tile_k));
+        if (blk_k0 >= blk_k1) continue;
+      }
+
+      int split_blk_k0 = blk_k0;
+      int split_blk_k1 = blk_k1;
+      if constexpr (StaticNumKVSplits > 1) {
+        constexpr int num_kv_splits = StaticNumKVSplits;
+        int const total_k_blocks = blk_k1 - blk_k0;
+        int const blocks_per_split = cute::ceil_div(total_k_blocks, num_kv_splits);
+        split_blk_k0 = blk_k0 + idx_kv_split * blocks_per_split;
+        split_blk_k1 = cute::min(blk_k1, split_blk_k0 + blocks_per_split);
+        split_blk_k0 = cute::min(split_blk_k0, blk_k1);
+      }
+
+      int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
+      int offset_k_cache = 0, offset_v_cache = 0;
+      if constexpr (is_var_len) {
+        auto qo_cumulative = s.seq_len_qo.cumulative_length;
+        auto kv_cumulative = s.seq_len_kv.cumulative_length;
+        offset_q = s.num_heads_q * s.head_size_qk * qo_cumulative[idx_b];
+        // offset_k = s.num_heads_kv * s.head_size_qk * kv_cumulative[idx_b];
+        // offset_v = s.num_heads_kv * s.head_size_vo * kv_cumulative[idx_b];
+        offset_o = s.num_heads_q * s.head_size_vo * qo_cumulative[idx_b];
+        if (s.seq_len_kv_cache.cumulative_length) {
+          auto kv_cumulative_cache = s.seq_len_kv_cache.cumulative_length;
+          // Non-paged KV stores all batches in one contiguous ragged buffer, so each
+          // batch starts at its cumulative KV offset. Paged KV uses the page table for
+          // absolute addressing, so no base offset is applied here.
+          if constexpr (!CollectiveMainloop::PagedKV) {
+            offset_k_cache = s.num_heads_kv * s.head_size_qk * kv_cumulative_cache[idx_b];
+            offset_v_cache = s.num_heads_kv * s.head_size_vo * kv_cumulative_cache[idx_b];
+          }
+        }
+      }
+
+      auto batch_dim = TileScheduler::StaticHd512Target ? 1 : (is_var_len ? 1 : s.batch);
+      // Paged KV addresses the whole cache buffer (page table remaps tiles), so the
+      // sequence extent is the global total. Non-paged KV points at a single batch's
+      // contiguous region, so the extent must be this batch's KV length to keep the
+      // 2D block loads in-bounds.
+      int kv_seq_extent = TileScheduler::StaticHd512Target ? 4096 : int(seq_len_kv_cache);
+      if constexpr (CollectiveMainloop::PagedKV && is_var_len) {
+        kv_seq_extent = int(s.seq_len_kv_cache.total_length);
+      }
+      // PackGQA folds the head_group_q query heads into M and grids over KV
+      // heads, so the Q/O head extent collapses to num_heads_kv.
+      auto q_head_count = TileScheduler::StaticHd512Target ? 16 : (PackGQA_ ? s.num_heads_kv : s.num_heads_q);
+      auto kv_head_count = TileScheduler::StaticHd512Target ? 8 : s.num_heads_kv;
+      auto head_size_qk = TileScheduler::StaticHd512Target ? 512 : s.head_size_qk;
+      auto head_size_vo = TileScheduler::StaticHd512Target ? 512 : s.head_size_vo;
+      auto shape_Q = make_shape(m_extent, head_size_qk, q_head_count, batch_dim);
+      auto shape_K = make_shape(kv_seq_extent, head_size_qk, kv_head_count, batch_dim);
+      auto shape_V = make_shape(head_size_vo, kv_seq_extent, kv_head_count, batch_dim);
+      auto shape_O = make_shape(m_extent, head_size_vo, q_head_count, batch_dim);
+
+      auto dcQ = const_cast<ElementQ*>(p.Q + offset_q);
+      auto dcK_cache = const_cast<ElementK*>(p.K_cache + offset_k_cache);
+      auto dcV_cache = const_cast<ElementV*>(p.V_cache + offset_v_cache);
+      auto dcO = const_cast<ElementO*>(p.O + offset_o);
+      // NHD layout for GQA
+      auto layout_q = is_var_len ? make_ordered_layout(shape_Q, VarLenQLayoutStep_{}) : make_layout(shape_Q, p.dQ);
+      auto layout_k = is_var_len ? make_ordered_layout(shape_K, VarLenKLayoutStep_{}) : make_layout(shape_K, p.dK);
+      auto layout_v = is_var_len ? make_ordered_layout(shape_V, VarLenVLayoutStep_{}) : make_layout(shape_V, p.dV);
+
+      // NHD layout for GQA
+      auto layout_o = is_var_len ? make_ordered_layout(shape_O, VarLenOLayoutStep_{}) : make_layout(shape_O, p.dO);
+
+      Tensor Q = make_tensor(make_gmem_ptr(dcQ), layout_q);
+      Tensor K_cache = make_tensor(make_gmem_ptr(dcK_cache), layout_k);
+      Tensor V_cache = make_tensor(make_gmem_ptr(dcV_cache), layout_v);
+      Tensor O = make_tensor(make_gmem_ptr(dcO), layout_o);
+      // O accumulator types
+      FragA tArA;
+      FragARow tA_max, tA_sum;
+
+      // Main loop
+      int const l_coord = TileScheduler::StaticHd512Target ? 0 : (is_var_len ? 0 : idx_b);
+      // With PackGQA the Q/O head dimension is indexed by the KV head; otherwise
+      // by the (un-grouped) query head.
+      int const q_head_idx = TileScheduler::StaticHd512Target ? head_q : (PackGQA_ ? head : head_q);
+      int const num_heads_kv = TileScheduler::StaticHd512Target ? 8 : s.num_heads_kv;
+      CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
+      mainloop(
+          Q(_, _, q_head_idx, l_coord),
+          K_cache(_, _, head, l_coord),
+          V_cache(_, _, head, l_coord),
+          tArA,
+          tA_max,
+          tA_sum,
+          blk_qv,
+          split_blk_k0,
+          split_blk_k1,
+          k_blocks,
+          k_blocks_causal,
+          thr_id,
+          seq_len,
+          seq_k_eff,
+          idx_b,
+          head,
+          num_heads_kv,
+          full_tile_offset,
+          discard_seq_coord,
+          append_store_len,
+          K_cache(_, _, head, l_coord),
+          V_cache(_, _, head, l_coord));
+
+      if constexpr (StaticNumKVSplits > 1) {
+        constexpr int num_kv_splits = StaticNumKVSplits;
+        int const wg_size = SGPerWG::value * intel::sg_size;
+        int const leader_kv_split = TileScheduler::StaticLeaderKVSplits;
+        int tile_linear = 0;
+        if constexpr (TileScheduler::StaticHd512Target) {
+          tile_linear = ((head_q * TargetQTiles + blk_q) * TargetVTilesO + blk_v);
+        } else {
+          tile_linear =
+              (((idx_b * s.num_heads_q + head_q) * int(GridDimY()) + blk_q) * int(GridDimX()) + blk_v);
+        }
+
+        if (idx_kv_split != leader_kv_split) {
+          int const partial_offset =
+              (tile_linear * num_kv_splits + idx_kv_split) * wg_size * num_elem_per_thread +
+              thr_id * num_elem_per_thread;
+          ElementA* __restrict__ partial_ptr = params.partial_results_ptr + partial_offset;
+
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < size(FragA{}.shape()); ++i) {
+            partial_ptr[i] = tArA(i);
+          }
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < size(FragARow{}.shape()); ++i) {
+            partial_ptr[2 * i + size(FragA{}.shape())] = tA_max(i);
+            partial_ptr[2 * i + 1 + size(FragA{}.shape())] = tA_sum(i);
+          }
+
+          auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+          sycl::group_barrier(sg);
+          threadfence();
+          sycl::group_barrier(sg);
+          if (sg.get_local_id()[0] == 0) {
+            atomicAdd(params.atomic_reduce_cnt_ptr + tile_linear * SGPerWG::value + sub_group_id, 1);
+          }
+          continue;
+        }
+
+        auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+        while (true) {
+          int ready = 0;
+          if (sg.get_local_id()[0] == 0) {
+            ready =
+                atomicLoad(params.atomic_reduce_cnt_ptr + tile_linear * SGPerWG::value + sub_group_id) ==
+                num_kv_splits - 1;
+          }
+          ready = sycl::group_broadcast(sg, ready, 0);
+          if (ready) {
+            break;
+          }
+        }
+        threadfence();
+
+        static_assert(StaticNumKVSplits == 4);
+        if constexpr (TileScheduler::StaticLeaderKVSplits == 0) {
+          reduce_workspace_split4_leader0(params, tArA, tA_max, tA_sum, tile_linear, wg_size, thr_id, num_kv_splits);
+        } else {
+          static_assert(TileScheduler::StaticLeaderKVSplits == 3);
+          reduce_workspace_split4_leader3(params, tArA, tA_max, tA_sum, tile_linear, wg_size, thr_id, num_kv_splits);
+        }
+      }
+
+      if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
+        sycl::group_barrier(get_work_group<3>());
+      }
+
+      // Epilogue
+      CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
+      if constexpr (Sink) {
+        if constexpr (PackGQA_) {
+          // Packed decode: pass the per-row sink base for this KV head's group
+          // (heads head*head_group_q .. +head_group_q-1), applied per row in the
+          // epilogue.
+          epilogue(
+              O(_, _, q_head_idx, l_coord),
+              tArA,
+              tA_max,
+              tA_sum,
+              blk_qv,
+              thr_id,
+              ElementSink{},
+              p.sm_sink + head * head_group_q,
+              head_group_q);
+        } else {
+          epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id, p.sm_sink[q_head_idx]);
+        }
+      } else {
+        epilogue(O(_, _, q_head_idx, l_coord), tArA, tA_max, tA_sum, blk_qv, thr_id);
+      }
+    }
+    }
+#endif
   }
 };
 
