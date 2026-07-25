@@ -150,8 +150,10 @@ Config parse_args(int argc, char** argv) {
   if (cfg.sink && (!cfg.paged || cfg.head_dim != 64)) {
     throw std::runtime_error("the current SGL prefill runner supports sink only on paged head_dim=64");
   }
-  if (!cfg.paged && !(cfg.head_dim == 64 || cfg.head_dim == 72 || cfg.head_dim == 96 || cfg.head_dim == 128)) {
-    throw std::runtime_error("non-paged standalone prefill supports head_dim in {64,72,96,128}");
+  if (!cfg.paged &&
+      !(cfg.head_dim == 64 || cfg.head_dim == 72 || cfg.head_dim == 80 || cfg.head_dim == 96 ||
+        cfg.head_dim == 128 || cfg.head_dim == 192)) {
+    throw std::runtime_error("non-paged standalone prefill supports head_dim in {64,72,80,96,128,192}");
   }
   if (cfg.paged &&
       !(cfg.head_dim == 64 || cfg.head_dim == 96 || cfg.head_dim == 128 || cfg.head_dim == 192 ||
@@ -261,6 +263,11 @@ void dispatch_prefill(const prefill::Arguments& params) {
 #ifdef FMHA_STANDALONE_HAS_HD_72
     case 72:
       DISPATCH_PREFILL_KERNEL(72);
+      break;
+#endif
+#ifdef FMHA_STANDALONE_HAS_HD_80
+    case 80:
+      DISPATCH_PREFILL_KERNEL(80);
       break;
 #endif
 #ifdef FMHA_STANDALONE_HAS_HD_96

@@ -237,6 +237,14 @@ fmha_prefill_add_case(coverage.nonpaged_hd72
   COVERAGE CAUSAL
   BATCH 1 SEQLEN_Q 16 SEQLEN_K 64 HEADS_Q 4 HEADS_KV 2 HEAD_DIM 72)
 
+fmha_prefill_add_case(coverage.nonpaged_hd80
+  COVERAGE CAUSAL
+  BATCH 1 SEQLEN_Q 16 SEQLEN_K 64 HEADS_Q 4 HEADS_KV 2 HEAD_DIM 80)
+
+fmha_prefill_add_case(coverage.nonpaged_hd192
+  COVERAGE CAUSAL
+  BATCH 1 SEQLEN_Q 16 SEQLEN_K 64 HEADS_Q 4 HEADS_KV 1 HEAD_DIM 192)
+
 fmha_prefill_add_case(coverage.dv128_from_d64
   COVERAGE PAGED CAUSAL
   BATCH 1 SEQLEN_Q 16 SEQLEN_K 64 HEADS_Q 4 HEADS_KV 1 HEAD_DIM 64 HEAD_DIM_V 128 PAGE_SIZE 64)

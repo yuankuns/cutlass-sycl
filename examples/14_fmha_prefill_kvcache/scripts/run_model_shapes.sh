@@ -319,6 +319,14 @@ run_case "coverage.nonpaged_hd72" \
   --batch 1 --seqlen-q 16 --seqlen-k 64 --heads-q 4 --heads-kv 2 \
   --head-dim 72 --head-dim-v 72 --paged 0 --causal 1
 
+run_case "coverage.nonpaged_hd80" \
+  --batch 1 --seqlen-q 16 --seqlen-k 64 --heads-q 4 --heads-kv 2 \
+  --head-dim 80 --head-dim-v 80 --paged 0 --causal 1
+
+run_case "coverage.nonpaged_hd192" \
+  --batch 1 --seqlen-q 16 --seqlen-k 64 --heads-q 4 --heads-kv 1 \
+  --head-dim 192 --head-dim-v 192 --paged 0 --causal 1
+
 run_case "coverage.dv128_from_d64" \
   --batch 1 --seqlen-q 16 --seqlen-k 64 --heads-q 4 --heads-kv 1 \
   --head-dim 64 --head-dim-v 128 --paged 1 --page-size 64 --causal 1

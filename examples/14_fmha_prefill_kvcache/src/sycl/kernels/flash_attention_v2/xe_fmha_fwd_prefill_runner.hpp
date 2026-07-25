@@ -121,6 +121,12 @@ struct Arguments {
   void* softmax_sink_ptr;
   float softcap;
 
+  // FP8 KV cache per-tensor descale. The standalone bf16 benchmark leaves
+  // these null; the copied current SGL FMHA headers keep the fields in the
+  // kernel ABI.
+  const float* k_scale_ptr = nullptr;
+  const float* v_scale_ptr = nullptr;
+
   // array of length b+1 holding starting offset of each sequence.
   int* __restrict__ cu_seqlens_q;
   int* __restrict__ cu_seqlens_k;
@@ -190,7 +196,8 @@ struct Arguments {
 
   bool is_bf16;
   bool is_fp32;
-  bool is_e4m3;
+  bool is_e4m3 = false;
+  bool is_e5m2 = false;
   bool is_causal;
   bool is_local;
 
@@ -331,6 +338,8 @@ struct PrefillRunner {
             stride_V_cache,
             static_cast<const typename FMHAPrefillKernel::ElementSink*>(params.softmax_sink_ptr),
             static_cast<const bool*>(params.skip_batch_mask_ptr),
+            params.k_scale_ptr,
+            params.v_scale_ptr,
         },
         {
             params.softmax_scale,
@@ -512,6 +521,18 @@ struct FMHAConfig {
 
 template <int HEAD_DIM>
 struct FmhaPrefillRunner {
+  void operator()(const Arguments& params) const;
+};
+
+// Standalone uses a combined generated TU, but keep the split-runner type names
+// aligned with current SGL headers.
+template <int HEAD_DIM>
+struct FmhaPrefillNpRunner {
+  void operator()(const Arguments& params) const;
+};
+
+template <int HEAD_DIM>
+struct FmhaPrefillFp8Runner {
   void operator()(const Arguments& params) const;
 };
 
