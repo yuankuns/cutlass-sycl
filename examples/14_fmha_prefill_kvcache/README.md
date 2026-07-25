@@ -35,6 +35,9 @@ by default, enables a q256/k32 path for model-sized requests with
 `seqlen_q >= 512`.  The large-shape path can be disabled with
 `-DFMHA_STANDALONE_PAGED_HD128_LARGE_TILE=OFF`; its threshold and tile sizes are
 exposed as `FMHA_STANDALONE_PAGED_HD128_LARGE_TILE_*` CMake cache variables.
+Paged `head_dim=256` defaults to a q128/k64 tile with 16 subgroups so common
+`seqlen_q=128` prefill requests fill the Q tile instead of launching a half-full
+q256 work-group.
 
 Tests are enabled by default.  They are registered through CTest and remain
 C++/SYCL-only:
