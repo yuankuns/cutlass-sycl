@@ -311,10 +311,7 @@ struct PrefillRunner {
     return shape;
   }
 
-  cutlass::Status run(
-      const Arguments& params,
-      const cutlass::KernelHardwareInfo& hw_info,
-      int num_kv_splits = -1) {
+  cutlass::Status run(const Arguments& params, const cutlass::KernelHardwareInfo& hw_info) {
     ProblemShapeType shape = initialize(params);
 
     typename FMHAPrefillKernel::Arguments arguments{
@@ -345,7 +342,6 @@ struct PrefillRunner {
         },
         {},
         hw_info};
-    arguments.num_kv_splits = num_kv_splits;
 
     // Define device-global scratch memory
     size_t workspace_size = FMHAPrefillKernel::get_workspace_size(arguments);
@@ -415,13 +411,8 @@ struct FMHAConfig {
       decltype(cutlass::fmha::collective::get_sg_layout_pv(SubgroupLayoutQK{})),
       SubgroupLayoutPV_>;
 
-  template <
-      bool isVarLen,
-      bool CachedKV,
-      bool PagedKV,
-      class Scheduler,
-      bool UseHd512SplitKernel = false>
-  static int run(const Arguments& params, int num_kv_splits = -1) {
+  template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
+  static int run(const Arguments& params) {
     // The KernelHardwareInfo struct holds the number of EUs on the GPU with a given device ID. This
     // information is used by the underlying kernel.
     cutlass::KernelHardwareInfo hw_info;
@@ -481,30 +472,19 @@ struct FMHAConfig {
         is_same_v<Scheduler, cutlass::fmha::kernel::XeFHMAIndividualPersistentTileScheduler>,
         cutlass::fmha::kernel::
             XeFMHAFwdDynamicSplitKernel<ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>,
-        conditional_t<
-            UseHd512SplitKernel,
-            cutlass::fmha::kernel::XeFMHAFwdHd512SplitKernel<
-                ProblemShapeType,
-                CollectiveMainloop,
-                CollectiveEpilogue,
-                Scheduler,
-                Step<_2, _0, _1, _3>,
-                Step<_2, _0, _1, _3>,
-                Step<_0, _2, _1, _3>,
-                Step<_2, _0, _1, _3>>,
-            cutlass::fmha::kernel::XeFMHAFwdKernel<
-                ProblemShapeType,
-                CollectiveMainloop,
-                CollectiveEpilogue,
-                Scheduler,
-                Step<_2, _0, _1, _3>,
-                Step<_2, _0, _1, _3>,
-                Step<_0, _2, _1, _3>,
-                Step<_2, _0, _1, _3>>>>;
+        cutlass::fmha::kernel::XeFMHAFwdKernel<
+            ProblemShapeType,
+            CollectiveMainloop,
+            CollectiveEpilogue,
+            Scheduler,
+            Step<_2, _0, _1, _3>,
+            Step<_2, _0, _1, _3>,
+            Step<_0, _2, _1, _3>,
+            Step<_2, _0, _1, _3>>>;
 
     PrefillRunner<FMHAPrefillKernel, isVarLen> kernel;
 
-    kernel.run(params, hw_info, num_kv_splits);
+    kernel.run(params, hw_info);
     return 0;
   }
 
