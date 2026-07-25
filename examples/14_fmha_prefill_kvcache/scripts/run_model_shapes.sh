@@ -13,6 +13,7 @@ FILTER="${FMHA_PREFILL_FILTER:-}"
 SUITE="${FMHA_PREFILL_SUITE:-tile,chunk,perf}"
 PAGED_HD128_TILE_Q="${FMHA_PREFILL_PAGED_HD128_TILE_Q:-128}"
 PAGED_HD128_TILE_KV="${FMHA_PREFILL_PAGED_HD128_TILE_KV:-64}"
+PAGED_HD192_TILE_Q="${FMHA_PREFILL_PAGED_HD192_TILE_Q:-128}"
 PAGED_HD256_TILE_Q="${FMHA_PREFILL_PAGED_HD256_TILE_Q:-128}"
 
 usage() {
@@ -398,6 +399,16 @@ run_tile_boundary_family "tile.paged_hd128_q${PAGED_HD128_TILE_Q}_k${PAGED_HD128
 
 run_tile_boundary_family "tile.nonpaged_hd128_q256_k32" \
   0 64 1 2 1 128 128 256 32
+
+run_case "tile.paged_hd192_q${PAGED_HD192_TILE_Q}_minus1" \
+  --batch 1 --seqlen-q "$((PAGED_HD192_TILE_Q - 1))" --seqlen-k 512 --heads-q 2 --heads-kv 1 \
+  --head-dim 192 --head-dim-v 192 --paged 1 --page-size 64 --causal 1
+run_case "tile.paged_hd192_q${PAGED_HD192_TILE_Q}" \
+  --batch 1 --seqlen-q "$PAGED_HD192_TILE_Q" --seqlen-k 512 --heads-q 2 --heads-kv 1 \
+  --head-dim 192 --head-dim-v 192 --paged 1 --page-size 64 --causal 1
+run_case "tile.paged_hd192_q${PAGED_HD192_TILE_Q}_plus1" \
+  --batch 1 --seqlen-q "$((PAGED_HD192_TILE_Q + 1))" --seqlen-k 512 --heads-q 2 --heads-kv 1 \
+  --head-dim 192 --head-dim-v 192 --paged 1 --page-size 64 --causal 1
 
 run_case "tile.paged_hd256_q${PAGED_HD256_TILE_Q}_minus1" \
   --batch 1 --seqlen-q "$((PAGED_HD256_TILE_Q - 1))" --seqlen-k 512 --heads-q 2 --heads-kv 1 \
