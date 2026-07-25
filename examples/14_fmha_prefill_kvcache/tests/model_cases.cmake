@@ -389,6 +389,18 @@ fmha_prefill_add_case(boundary.nonpaged_hd128_k_half_plus1
   BOUNDARY
   BATCH 1 SEQLEN_Q 128 SEQLEN_K 17 HEADS_Q 2 HEADS_KV 1 HEAD_DIM 128)
 
+foreach(_q IN ITEMS 31 32 33 127 128 129 511 512 513)
+  fmha_prefill_add_case(boundary.nonpaged_hd96_q${_q}
+    BOUNDARY
+    BATCH 1 SEQLEN_Q ${_q} SEQLEN_K 64 HEADS_Q 2 HEADS_KV 1 HEAD_DIM 96)
+endforeach()
+
+foreach(_q IN ITEMS 127 128 129)
+  fmha_prefill_add_case(boundary.paged_hd96_q${_q}
+    BOUNDARY PAGED CAUSAL
+    BATCH 1 SEQLEN_Q ${_q} SEQLEN_K 256 HEADS_Q 2 HEADS_KV 1 HEAD_DIM 96 PAGE_SIZE 64)
+endforeach()
+
 math(EXPR _fmha_prefill_tiled_q_256_plus1 "${FMHA_PREFILL_TILED_Q_256} + 1")
 
 math(EXPR _fmha_prefill_tiled_q_192_minus1 "${FMHA_PREFILL_TILED_Q_192} - 1")

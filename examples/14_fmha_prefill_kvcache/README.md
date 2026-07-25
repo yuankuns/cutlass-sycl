@@ -35,6 +35,12 @@ by default, enables a q256/k32 path for model-sized requests with
 `seqlen_q >= 512`.  The large-shape path can be disabled with
 `-DFMHA_STANDALONE_PAGED_HD128_LARGE_TILE=OFF`; its threshold and tile sizes are
 exposed as `FMHA_STANDALONE_PAGED_HD128_LARGE_TILE_*` CMake cache variables.
+Paged `head_dim=96` uses q128/k64 with 16 subgroups. Non-paged `head_dim=96`
+uses q32/k64 with 4 subgroups through `seqlen_q=32`, q128/k64 with 16
+subgroups for intermediate requests, and q256/k64 with 16 subgroups from
+`seqlen_q=512`. The short and long paths and their thresholds are exposed as
+`FMHA_STANDALONE_NP_HD96_SMALL_*` and `FMHA_STANDALONE_NP_HD96_LARGE_*`
+CMake cache variables.
 Paged `head_dim=192` defaults to a q128/k64 tile with 16 subgroups, matching
 common `seqlen_q=128` prefill requests without a half-empty q256 work-group.
 Paged `head_dim=256` defaults to a q128/k64 tile with 16 subgroups so common
