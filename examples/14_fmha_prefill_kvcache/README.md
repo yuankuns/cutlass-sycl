@@ -4,10 +4,10 @@ This directory builds a C++/SYCL-only executable for the extracted SGL XPU FMHA
 prefill-with-KV-cache kernel through the sycl-tla examples CMake flow. It does not
 use Torch, Python, or the installed `sgl_kernel` extension.
 
-The CMake file generates the same `FmhaPrefillRunner<HEAD_DIM>` translation units from
-`src/sycl/xe_fmha_fwd_prefill_kernel.cpp.in`. The FMHA kernel headers needed by this
-example live under this directory, so the target does not depend on an external SGL
-checkout.
+The CMake file generates the same split paged, non-paged, and FP8 prefill
+translation units from `src/sycl/kernels/flash_attention_v2/*.cpp.in`. The FMHA
+kernel headers needed by this example live under this directory, so the target
+does not depend on an external SGL checkout.
 
 ## Build
 

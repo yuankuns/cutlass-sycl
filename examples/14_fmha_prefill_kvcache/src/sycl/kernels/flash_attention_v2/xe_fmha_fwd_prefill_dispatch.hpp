@@ -76,9 +76,9 @@ EXTERN_FMHA_PREFILL_NP_RUNNER(192)
   do {                                                                         \
     TORCH_CHECK(params.is_bf16, "Prefill attention only supports bf16 query"); \
     if (params.is_e4m3 || params.is_e5m2) {                                    \
-      FmhaPrefillFp8Runner<HD>{}(params);                                      \
+      ::prefill::FmhaPrefillFp8Runner<HD>{}(params);                           \
     } else {                                                                   \
-      FmhaPrefillRunner<HD>{}(params);                                         \
+      ::prefill::FmhaPrefillRunner<HD>{}(params);                              \
     }                                                                          \
   } while (0)
 
@@ -86,7 +86,7 @@ EXTERN_FMHA_PREFILL_NP_RUNNER(192)
 #define DISPATCH_PREFILL_NOPAGE_KERNEL(HD)                                               \
   do {                                                                                   \
     TORCH_CHECK(params.is_bf16, "Non-paged prefill attention only supports bf16 query"); \
-    FmhaPrefillNpRunner<HD>{}(params);                                                   \
+    ::prefill::FmhaPrefillNpRunner<HD>{}(params);                                        \
   } while (0)
 
 }  // namespace prefill
