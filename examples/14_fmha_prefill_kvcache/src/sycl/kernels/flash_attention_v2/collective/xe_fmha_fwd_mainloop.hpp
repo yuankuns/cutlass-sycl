@@ -39,6 +39,34 @@
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "fmha_fusion.hpp"
 
+#ifndef FMHA_PREFILL_ENABLE_P_EXCHANGE
+#define FMHA_PREFILL_ENABLE_P_EXCHANGE 0
+#endif
+
+#ifndef FMHA_PREFILL_ENABLE_KSPLIT_SOFTMAX
+#define FMHA_PREFILL_ENABLE_KSPLIT_SOFTMAX 0
+#endif
+
+#ifndef FMHA_PREFILL_ENABLE_PARTIAL_P_EXCHANGE
+#define FMHA_PREFILL_ENABLE_PARTIAL_P_EXCHANGE 0
+#endif
+
+#ifndef FMHA_PREFILL_ENABLE_DUAL_O_TILE_WORKSPACE
+#define FMHA_PREFILL_ENABLE_DUAL_O_TILE_WORKSPACE 0
+#endif
+
+#ifndef FMHA_PREFILL_ENABLE_DUAL_O_TILE_REGISTER
+#define FMHA_PREFILL_ENABLE_DUAL_O_TILE_REGISTER 0
+#endif
+
+#ifndef FMHA_PREFILL_ENABLE_DUAL_Q_TILE_REGISTER
+#define FMHA_PREFILL_ENABLE_DUAL_Q_TILE_REGISTER 0
+#endif
+
+#ifndef FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+#define FMHA_PREFILL_ENABLE_SCORE_BLOCK2D 0
+#endif
+
 namespace cutlass::fmha {
 
 template <int Stages>
@@ -75,7 +103,8 @@ template <
     // (decode only, seq_len_qo == 1). All packed rows share the single decode
     // KV position, so per-row masking must use a fixed decode row. Default
     // false keeps prefill (and non-packed decode) unaffected.
-    bool PackGQA_ = false>
+    bool PackGQA_ = false,
+    bool PageTableIdentity_ = false>
 struct FMHAFwdMainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
@@ -101,7 +130,8 @@ template <
     class TiledCopyK_cache_,
     class TiledCopyV_cache_,
     bool LocalMask_,
-    bool PackGQA_>
+    bool PackGQA_,
+    bool PageTableIdentity_>
 struct FMHAFwdMainloop<
     XeDefault<Stages>,
     CausalMask_,
@@ -121,7 +151,8 @@ struct FMHAFwdMainloop<
     TiledCopyK_cache_,
     TiledCopyV_cache_,
     LocalMask_,
-    PackGQA_> {
+    PackGQA_,
+    PageTableIdentity_> {
   //
   // Type Aliases
   //
@@ -188,12 +219,21 @@ struct FMHAFwdMainloop<
   using FragA = expand_sg_fragment_t<SingleFragA, 1, VTiles>;  // (atom val,q',v',VV)
   using FragARow = decltype(reduce<1>(FragA{}, sycl::plus<void>{}));
   using ElementA = typename TiledMMAPV::ValTypeD;
+  using ElementP = typename TiledMMAPV::ValTypeA;
 
   static constexpr bool CausalMask = CausalMask_;
   static constexpr bool CachedKV = CachedKV_;
   static constexpr bool PagedKV = PagedKV_;
   static constexpr bool LocalMask = LocalMask_;
   static constexpr bool PackGQA = PackGQA_;
+  static constexpr bool PageTableIdentity = PageTableIdentity_;
+  static constexpr bool PExchange = FMHA_PREFILL_ENABLE_P_EXCHANGE;
+  static constexpr bool KSplitSoftmax = FMHA_PREFILL_ENABLE_KSPLIT_SOFTMAX;
+  static constexpr bool DualOTileWorkspace = FMHA_PREFILL_ENABLE_DUAL_O_TILE_WORKSPACE;
+  static constexpr bool DualOTileRegister = FMHA_PREFILL_ENABLE_DUAL_O_TILE_REGISTER;
+  static constexpr bool DualQTileRegister = FMHA_PREFILL_ENABLE_DUAL_Q_TILE_REGISTER;
+  static constexpr bool DualOTile = DualOTileWorkspace || DualOTileRegister;
+  static constexpr bool ScoreBlock2D = FMHA_PREFILL_ENABLE_SCORE_BLOCK2D;
 
   // FP8 KV cache: enabled when the K element type is an 8-bit float. The fp8
   // K/V are dequantized (cast to ElementQ and multiplied by the per-tensor
@@ -208,23 +248,46 @@ struct FMHAFwdMainloop<
     int max_num_pages_per_seq = 0;
     int window_size_left = -1;
     int window_size_right = -1;
+    bool page_table_identity = false;
+    ElementA* ptr_dual_o_accum = nullptr;
+    ElementS* ptr_score = nullptr;
+    int score_mode = 0;
   };
 
   // Kernel-facing parameters
   using Params = Arguments;
 
   // SLM data
-  struct SharedStorage {};
+  struct SharedStorage {
+#if FMHA_PREFILL_ENABLE_P_EXCHANGE
+    alignas(16) ElementP p_exchange[get<0>(TileShapeQK{}) * get<1>(TileShapeQK{})];
+    alignas(16) ElementA row_rescale[get<0>(TileShapeQK{})];
+    alignas(16) ElementA row_sum[get<0>(TileShapeQK{})];
+#endif
+#if FMHA_PREFILL_ENABLE_KSPLIT_SOFTMAX
+    alignas(16) ElementS ksplit_row_max[get<0>(TileShapeQK{}) * 2];
+    alignas(16) ElementS ksplit_row_sum[get<0>(TileShapeQK{}) * 2];
+#endif
+  };
 
   Params params;
+#if FMHA_PREFILL_ENABLE_P_EXCHANGE || FMHA_PREFILL_ENABLE_KSPLIT_SOFTMAX
+  SharedStorage* shared_storage;
+#endif
 
   //
   // Methods
   //
 
-  FMHAFwdMainloop(Params const& params_, SharedStorage&) : params(params_) {}
+  FMHAFwdMainloop(Params const& params_, SharedStorage& shared_storage_)
+      : params(params_)
+#if FMHA_PREFILL_ENABLE_P_EXCHANGE || FMHA_PREFILL_ENABLE_KSPLIT_SOFTMAX
+        ,
+        shared_storage(&shared_storage_)
+#endif
+  {}
 
-  static constexpr Params to_underlying_arguments(Arguments const& args, void* /* workspace */) {
+  static constexpr Params to_underlying_arguments(Arguments const& args, void* workspace) {
     constexpr double kLog2e = 1.4426950408889634074;  // log_2(e)
     ElementS val = args.scale * static_cast<ElementS>(kLog2e);
     return Params{
@@ -233,7 +296,20 @@ struct FMHAFwdMainloop<
         args.page_size,
         args.max_num_pages_per_seq,
         args.window_size_left,
-        args.window_size_right};
+        args.window_size_right,
+        args.page_table_identity,
+#if FMHA_PREFILL_ENABLE_DUAL_O_TILE_WORKSPACE
+        reinterpret_cast<ElementA*>(workspace),
+#else
+        nullptr,
+#endif
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+        reinterpret_cast<ElementS*>(workspace),
+#else
+        nullptr,
+#endif
+        args.score_mode
+    };
   }
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
@@ -254,7 +330,7 @@ struct FMHAFwdMainloop<
     return params.ptr_page_table[batch_offset + next_page_logical_idx] * tiles_per_page + K % tiles_per_page;
   }
 
-  template <typename QVCoord>
+  template <int StaticScoreMode = -1, typename QVCoord>
   CUTLASS_DEVICE void operator()(
       TensorQ2D const& Q_2D,  // (q,d)
       TensorK2D const& K_2D,  // (k,d)
@@ -275,7 +351,10 @@ struct FMHAFwdMainloop<
       int discard_seq_coord,
       TensorK_cache2D const& K_cache_2D = TensorK_cache2D{},
       TensorV_cache2D const& V_cache_2D = TensorV_cache2D{},
-      float scale_k = 1.0f) {  // FP8 K per-tensor dequant scale
+      float scale_k = 1.0f,   // FP8 K per-tensor dequant scale
+      FragA* tArA_dual = nullptr,
+      int dual_o_workspace_tile = 0,
+      ElementS* score_head_ptr = nullptr) {
     using namespace sycl::ext::oneapi::this_work_item;
 
     // Short dimension names:
@@ -296,6 +375,12 @@ struct FMHAFwdMainloop<
     Tensor cK_cache = make_identity_tensor(K_cache_2D.shape());   // (k,d)
     Tensor cV_cache = make_identity_tensor(V_cache_2D.shape());   // (v,k)
     Tensor cP = make_identity_tensor(take<0, 2>(TileShapeQK{}));  // (q,k)
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+    auto score_shape = make_shape(int(size<0>(Q_2D)), seq_len_kv_cache);
+    auto score_layout = make_layout(score_shape, make_stride(seq_len_kv_cache, Int<1>{}));
+    Tensor Score = make_tensor(make_gmem_ptr(score_head_ptr), score_layout);
+    Tensor cScore = make_identity_tensor(score_shape);  // (q,k)
+#endif
 
     /* Partition global tensors into workgroup tiles */
     Tensor gQ = local_tile(cQ, TileShapeQK{}, append(blk_qv, _), Step<_1, X, _1>{});          // (q,d,D)
@@ -306,6 +391,9 @@ struct FMHAFwdMainloop<
     Tensor gK_cache = local_tile(cK_cache, TileShapeQK{}, make_coord(_, _, _), Step<X, _1, _1>{});        // (k,d,K,D)
     Tensor gV_cache = local_tile(cV_cache, tile_shape_v, make_coord(get<1>(blk_qv), _));                  // (v,k,K)
     Tensor gV_cache_split = local_tile(gV_cache, TileShapePV{}, make_coord(_, _, 0), Step<X, _1, _1>{});  // (v,k,VV,K)
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+    Tensor gScore = local_tile(cScore, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), _));  // (q,k,K)
+#endif
 
     /* Create global -> register copies */
     TiledCopyQ copy_q{Q_2D};
@@ -317,6 +405,10 @@ struct FMHAFwdMainloop<
     /* Create MMAs */
     TiledMMAQK mma_qk{};
     TiledMMAPV mma_pv{};
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+    auto copy_score_store = make_block_2d_copy_D(mma_qk, Score);
+    auto copy_score_load = make_block_2d_copy_C(mma_qk, Score);
+#endif
 
     /* Slice TiledCopy/TiledMMA operations down to to work-item level */
     auto thr_copy_q = copy_q.get_slice(thr_id);
@@ -326,6 +418,10 @@ struct FMHAFwdMainloop<
     auto thr_copy_v_cache = copy_v_cache.get_slice(thr_id);
     auto thr_mma_qk = mma_qk.get_slice(thr_id);
     auto thr_mma_pv = mma_pv.get_slice(thr_id);
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+    auto thr_copy_score_store = copy_score_store.get_slice(thr_id);
+    auto thr_copy_score_load = copy_score_load.get_slice(thr_id);
+#endif
 
     /* Partition coordinate tensors for copy */
     auto tQgQ = thr_copy_q.partition_S(gQ);        // (atom_val,q',d',D)
@@ -333,6 +429,12 @@ struct FMHAFwdMainloop<
     auto tVgV = thr_copy_v.partition_S(gV_split);  // (atom_val,v',k',VV,K)
     auto tKgK_cache = thr_copy_k_cache.partition_S(gK_cache);
     auto tVgV_cache = thr_copy_v_cache.partition_S(gV_cache_split);
+#if FMHA_PREFILL_ENABLE_DUAL_O_TILE_WORKSPACE || FMHA_PREFILL_ENABLE_DUAL_O_TILE_REGISTER
+    Tensor gV_cache_dual = local_tile(cV_cache, tile_shape_v, make_coord(get<1>(blk_qv) + 1, _));
+    Tensor gV_cache_dual_split =
+        local_tile(gV_cache_dual, TileShapePV{}, make_coord(_, _, 0), Step<X, _1, _1>{});
+    auto tVgV_cache_dual = thr_copy_v_cache.partition_S(gV_cache_dual_split);
+#endif
 
     /* Create register fragments for MMA and copies */
     auto tQrQ = thr_copy_q.partition_sg_fragment_D(gQ(_, _, 0));
@@ -343,41 +445,99 @@ struct FMHAFwdMainloop<
 
     auto tSrS = thr_mma_qk.partition_sg_fragment_C(cP);
     auto tArP = thr_mma_pv.partition_sg_fragment_A(cP);
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+    auto tScoreStoreR = thr_copy_score_store.partition_sg_fragment_S(gScore(_, _, 0));
+    auto tScoreStoreG = thr_copy_score_store.partition_D(gScore);
+    auto tScoreLoadG = thr_copy_score_load.partition_S(gScore);
+    auto tScoreLoadR = thr_copy_score_load.partition_sg_fragment_D(gScore(_, _, 0));
+#endif
 
     auto tVrV = thr_copy_v.partition_sg_fragment_D(gV_split(_, _, 0, 0));
     auto tArV = thr_mma_pv.partition_sg_fragment_B(gV_split(_, _, 0, 0));
+#if FMHA_PREFILL_ENABLE_P_EXCHANGE
+    Tensor cO_pv = make_identity_tensor(select<0, 1>(TileShapePV{}));
+    auto tOcO_pv = thr_mma_pv.partition_C(cO_pv);
+#endif
 
     /* Create TiledCopy objects for prefetches */
     auto prefetch_q = make_block_2d_prefetch(copy_q);
-    auto prefetch_k = make_block_2d_prefetch(copy_k);
-    auto prefetch_v = make_block_2d_prefetch(copy_v);
+    auto prefetch_v = make_block_2d_prefetch<SGPerWG::value>(tile_shape_v, V_2D);
     auto prefetch_k_cache = make_block_2d_prefetch(copy_k_cache);
-    auto prefetch_v_cache = make_block_2d_prefetch(copy_v_cache);
+    auto prefetch_v_cache = make_block_2d_prefetch<SGPerWG::value>(tile_shape_v, V_cache_2D);
 
     /* Partition global tensors for prefetch */
     auto pQgQ = prefetch_q.get_slice(thr_id).partition_S(gQ);
-    auto pKgK = prefetch_k.get_slice(thr_id).partition_S(gK);
-    auto pVgV = prefetch_v.get_slice(thr_id).partition_S(gV_split);
+    auto pVgV = prefetch_v.get_slice(thr_id).partition_S(gV);
     auto pKgK_cache = prefetch_k_cache.get_slice(thr_id).partition_S(gK_cache);
-    auto pVgV_cache = prefetch_v_cache.get_slice(thr_id).partition_S(gV_cache_split);
+    auto pVgV_cache = prefetch_v_cache.get_slice(thr_id).partition_S(gV_cache);
+#if FMHA_PREFILL_ENABLE_DUAL_O_TILE_WORKSPACE || FMHA_PREFILL_ENABLE_DUAL_O_TILE_REGISTER
+    auto pVgV_cache_dual = prefetch_v_cache.get_slice(thr_id).partition_S(gV_cache_dual);
+#endif
+
+#if FMHA_PREFILL_ENABLE_DUAL_O_TILE_WORKSPACE
+    constexpr int DualOFragElems = size(FragA{}.shape());
+#endif
+#if FMHA_PREFILL_ENABLE_DUAL_O_TILE_WORKSPACE
+    constexpr int DualOWGSize = SGPerWG::value * intel::sg_size;
+    ElementA* dual_o_thread_accum =
+        params.ptr_dual_o_accum + (dual_o_workspace_tile * DualOWGSize + thr_id) * DualOFragElems;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < DualOFragElems; ++i) {
+      dual_o_thread_accum[i] = ElementA(0);
+    }
+#elif FMHA_PREFILL_ENABLE_DUAL_O_TILE_REGISTER
+    (void)dual_o_workspace_tile;
+    clear(*tArA_dual);
+#endif
 
     // ------
     // Kernel
     // ------
 
-    /* Initialization steps for first block: Q/K prefetch, O init */
-    /* TODO: limit D prefetch for large head size, and reorder K prefetches */
+    /* Initialization steps for first block: Q prefetch, optional K prefetch, O init */
     int kblocks_cache = ceil_div(seq_len_kv_cache, get<1>(TileShapeQK{}));
     int page_idx = blk_k0;
     int next_page_idx = blk_k0;
+    int tiles_per_page = 1;
+    int next_page_logical_idx = blk_k0;
+    int next_tile_in_page = 0;
+    int next_physical_page = 0;
+    int batch_page_offset = 0;
+    int identity_tile_base = 0;
     if constexpr (PagedKV) {
-      next_page_idx = get_physical_k_tile(blk_k0, l_coord, seq_len_kv_cache);
+      tiles_per_page = params.page_size / get<1>(TileShapeQK{});
+      batch_page_offset = l_coord * params.max_num_pages_per_seq;
+      if constexpr (PageTableIdentity) {
+        identity_tile_base = batch_page_offset * tiles_per_page;
+        next_page_idx = identity_tile_base + blk_k0;
+      } else {
+        next_page_logical_idx = blk_k0 / tiles_per_page;
+        next_tile_in_page = blk_k0 - next_page_logical_idx * tiles_per_page;
+        next_physical_page = params.ptr_page_table[batch_page_offset + next_page_logical_idx];
+        next_page_idx = next_physical_page * tiles_per_page + next_tile_in_page;
+      }
     }
-    for (int D = 0; D < size<3>(pQgQ); D++) {
-      prefetch(prefetch_q, pQgQ(_, _, _, D));
+    bool score_load_mode = false;
+    bool score_store_mode = false;
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+    if constexpr (StaticScoreMode >= 0) {
+      score_load_mode = (StaticScoreMode == 1);
+      score_store_mode = (StaticScoreMode == 0);
+    } else {
+      score_load_mode = (score_head_ptr != nullptr) && (params.score_mode == 1);
+      score_store_mode = (score_head_ptr != nullptr) && (params.score_mode == 0);
     }
-    for (int D = 0; D < size<4>(pKgK); D++) {
-      prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
+#endif
+    if (!score_load_mode) {
+      for (int D = 0; D < size<3>(pQgQ); D++) {
+        prefetch(prefetch_q, pQgQ(_, _, _, D));
+      }
+    }
+    bool prefetch_k_cache_enabled = int(size<1>(K_cache_2D)) < 512;
+    if (prefetch_k_cache_enabled && !score_load_mode) {
+      for (int D = 0; D < size<4>(pKgK_cache); D++) {
+        prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
+      }
     }
     // Always initialize the per-WG accumulators: the caller (kernel) may pass
     // blk_k0 > 0 when sliding-window pruning skips leading K blocks, so we can
@@ -398,42 +558,28 @@ struct FMHAFwdMainloop<
       qk_scale = params.scale * static_cast<ElementS>(scale_k);
     }
 
-    /* Main loop, blocked in k. */
-    for (int K = blk_k0; K < blk_k1 && K < kblocks_cache; K++) {
-      /* Split barrier to keep threads together */
-      barrier_arrive(ScopeWorkgroup);
-
-      bool need_causal = false;
-      if constexpr (CausalMask) {
-        need_causal = K >= blk_k1_causal;
-      }
-
-      page_idx = next_page_idx;
-      next_page_idx = K + 1;
-      if constexpr (PagedKV) {
-        next_page_idx = get_physical_k_tile(next_page_idx, l_coord, seq_len_kv_cache);
-      }
-
-      /* GEMM 1: S = K * Q */
-      clear(tSrS);
-      CUTLASS_PRAGMA_UNROLL
-      for (int D = 0; D < size<4>(tKgK); D++) {
-        copy(copy_q, tQgQ(_, _, _, D), tQrQ);
-        copy(copy_k_cache, tKgK_cache(_, _, _, page_idx, D), tKrK);
-        reorder(tQrQ, tSrQ);
-        reorder(tKrK, tSrK);
-        cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
-      }
-
+    auto apply_softmax_and_pv = [&](int K, int page_idx, bool first_block, auto& scores) {
       /* V prefetch for GEMM 2 */
-      CUTLASS_PRAGMA_UNROLL
-      for (int VV = 0; VV < VTiles; VV++) {
-        prefetch(prefetch_v_cache, pVgV_cache(_, _, _, VV, page_idx));
-      }
+      prefetch(prefetch_v_cache, pVgV_cache(_, _, _, page_idx));
+#if FMHA_PREFILL_ENABLE_DUAL_O_TILE_WORKSPACE || FMHA_PREFILL_ENABLE_DUAL_O_TILE_REGISTER
+      prefetch(prefetch_v_cache, pVgV_cache_dual(_, _, _, page_idx));
+#endif
 
       /* Causal masking */
       if constexpr (CausalMask) {
-        if (need_causal) {
+        if (!score_load_mode && K >= blk_k1_causal) {
+#if FMHA_PREFILL_ENABLE_KSPLIT_SOFTMAX
+          auto qk_coords = thr_mma_qk.partition_C(cP);
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < scores.size(); ++i) {
+            int row_idx = get<0>(blk_qv) * get<0>(TileShapeQK{}) + int(get<0>(qk_coords(i)));
+            int col_idx = K * get<1>(TileShapeQK{}) + int(get<1>(qk_coords(i)));
+            int row_kv_idx = (PackGQA_ ? 0 : row_idx) + full_tile_offset;
+            if (col_idx > row_kv_idx) {
+              scores(i) = ElementS(-INFINITY);
+            }
+          }
+#else
           /* Masking scalars */
           // TODO: use a more general code path for causal masking.
           int lane_id = thr_id % intel::sg_size;
@@ -442,7 +588,7 @@ struct FMHAFwdMainloop<
 
           constexpr int kTileK = get<1>(TileShapeQK{});
           constexpr int n_reps = kTileK / intel::sg_size;
-          constexpr int elems_per_n = tSrS.size() / n_reps;
+          const int elems_per_n = scores.size() / n_reps;
           int k_base = K * kTileK;
           CUTLASS_PRAGMA_UNROLL
           for (int n = 0; n < n_reps; n++) {
@@ -451,36 +597,39 @@ struct FMHAFwdMainloop<
             CUTLASS_PRAGMA_UNROLL
             for (int j = 0; j < elems_per_n; j++) {
               if (j < causal_bound) {
-                tSrS(n * elems_per_n + j) = ElementS(-INFINITY);
+                scores(n * elems_per_n + j) = ElementS(-INFINITY);
               }
             }
           }
+#endif
         }
       }
 
       /* Local/sliding window masking */
       if constexpr (LocalMask) {
-        Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
-        Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
-        auto cS_thread = thr_mma_qk.partition_C(gP);
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < tSrS.size(); ++i) {
-          int row_idx = get<0>(cS_thread(i));
-          int col_idx = get<1>(cS_thread(i));
-          // PackGQA decode: every packed M row is the same decode token, so the
-          // KV position is full_tile_offset regardless of the per-row (head)
-          // index. Non-packed keeps the per-row sequence position.
-          int row_kv_idx = (PackGQA_ ? 0 : row_idx) + full_tile_offset;
-          bool left_mask = col_idx < row_kv_idx - params.window_size_left;
-          bool right_mask = col_idx > row_kv_idx + params.window_size_right;
-          if (left_mask || right_mask) {
-            tSrS(i) = ElementS(-INFINITY);
+        if (!score_load_mode) {
+          Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
+          Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
+          auto cS_thread = thr_mma_qk.partition_C(gP);
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < scores.size(); ++i) {
+            int row_idx = get<0>(cS_thread(i));
+            int col_idx = get<1>(cS_thread(i));
+            // PackGQA decode: every packed M row is the same decode token, so the
+            // KV position is full_tile_offset regardless of the per-row (head)
+            // index. Non-packed keeps the per-row sequence position.
+            int row_kv_idx = (PackGQA_ ? 0 : row_idx) + full_tile_offset;
+            bool left_mask = col_idx < row_kv_idx - params.window_size_left;
+            bool right_mask = col_idx > row_kv_idx + params.window_size_right;
+            if (left_mask || right_mask) {
+              scores(i) = ElementS(-INFINITY);
+            }
           }
         }
       }
 
       /* k masking for remainder tiles */
-      if (check_remainder_k && K == total_blk - 1) {
+      if (!score_load_mode && check_remainder_k && K == total_blk - 1) {
         FragSCol k_rem_mask;
         int k_val = get<0>(tKgK_cache(0, 0, 0, K, 0));
         int k = k_val + get_sub_group().get_local_id()[0];
@@ -489,36 +638,184 @@ struct FMHAFwdMainloop<
           k_rem_mask(i) = (k < seq_len) ? ElementS(sycl::nan(0u)) : ElementS(-INFINITY);
         }
         CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < tSrS.size(); i++) {
-          tSrS(i) = sycl::fmin(tSrS(i), broadcast<1>(k_rem_mask, tSrS, i));
+        for (int i = 0; i < scores.size(); i++) {
+          scores(i) = sycl::fmin(scores(i), broadcast<1>(k_rem_mask, scores, i));
         }
       }
 
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+      if (score_store_mode) {
+        reorder(scores, tScoreStoreR);
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < tScoreStoreR.size(); ++i) {
+          tScoreStoreR(i) *= qk_scale;
+        }
+        copy(copy_score_store, tScoreStoreR, tScoreStoreG(_, _, _, K));
+      }
+#endif
+
       /* Apply softmax and scaling (tA rescaling fused into GEMM2 VTile loop) */
-      auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum, qk_scale);
-      reorder(tSrS, tArP);
+      auto rescale = [&]() {
+        ElementS softmax_scale = score_load_mode ? ElementS(1) : qk_scale;
+#if FMHA_PREFILL_ENABLE_KSPLIT_SOFTMAX
+        constexpr int KSplitCount =
+            get<2>(shape(typename TiledMMAQK::ThrLayoutVMNK{})) * get<3>(shape(typename TiledMMAQK::ThrLayoutVMNK{}));
+        static_assert(KSplitCount == 2, "FMHA_PREFILL_ENABLE_KSPLIT_SOFTMAX expects two QK K-split subgroups");
+        int ksplit_id = ksplit_index(thr_id);
+        return softmax_ksplit2(first_block, scores, tA_max, tA_sum, softmax_scale, thr_id, ksplit_id);
+#else
+        return softmax(first_block, scores, tA_max, tA_sum, softmax_scale);
+#endif
+      }();
+#if FMHA_PREFILL_ENABLE_P_EXCHANGE
+      auto qk_p_coords = thr_mma_qk.partition_C(cP);
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < scores.size(); ++i) {
+        int row = int(get<0>(qk_p_coords(i)));
+        int col = int(get<1>(qk_p_coords(i)));
+        shared_storage->p_exchange[row * get<1>(TileShapeQK{}) + col] = static_cast<ElementP>(scores(i));
+        shared_storage->row_rescale[row] = static_cast<ElementA>(broadcast<0>(rescale, scores, i));
+        shared_storage->row_sum[row] = static_cast<ElementA>(broadcast<0>(tA_sum, scores, i));
+      }
+      sycl::group_barrier(get_work_group<3>());
+      auto pv_p_coords = thr_mma_pv.partition_A(cP);
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tArP.size(); ++i) {
+        int row = int(get<0>(pv_p_coords(i)));
+        int col = int(get<1>(pv_p_coords(i)));
+        tArP(i) = shared_storage->p_exchange[row * get<1>(TileShapeQK{}) + col];
+      }
+#else
+      reorder(scores, tArP);
+#endif
 
       /* GEMM 2: A += P * V, split in v dimension. */
       CUTLASS_PRAGMA_UNROLL
       for (int VV = 0; VV < VTiles; VV++) {
         copy(copy_v_cache, tVgV_cache(_, _, _, VV, page_idx), tVrV);
         reorder(tVrV, tArV);
-        if (K != blk_k0) {
+        if (!first_block) {
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < tArA.size() / VTiles; i++) {
+#if FMHA_PREFILL_ENABLE_P_EXCHANGE
+            int row = int(get<0>(tOcO_pv(i)));
+            tArA(_, _, _, VV)(i) *= shared_storage->row_rescale[row];
+#else
             tArA(_, _, _, VV)(i) *= broadcast<0>(rescale, tArA, i);
+#endif
           }
         }
         cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
       }
 
-      /* K prefetch */
-      for (int D = 0; D < size<4>(pKgK); D++) {
-        prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
+#if FMHA_PREFILL_ENABLE_DUAL_O_TILE_WORKSPACE || FMHA_PREFILL_ENABLE_DUAL_O_TILE_REGISTER
+#if FMHA_PREFILL_ENABLE_DUAL_O_TILE_REGISTER
+      FragA& tDualA = *tArA_dual;
+#else
+      FragA tDualA;
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < DualOFragElems; ++i) {
+        tDualA(i) = dual_o_thread_accum[i];
+      }
+#endif
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int VV = 0; VV < VTiles; VV++) {
+        copy(copy_v_cache, tVgV_cache_dual(_, _, _, VV, page_idx), tVrV);
+        reorder(tVrV, tArV);
+        if (!first_block) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tDualA.size() / VTiles; i++) {
+#if FMHA_PREFILL_ENABLE_P_EXCHANGE
+            int row = int(get<0>(tOcO_pv(i)));
+            tDualA(_, _, _, VV)(i) *= shared_storage->row_rescale[row];
+#else
+            tDualA(_, _, _, VV)(i) *= broadcast<0>(rescale, tDualA, i);
+#endif
+          }
+        }
+        cute::gemm(mma_pv, tArP, tArV, tDualA(_, _, _, VV));
+      }
+
+#if FMHA_PREFILL_ENABLE_DUAL_O_TILE_WORKSPACE
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < DualOFragElems; ++i) {
+        dual_o_thread_accum[i] = tDualA(i);
+      }
+#endif
+#endif
+    };
+
+    /* Main loop, blocked in k. */
+    for (int K = blk_k0; K < blk_k1 && K < kblocks_cache; K++) {
+      /* Split barrier to keep threads together */
+      barrier_arrive(ScopeWorkgroup);
+
+      page_idx = next_page_idx;
+      bool has_next_k_tile = (K + 1 < blk_k1) && (K + 1 < kblocks_cache);
+      if (has_next_k_tile) {
+        if constexpr (PagedKV) {
+          if constexpr (PageTableIdentity) {
+            next_page_idx = identity_tile_base + K + 1;
+          } else {
+            ++next_tile_in_page;
+            if (next_tile_in_page == tiles_per_page) {
+              next_tile_in_page = 0;
+              ++next_page_logical_idx;
+              next_physical_page = params.ptr_page_table[batch_page_offset + next_page_logical_idx];
+            }
+            next_page_idx = next_physical_page * tiles_per_page + next_tile_in_page;
+          }
+        } else {
+          next_page_idx = K + 1;
+        }
+      }
+
+      if (score_load_mode) {
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+        copy(copy_score_load, tScoreLoadG(_, _, _, K), tScoreLoadR);
+        reorder(tScoreLoadR, tSrS);
+#endif
+      } else {
+        clear(tSrS);
+        /* GEMM 1: S = K * Q */
+        CUTLASS_PRAGMA_UNROLL
+        for (int D = 0; D < size<4>(tKgK); D++) {
+          copy(copy_q, tQgQ(_, _, _, D), tQrQ);
+          copy(copy_k_cache, tKgK_cache(_, _, _, page_idx, D), tKrK);
+          reorder(tQrQ, tSrQ);
+          reorder(tKrK, tSrK);
+          cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
+        }
+      }
+
+      apply_softmax_and_pv(K, page_idx, K == blk_k0, tSrS);
+
+      if (prefetch_k_cache_enabled && !score_load_mode) {
+        int prefetch_page_idx = has_next_k_tile ? next_page_idx : page_idx;
+        for (int D = 0; D < size<4>(pKgK_cache); D++) {
+          prefetch(prefetch_k_cache, pKgK_cache(_, _, _, prefetch_page_idx, D));
+        }
       }
 
       barrier_wait(ScopeWorkgroup);
     }
+
+#if FMHA_PREFILL_ENABLE_P_EXCHANGE
+    CUTLASS_PRAGMA_UNROLL
+    for (int VV = 0; VV < VTiles; VV++) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tArA.size() / VTiles; i++) {
+        int row = int(get<0>(tOcO_pv(i)));
+        ElementA denom = shared_storage->row_sum[row];
+        tArA(_, _, _, VV)(i) = denom != ElementA(0) ? tArA(_, _, _, VV)(i) / denom : ElementA(0);
+      }
+    }
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tA_sum.size(); i++) {
+      tA_sum(i) = ElementA(1);
+    }
+#endif
   }
 
   // Single step of blocked softmax.
@@ -563,6 +860,118 @@ struct FMHAFwdMainloop<
 
     return rescale;
   }
+
+#if FMHA_PREFILL_ENABLE_KSPLIT_SOFTMAX
+  CUTLASS_DEVICE
+  int ksplit_row_index(int row_fragment_idx, int thr_id) const {
+    using namespace sycl::ext::oneapi::this_work_item;
+
+    constexpr int RowsPerSG = get<0>(TileShapeQK{}) / get<1>(shape(typename TiledMMAQK::ThrLayoutVMNK{}));
+    constexpr int KSplitCount =
+        get<2>(shape(typename TiledMMAQK::ThrLayoutVMNK{})) * get<3>(shape(typename TiledMMAQK::ThrLayoutVMNK{}));
+    static_assert(KSplitCount == 2, "K-split softmax currently supports exactly two K-split subgroups");
+    static_assert(RowsPerSG % intel::sg_size == 0, "Rows per subgroup must map cleanly onto subgroup lanes");
+
+    auto thr_vmnk = TiledMMAQK{}.get_thr_layout_vmnk().get_flat_coord(assert_uniform(thr_id));
+    int sg_m = int(get<1>(thr_vmnk));
+    int lane_id = get_sub_group().get_local_id()[0];
+    return sg_m * RowsPerSG + row_fragment_idx * intel::sg_size + lane_id;
+  }
+
+  CUTLASS_DEVICE
+  int ksplit_index(int thr_id) const {
+    constexpr int SplitK = get<3>(shape(typename TiledMMAQK::ThrLayoutVMNK{}));
+    auto thr_vmnk = TiledMMAQK{}.get_thr_layout_vmnk().get_flat_coord(assert_uniform(thr_id));
+    return int(get<2>(thr_vmnk)) * SplitK + int(get<3>(thr_vmnk));
+  }
+
+  CUTLASS_DEVICE
+  bool p_exchange_has_local_p(int thr_id) const {
+    auto qk_thr_vmnk = TiledMMAQK{}.get_thr_layout_vmnk().get_flat_coord(assert_uniform(thr_id));
+    auto pv_thr_vmnk = TiledMMAPV{}.get_thr_layout_vmnk().get_flat_coord(assert_uniform(thr_id));
+    return int(get<1>(qk_thr_vmnk)) == int(get<1>(pv_thr_vmnk)) &&
+           int(get<3>(qk_thr_vmnk)) == int(get<3>(pv_thr_vmnk));
+  }
+
+  // Softmax for layouts where the Q*K tile is split across two subgroup columns
+  // in K. Only per-row maxima are exchanged; P and row sums remain local and
+  // are combined by the epilogue ReduceK path.
+  CUTLASS_DEVICE
+  FragSRow softmax_ksplit2(
+      bool first_block,
+      FragS& tS,
+      FragSRow& tS_max,
+      FragSRow& tS_sum,
+      ElementS qk_scale,
+      int thr_id,
+      int ksplit_id) {
+    using namespace sycl::ext::oneapi::this_work_item;
+
+    auto tS_local_bmax = reduce<1>(tS, sycl::maximum{});
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tS_local_bmax.size(); i++) {
+      int row = ksplit_row_index(i, thr_id);
+      shared_storage->ksplit_row_max[row * 2 + ksplit_id] = tS_local_bmax(i);
+    }
+
+    sycl::group_barrier(get_work_group<3>());
+
+    FragSRow tS_bmax;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tS_bmax.size(); i++) {
+      int row = ksplit_row_index(i, thr_id);
+      ElementS m0 = shared_storage->ksplit_row_max[row * 2 + 0];
+      ElementS m1 = shared_storage->ksplit_row_max[row * 2 + 1];
+      tS_bmax(i) = sycl::max(m0, m1);
+    }
+
+    FragSRow rescale;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tS_max.size(); i++) {
+      ElementS new_max = sycl::max(tS_max(i), qk_scale * tS_bmax(i));
+      rescale(i) = sycl::native::exp2(tS_max(i) - new_max);
+      tS_max(i) = new_max;
+    }
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tS.size(); i++) {
+      tS(i) = sycl::native::exp2(qk_scale * tS(i) - broadcast<0>(tS_max, tS, i));
+    }
+
+    if (!first_block) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tS_sum.size(); i++) {
+        tS_sum(i) *= rescale(i);
+      }
+    }
+
+    auto tS_local_bsum = reduce<1>(tS, sycl::plus<void>{});
+    if constexpr (PExchange) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tS_local_bsum.size(); i++) {
+        int row = ksplit_row_index(i, thr_id);
+        shared_storage->ksplit_row_sum[row * 2 + ksplit_id] = tS_local_bsum(i);
+      }
+
+      sycl::group_barrier(get_work_group<3>());
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tS_sum.size(); i++) {
+        int row = ksplit_row_index(i, thr_id);
+        tS_sum(i) += shared_storage->ksplit_row_sum[row * 2 + 0] + shared_storage->ksplit_row_sum[row * 2 + 1];
+      }
+    } else {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tS_local_bsum.size(); i++) {
+        tS_sum(i) += tS_local_bsum(i);
+      }
+    }
+
+    return rescale;
+  }
+#endif
+
 };
 
 template <

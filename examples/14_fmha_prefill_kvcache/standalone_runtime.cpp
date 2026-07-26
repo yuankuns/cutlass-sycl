@@ -1,6 +1,7 @@
 #include "standalone_runtime.hpp"
 
 #include <stdexcept>
+#include <vector>
 
 namespace sgl_standalone {
 namespace {
@@ -8,6 +9,7 @@ sycl::queue* current_queue = nullptr;
 void* workspace_ptr = nullptr;
 std::size_t workspace_bytes = 0;
 sycl::event last_kernel_event;
+std::vector<sycl::event> last_kernel_events;
 bool has_last_kernel_event = false;
 }  // namespace
 
@@ -22,8 +24,14 @@ sycl::queue& queue() {
   return *current_queue;
 }
 
+void clear_events() {
+  last_kernel_events.clear();
+  has_last_kernel_event = false;
+}
+
 void set_last_event(const sycl::event& event) {
   last_kernel_event = event;
+  last_kernel_events.push_back(event);
   has_last_kernel_event = true;
 }
 
@@ -32,6 +40,13 @@ sycl::event last_event() {
     throw std::runtime_error("standalone FMHA kernel event was not recorded");
   }
   return last_kernel_event;
+}
+
+const std::vector<sycl::event>& last_events() {
+  if (!has_last_kernel_event) {
+    throw std::runtime_error("standalone FMHA kernel event was not recorded");
+  }
+  return last_kernel_events;
 }
 
 void* workspace(std::size_t bytes) {
@@ -60,7 +75,7 @@ void release_workspace() {
   }
   workspace_ptr = nullptr;
   workspace_bytes = 0;
-  has_last_kernel_event = false;
+  clear_events();
 }
 
 }  // namespace sgl_standalone

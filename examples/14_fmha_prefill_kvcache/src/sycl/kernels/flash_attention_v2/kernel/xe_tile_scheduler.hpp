@@ -225,4 +225,61 @@ struct XeReduceSplitKTileScheduler {
     return *this;
   }
 };
+
+struct XeFHMASplitKVPrefillTileScheduler {
+  struct Params {
+    dim3 grid;
+    FastDivmod divmod_num_heads;
+    FastDivmod divmod_batch;
+    int num_kv_splits = 1;
+  };
+
+  bool valid_ = true;
+  Params params;
+
+  CUTLASS_DEVICE
+  XeFHMASplitKVPrefillTileScheduler(Params const& params) : params(params) {}
+
+  template <class ProblemShape, class TileShape>
+  static Params to_underlying_arguments(
+      ProblemShape const& shape,
+      KernelHardwareInfo hw_info,
+      TileShape const& tile_shape,
+      const int& num_kv_splits = 1) {
+    using namespace cute;
+
+    dim3 grid(
+        size(ceil_div(shape.head_size_vo, get<1>(tile_shape))),
+        size(ceil_div(shape.seq_len_qo, get<0>(tile_shape))),
+        size(shape.batch * shape.num_heads_q * num_kv_splits));
+    return Params{grid, {shape.num_heads_q}, {shape.batch * shape.num_heads_q}, num_kv_splits};
+  }
+
+  template <int Num_SGs>
+  static dim3 get_grid_shape(Params const& params) {
+    return params.grid;
+  }
+
+  CUTLASS_DEVICE
+  bool is_valid() {
+    return valid_;
+  }
+
+  CUTLASS_DEVICE
+  auto get_block_coord() {
+    using namespace cute;
+    int idx = BlockIdxZ();
+    int idx_kv_split = idx % params.num_kv_splits;
+    int batch_head = idx / params.num_kv_splits;
+    int head, idx_b;
+    params.divmod_num_heads(idx_b, head, batch_head);
+    return make_coord(BlockIdxY(), BlockIdxX(), head, idx_b, idx_kv_split);
+  }
+
+  CUTLASS_DEVICE
+  XeFHMASplitKVPrefillTileScheduler& operator++() {
+    valid_ = false;
+    return *this;
+  }
+};
 }  // namespace cutlass::fmha::kernel

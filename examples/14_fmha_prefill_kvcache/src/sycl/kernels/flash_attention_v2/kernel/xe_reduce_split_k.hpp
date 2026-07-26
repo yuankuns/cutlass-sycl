@@ -306,6 +306,193 @@ class ReduceSplitK {
   }
 };
 
+template <class ProblemShape_, class TileScheduler_, class FMHAKernel_, class TensorO_>
+class ReducePrefillSplitK {
+ public:
+  using ProblemShape = ProblemShape_;
+  using VariableLength = cutlass::fmha::collective::VariableLength;
+  static constexpr bool is_var_len = cutlass::fmha::collective::is_variable_length_v<typename ProblemShape::SeqLenType>;
+  using TileScheduler = TileScheduler_;
+  static_assert(
+      is_same_v<TileScheduler, cutlass::fmha::kernel::XeReduceSplitKTileScheduler>,
+      "ReducePrefillSplitK kernel requires XeReduceSplitKTileScheduler");
+  using TileSchedulerParams = typename TileScheduler::Params;
+
+  using TensorO = TensorO_;
+  using ElementO = typename TensorO::value_type;
+  using StrideO = decltype(stride(TensorO{}));
+  using ElementAccum = typename FMHAKernel_::ElementO;
+  using StrideAccum = typename FMHAKernel_::StrideO;
+  using TileShapeO = typename FMHAKernel_::TileShapeO;
+  using TileShapeQK = typename FMHAKernel_::TileShapeQK;
+  using ElementLSE = float;
+  using SGPerWG = typename FMHAKernel_::SGPerWG;
+
+  struct KernelArguments {
+    ProblemShape shape;
+    ElementO* O;
+    StrideO dO;
+    const ElementAccum* Oaccum;
+    StrideAccum dOaccum;
+    const ElementLSE* exp_sums;
+    StrideO dExp_sums;
+    const ElementLSE* max_logits;
+    StrideO dMax_logits;
+    const bool* skip_batch_mask = nullptr;
+  };
+  using KernelParams = KernelArguments;
+
+  struct Arguments {
+    KernelArguments kernel{};
+    KernelHardwareInfo hw_info{};
+    int num_kv_splits = 1;
+  };
+
+  struct Params {
+    KernelParams kernel;
+    TileSchedulerParams scheduler;
+  };
+
+  struct SharedStorage {
+    cutlass::Array<ElementLSE, FMHAKernel_::max_num_kv_splits> max_logits_slm_array;
+    cutlass::Array<ElementLSE, FMHAKernel_::max_num_kv_splits> exp_sums_slm_array;
+  };
+
+  static constexpr int SharedStorageSize = is_empty_v<SharedStorage> ? size_t(0) : sizeof(SharedStorage);
+
+  static Params to_underlying_arguments(Arguments const& args, void* workspace) {
+    return {
+        args.kernel,
+        TileScheduler::to_underlying_arguments(args.kernel.shape, args.hw_info, TileShapeO{}, args.num_kv_splits)};
+  }
+
+  static bool can_implement(Arguments const& args) {
+    return args.num_kv_splits <= FMHAKernel_::max_num_kv_splits;
+  }
+
+  static int get_workspace_size(Arguments const& args) {
+    return 0;
+  }
+
+  static cutlass::Status initialize_workspace(
+      Arguments const& args,
+      void* workspace = nullptr,
+      cudaStream_t stream = nullptr,
+      CudaHostAdapter* cuda_adapter = nullptr) {
+    return Status::kSuccess;
+  }
+
+  static dim3 get_grid_shape(Params const& params) {
+    return TileScheduler::template get_grid_shape<SGPerWG::value>(params.scheduler);
+  }
+
+  static dim3 get_block_shape() {
+    return dim3(SGPerWG::value * intel::sg_size, 1, 1);
+  }
+
+  CUTLASS_DEVICE
+  Shape<int, int> get_sequence_length_shape(ProblemShape const& problem_shape, int const& batch) {
+    if constexpr (is_var_len) {
+      int seq_len_q =
+          problem_shape.seq_len_qo.cumulative_length[batch + 1] - problem_shape.seq_len_qo.cumulative_length[batch];
+      int seq_len_kv_cache = problem_shape.seq_len_kv_cache.cumulative_length
+                                 ? problem_shape.seq_len_kv_cache.cumulative_length[batch]
+                                 : int(problem_shape.seq_len_kv_cache);
+      return Shape<int, int>{seq_len_q, seq_len_kv_cache};
+    } else {
+      return Shape<int, int>{problem_shape.seq_len_qo, problem_shape.seq_len_kv_cache};
+    }
+  }
+
+  CUTLASS_DEVICE
+  void operator()(Params const& params, char* smem_buf) {
+    using namespace sycl::ext::oneapi::this_work_item;
+
+    SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
+
+    auto& p = params.kernel;
+    ProblemShape const& s = p.shape;
+    int thr_id = int(ThreadIdxX());
+
+    TileScheduler tile_scheduler{params.scheduler};
+    auto num_kv_splits = params.scheduler.num_kv_splits;
+    auto batch_dim = is_var_len ? 1 : s.batch;
+
+    CUTLASS_PRAGMA_NO_UNROLL
+    for (; tile_scheduler.is_valid(); ++tile_scheduler) {
+      auto [seq_idx, head_q, idx_b] = tile_scheduler.get_block_coord();
+      if (p.skip_batch_mask != nullptr && p.skip_batch_mask[idx_b]) continue;
+
+      auto [seq_len_qo, seq_len_kv_cache] = get_sequence_length_shape(s, idx_b);
+      if (seq_idx >= seq_len_qo) continue;
+
+      int k_blocks = cute::ceil_div(seq_len_kv_cache, get<1>(TileShapeQK{}));
+      int num_blocks_per_split = cute::ceil_div(k_blocks, num_kv_splits);
+
+      int offset_o = 0, offset_o_accum = 0, offset_exp_sums = 0, offset_max_logits = 0;
+      if constexpr (is_var_len) {
+        auto qo_cumulative = s.seq_len_qo.cumulative_length;
+        offset_o = s.num_heads_q * s.head_size_vo * qo_cumulative[idx_b];
+        offset_o_accum = s.num_heads_q * s.head_size_vo * num_kv_splits * qo_cumulative[idx_b];
+        offset_exp_sums = s.num_heads_q * num_kv_splits * qo_cumulative[idx_b];
+        offset_max_logits = s.num_heads_q * num_kv_splits * qo_cumulative[idx_b];
+      }
+
+      auto shape_O = make_shape(seq_len_qo, s.head_size_vo, s.num_heads_q, batch_dim);
+      auto shape_Oaccum = make_shape(seq_len_qo, s.head_size_vo, s.num_heads_q * num_kv_splits, batch_dim);
+      auto shape_exp_sums = make_shape(seq_len_qo, num_kv_splits, s.num_heads_q, batch_dim);
+      auto shape_max_logits = make_shape(seq_len_qo, num_kv_splits, s.num_heads_q, batch_dim);
+
+      Tensor O = make_tensor(make_gmem_ptr(p.O + offset_o), make_layout(shape_O, p.dO));
+      Tensor Oaccum = make_tensor(
+          make_gmem_ptr(const_cast<ElementAccum*>(p.Oaccum + offset_o_accum)),
+          make_layout(shape_Oaccum, p.dOaccum));
+      Tensor exp_sums = make_tensor(
+          make_gmem_ptr(const_cast<ElementLSE*>(p.exp_sums + offset_exp_sums)),
+          make_layout(shape_exp_sums, p.dExp_sums));
+      Tensor max_logits = make_tensor(
+          make_gmem_ptr(const_cast<ElementLSE*>(p.max_logits + offset_max_logits)),
+          make_layout(shape_max_logits, p.dMax_logits));
+
+      int l_coord = is_var_len ? 0 : idx_b;
+
+      ElementLSE global_max_logits{cutlass::platform::numeric_limits<ElementLSE>::lowest()};
+      ElementLSE global_exp_sums{0};
+      if (thr_id < num_kv_splits && thr_id * num_blocks_per_split < k_blocks) {
+        ElementLSE cur_max_logit = max_logits(seq_idx, thr_id, head_q, l_coord);
+        ElementLSE cur_exp_sum = exp_sums(seq_idx, thr_id, head_q, l_coord);
+        global_max_logits = sycl::max(global_max_logits, cur_max_logit);
+        shared_storage.max_logits_slm_array[thr_id] = cur_max_logit;
+        shared_storage.exp_sums_slm_array[thr_id] = cur_exp_sum;
+      }
+
+      sycl::group_barrier(get_work_group<3>());
+
+      global_max_logits = reduce_over_group(get_work_group<1>(), global_max_logits, sycl::maximum<>());
+      global_max_logits = sycl::group_broadcast(get_work_group<1>(), global_max_logits, 0);
+
+      for (int idx = thr_id; idx < s.head_size_vo; idx += SGPerWG::value * intel::sg_size) {
+        ElementLSE acc = 0;
+        global_exp_sums = 0;
+        for (int i = 0; i < num_kv_splits; ++i) {
+          if (i * num_blocks_per_split >= k_blocks) break;
+          ElementLSE local_exp_sum = shared_storage.exp_sums_slm_array[i];
+          if (local_exp_sum <= ElementLSE(0)) continue;
+          ElementLSE local_max_logit = shared_storage.max_logits_slm_array[i];
+          ElementLSE rescale = sycl::native::exp2(local_max_logit - global_max_logits);
+          ElementLSE o_accum_val =
+              static_cast<ElementLSE>(Oaccum(seq_idx, idx, i * s.num_heads_q + head_q, l_coord));
+          acc += o_accum_val * rescale;
+          global_exp_sums += local_exp_sum * rescale;
+        }
+
+        ElementLSE out = (global_exp_sums > ElementLSE(0)) ? (acc / global_exp_sums) : ElementLSE(0);
+        O(seq_idx, idx, head_q, l_coord) = static_cast<ElementO>(out);
+      }
+    }
+  }
+};
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 }  // namespace kernel

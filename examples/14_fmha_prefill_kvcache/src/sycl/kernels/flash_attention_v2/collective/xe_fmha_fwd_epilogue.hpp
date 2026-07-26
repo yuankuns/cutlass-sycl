@@ -43,6 +43,10 @@
 #include "sycl/Utils.h"
 #include "sycl/comm/copy_block_slm.hpp"
 
+#ifndef FMHA_PREFILL_ENABLE_P_EXCHANGE
+#define FMHA_PREFILL_ENABLE_P_EXCHANGE 0
+#endif
+
 namespace cutlass::fmha::collective {
 
 using namespace cute;
@@ -163,6 +167,32 @@ class FMHAFwdEpilogue {
     /* Some subgroups may not have any work to do; if so, quit early. */
     if (!active) return;
 
+    if constexpr (CollectiveMainloop::PExchange && !Sink && ReduceK{} == _1{}) {
+      Tensor cO = make_identity_tensor(O.shape());       // (q,v)
+      Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);  // (q,v)
+
+      TiledCopyO copy_o{O};
+      auto thr_copy_o = copy_o.get_slice(thr_id);
+      auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
+      auto tOgO = thr_copy_o.partition_D(gO);
+
+      int j = 0;
+      CUTLASS_PRAGMA_UNROLL
+      for (int VV = 0; VV < CollectiveMainloop::VTiles; VV++) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < tArA.size() / CollectiveMainloop::VTiles; i++) {
+          ElementA outv = tArA(_, _, _, VV)(i);
+          if constexpr (CollectiveMainloop::Fp8KV) {
+            outv *= ElementA(scale_v);
+          }
+          tOrO(j) = static_cast<ElementO>(outv);
+          ++j;
+        }
+      }
+      copy(copy_o, tOrO, tOgO);
+      return;
+    }
+
     /* Non-packed sink (prefill / MHA decode): every row in this tile belongs to
        the SAME query head, so a single scalar sink applies to all rows. Add
        exp2(sink_val * log2e - row_max) to each row's running sum. */
@@ -270,6 +300,73 @@ class FMHAFwdEpilogue {
       /* Reorder tile and write out */
       reorder(rA, tOrO);
       copy(copy_o, tOrO, tOgO);
+    }
+  }
+
+  // Split-K prefill partial epilogue. This writes the unnormalized P*V
+  // accumulator for one KV split plus the split-local softmax max/sum. A
+  // separate reduction kernel combines splits and performs the final divide.
+  template <typename QVCoord, class TensorLSE2D>
+  CUTLASS_DEVICE void operator()(
+      TensorO2D const& Oaccum,
+      FragA& tArA,
+      FragARow& tA_max,
+      FragARow& tA_sum,
+      QVCoord blk_qv,
+      int thr_id,
+      float scale_v,
+      TensorLSE2D const& exp_sums,
+      TensorLSE2D const& max_logits,
+      int idx_kv_split) {
+    using namespace cute;
+    using ElementA = typename FragA::element_type;
+
+    auto [rA, rA_max_local, rA_sum, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
+    if (!active) return;
+
+    Tensor cO = make_identity_tensor(Oaccum.shape());       // (q,v)
+    Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);       // (q,v)
+
+    TiledCopyO copy_o{Oaccum};
+    auto thr_copy_o = copy_o.get_slice(thr_id);
+
+    auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
+    auto tOgO = thr_copy_o.partition_D(gO);
+
+    if constexpr (CollectiveMainloop::Fp8KV) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA.size(); i++) {
+        rA(i) *= ElementA(scale_v);
+      }
+    }
+
+    reorder(rA, tOrO);
+    copy(copy_o, tOrO, tOgO);
+
+    if (int(get<1>(blk_qv)) == 0) {
+      auto sum_e = rA;
+      auto max_e = rA;
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA.size(); i++) {
+        sum_e(i) = broadcast<0>(rA_sum, rA, i);
+        max_e(i) = broadcast<0>(rA_max_local, rA, i);
+      }
+
+      auto tv = tOrO.tv_layout();
+      auto tO_sum = make_subgroup_tensor(make_fragment_like<ElementA>(tOrO.layout()), tv);
+      auto tO_max = make_subgroup_tensor(make_fragment_like<ElementA>(tOrO.layout()), tv);
+      reorder(sum_e, tO_sum);
+      reorder(max_e, tO_max);
+
+      int row_extent = int(get<0>(Oaccum.shape()));
+      CUTLASS_PRAGMA_UNROLL
+      for (int j = 0; j < int(tO_sum.size()); j++) {
+        int row = int(get<0>(tOgO(j)));
+        if (row < row_extent) {
+          exp_sums(row, idx_kv_split) = tO_sum(j);
+          max_logits(row, idx_kv_split) = tO_max(j);
+        }
+      }
     }
   }
 

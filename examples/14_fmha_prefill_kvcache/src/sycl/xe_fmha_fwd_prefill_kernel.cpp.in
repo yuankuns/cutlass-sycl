@@ -29,7 +29,14 @@
  *
  **************************************************************************************************/
 // Auto-generated from xe_fmha_fwd_prefill_kernel.cpp.in
-// Template parameters: HEAD_DIM=@HEAD_DIM@, TILED_Q=@TILED_Q@, TILED_KV=@TILED_KV@, NUM_SG=@NUM_SG@
+// Template parameters: HEAD_DIM=@HEAD_DIM@, TILED_Q=@TILED_Q@, TILED_KV=@TILED_KV@, TILED_D=@TILED_D@,
+// TILED_PV=@TILED_PV@, QK_SG=(@QK_SG_M@,@QK_SG_N@,@QK_SG_K@),
+// PV_SG=(@PV_SG_M@,@PV_SG_N@,@PV_SG_K@), NUM_KV_SPLITS=@NUM_KV_SPLITS@
+#if @ENABLE_SCORE_BLOCK2D@
+#ifndef FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+#define FMHA_PREFILL_ENABLE_SCORE_BLOCK2D 1
+#endif
+#endif
 #include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_runner.hpp"
 
 namespace prefill {
@@ -62,22 +69,29 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
 #endif
 
 #if @EMIT_PAGED@
-  using TileShapeQK = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_KV@>, cute::_32>;
-  using TileShapePV = cute::Shape<cute::Int<@TILED_Q@>, cute::_32, cute::Int<@TILED_KV@>>;
+  using TileShapeQK = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_KV@>, cute::Int<@TILED_D@>>;
+  using TileShapePV = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_PV@>, cute::Int<@TILED_KV@>>;
   // Round the head-dim of the output tile up to a multiple of get<1>(TileShapePV) (32) so that
   // VTiles = get<1>(TileShapeOutput) / get<1>(TileShapePV) covers the full head dimension when
   // HEAD_DIM is not a multiple of 32 (e.g. HEAD_DIM=72 -> 96, VTiles=3). The actual O surface is
   // bounded by head_size_vo, so HW clips the OOB tail writes in the epilogue.
   using TileShapeOutput = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_OUT@>>;
-  using SubgroupLayoutQK =
-      cute::Layout<cute::Shape<cute::Int<@NUM_SG@>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
-
+  using SubgroupLayoutQK = cute::Layout<
+      cute::Shape<cute::Int<@QK_SG_M@>, cute::Int<@QK_SG_N@>, cute::Int<@QK_SG_K@>>,
+      cute::Stride<cute::Int<@QK_SG_STRIDE_M@>, cute::Int<@QK_SG_STRIDE_N@>, cute::Int<@QK_SG_STRIDE_K@>>>;
+#if @USE_EXPLICIT_PV_LAYOUT@
+  using SubgroupLayoutPV = cute::Layout<
+      cute::Shape<cute::Int<@PV_SG_M@>, cute::Int<@PV_SG_N@>, cute::Int<@PV_SG_K@>>,
+      cute::Stride<cute::Int<@PV_SG_STRIDE_M@>, cute::Int<@PV_SG_STRIDE_N@>, cute::Int<@PV_SG_STRIDE_K@>>>;
+#else
+  using SubgroupLayoutPV = decltype(cutlass::fmha::collective::get_sg_layout_pv(SubgroupLayoutQK{}));
+#endif
 #if @HEAD_DIM@ == 64
   AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
-        FMHAConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_paged(
-            params);
+        FMHAConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK,
+                   SubgroupLayoutPV>::run_paged(params);
       });
     });
   });
@@ -85,12 +99,32 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
   TORCH_CHECK(
       !use_sink,
       "sink is only supported for head_size == 64, got @HEAD_DIM@");
+#if @NUM_KV_SPLITS@ > 1
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
-      FMHAConfig<Causal, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_paged(
-          params);
+      FMHAConfig<Causal, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK,
+                 SubgroupLayoutPV>::template run_paged_split<@NUM_KV_SPLITS@>(params);
     });
   });
+#else
+#if @HEAD_DIM@ == 512
+  if (params.page_table_identity && params.d == 512 && params.dv == 512 && params.total_knew == 0) {
+    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
+        FMHAConfig<Causal, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK,
+                   SubgroupLayoutPV>::run_paged_identity_contiguous(params);
+      });
+    });
+    return;
+  }
+#endif
+  AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+    AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
+      FMHAConfig<Causal, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK,
+                 SubgroupLayoutPV>::run_paged(params);
+    });
+  });
+#endif
 #endif
 #else
   TORCH_CHECK(false, "head dim @HEAD_DIM@ is not compiled for the paged prefill path");

@@ -50,6 +50,7 @@
 #include "sycl/comm/common.h"
 #include "sycl/kernels/flash_attention_v2/collective/fmha_fusion.hpp"
 #include "sycl/kernels/flash_attention_v2/kernel/xe_fhma_fwd_kernel.hpp"
+#include "sycl/kernels/flash_attention_v2/kernel/xe_reduce_split_k.hpp"
 #include "sycl/kernels/flash_attention_v2/kernel/xe_tile_scheduler.hpp"
 
 using namespace cute;
@@ -180,6 +181,7 @@ struct Arguments {
   int page_size;
   int num_pages;
   bool pagedkv_tma;
+  bool page_table_identity = false;
 
   // The dropout probability (probability of keeping an activation).
   float p_dropout;
@@ -290,7 +292,16 @@ struct PrefillRunner {
       shape = problem_shape_launch;
     } else {
       problem_size = problem_shape_in;
-      shape = problem_shape_in;
+      shape = ProblemShapeType{
+          .batch = get<0>(problem_shape_in),
+          .num_heads_q = get<1>(problem_shape_in),
+          .num_heads_kv = get<2>(problem_shape_in),
+          .seq_len_qo = get<3>(problem_shape_in),
+          .seq_len_kv = get<4>(problem_shape_in),
+          .seq_len_kv_cache = get<5>(problem_shape_in),
+          .head_size_qk = get<6>(problem_shape_in),
+          .head_size_vo = get<7>(problem_shape_in),
+      };
     }
 
     auto [batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, seq_len_kv_cache, head_size_qk, head_size_vo] =
@@ -348,6 +359,7 @@ struct PrefillRunner {
             params.max_num_pages_per_seq,
             params.window_size_left,
             params.window_size_right,
+            params.page_table_identity,
         },
         {},
         hw_info};
@@ -356,8 +368,10 @@ struct PrefillRunner {
     size_t workspace_size = FMHAPrefillKernel::get_workspace_size(arguments);
 #ifdef SGL_KERNEL_STANDALONE_NO_TORCH
     void* workspace = sgl_standalone::workspace(workspace_size);
+    void* workspace_ptr = workspace;
 #else
     auto workspace = torch::empty(workspace_size, params.tensor_opts);
+    void* workspace_ptr = workspace.data_ptr();
 #endif
 
     if (!FMHAPrefillKernel::can_implement(arguments)) {
@@ -365,20 +379,252 @@ struct PrefillRunner {
     }
 
     // Initialize the workspace
-#ifdef SGL_KERNEL_STANDALONE_NO_TORCH
-    FMHAPrefillKernel::initialize_workspace(arguments, workspace);
+    FMHAPrefillKernel::initialize_workspace(arguments, workspace_ptr);
 
     // Convert host-side arguments to device-side arguments to be passed to the kernel
-    auto kernel_params = FMHAPrefillKernel::to_underlying_arguments(arguments, workspace);
-#else
-    FMHAPrefillKernel::initialize_workspace(arguments, workspace.data_ptr());
-
-    // Convert host-side arguments to device-side arguments to be passed to the kernel
-    auto kernel_params = FMHAPrefillKernel::to_underlying_arguments(arguments, workspace.data_ptr());
-#endif
+    auto kernel_params = FMHAPrefillKernel::to_underlying_arguments(arguments, workspace_ptr);
 
     // Run
+    if constexpr (CollectiveMainloop::ScoreBlock2D) {
+      using ScoreStoreKernel = typename FMHAPrefillKernel::template WithStaticScoreMode<0>;
+      using ScoreLoadKernel = typename FMHAPrefillKernel::template WithStaticScoreMode<1>;
+      auto store_params = ScoreStoreKernel::to_underlying_arguments(arguments, workspace_ptr);
+      store_params.mainloop.score_mode = 0;
+      launch<ScoreStoreKernel>(store_params);
+      auto load_params = ScoreLoadKernel::to_underlying_arguments(arguments, workspace_ptr);
+      load_params.mainloop.score_mode = 1;
+      launch<ScoreLoadKernel>(load_params);
+    } else {
+      launch<FMHAPrefillKernel>(kernel_params);
+    }
+    return cutlass::Status::kSuccess;
+  }
+};
+
+template <class FMHAPrefillKernel, class ReductionSplitKernel, bool isVarLen = false>
+struct SplitPrefillRunner {
+  using StrideQ = typename FMHAPrefillKernel::StrideQ;
+  using StrideK = typename FMHAPrefillKernel::StrideK;
+  using StrideV = typename FMHAPrefillKernel::StrideV;
+  using StrideOaccum = typename FMHAPrefillKernel::StrideO;
+  using StrideO = typename ReductionSplitKernel::StrideO;
+
+  using ElementQ = typename FMHAPrefillKernel::ElementQ;
+  using ElementK = typename FMHAPrefillKernel::ElementK;
+  using ElementV = typename FMHAPrefillKernel::ElementV;
+  using ElementAccum = typename FMHAPrefillKernel::ElementO;
+  using ElementO = typename ReductionSplitKernel::ElementO;
+  using ElementLSE = typename ReductionSplitKernel::ElementLSE;
+
+  using ProblemShapeType = cutlass::fmha::kernel::FMHAProblemShape<isVarLen>;
+
+  StrideQ stride_Q;
+  StrideK stride_K;
+  StrideV stride_V;
+  StrideK stride_K_cache;
+  StrideV stride_V_cache;
+  StrideOaccum stride_Oaccum;
+  StrideO stride_O;
+  StrideO stride_exp_sums;
+  StrideO stride_max_logits;
+
+  template <class ProblemShape>
+  auto initialize_varlen(const Arguments& params, const ProblemShape& problem_size) {
+    ProblemShape problem_size_for_init = problem_size;
+    get<0>(problem_size_for_init) = 1;
+    get<1>(problem_size_for_init) = params.h;
+    get<3>(problem_size_for_init) = params.total_q;
+    get<4>(problem_size_for_init) = params.total_knew;
+    get<5>(problem_size_for_init) = params.total_k;
+
+    ProblemShapeType problem_size_for_launch{
+        .batch = get<0>(problem_size),
+        .num_heads_q = get<1>(problem_size),
+        .num_heads_kv = get<2>(problem_size),
+        .seq_len_qo = {params.seqlen_q, params.total_q, nullptr},
+        .seq_len_kv = {params.seqlen_knew, params.total_knew},
+        .seq_len_kv_cache = {params.seqlen_k, params.total_k},
+        .head_size_qk = get<6>(problem_size),
+        .head_size_vo = get<7>(problem_size),
+    };
+
+    return cute::make_tuple(problem_size_for_init, problem_size_for_launch);
+  }
+
+  ProblemShapeType initialize(const Arguments& params, int num_kv_splits) {
+    auto problem_shape_in = cute::make_tuple(
+        params.b, params.h, params.h_k, params.seqlen_q, params.seqlen_knew, params.seqlen_k, params.d, params.dv);
+    ProblemShapeType shape;
+    decltype(problem_shape_in) problem_size;
+
+    if constexpr (isVarLen) {
+      auto [problem_shape_init, problem_shape_launch] = initialize_varlen(params, problem_shape_in);
+      problem_size = problem_shape_init;
+      shape = problem_shape_launch;
+    } else {
+      problem_size = problem_shape_in;
+      shape = problem_shape_in;
+    }
+
+    auto [batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, seq_len_kv_cache, head_size_qk, head_size_vo] =
+        problem_size;
+
+    stride_Q = cutlass::make_stride(
+        num_heads_q * head_size_qk, Int<1>{}, head_size_qk, head_size_qk * num_heads_q * seq_len_qo);
+    stride_K = cutlass::make_stride(
+        num_heads_kv * head_size_qk, Int<1>{}, head_size_qk, head_size_qk * num_heads_kv * seq_len_kv);
+    stride_V = cutlass::make_stride(
+        Int<1>{}, num_heads_kv * head_size_vo, head_size_vo, head_size_vo * num_heads_kv * seq_len_kv);
+    stride_K_cache = cutlass::make_stride(
+        num_heads_kv * head_size_qk, Int<1>{}, head_size_qk, head_size_qk * num_heads_kv * seq_len_kv_cache);
+    stride_V_cache = cutlass::make_stride(
+        Int<1>{}, num_heads_kv * head_size_vo, head_size_vo, head_size_vo * num_heads_kv * seq_len_kv_cache);
+    stride_O = cutlass::make_stride(
+        num_heads_q * head_size_vo, Int<1>{}, head_size_vo, head_size_vo * num_heads_q * seq_len_qo);
+    stride_Oaccum = cutlass::make_stride(
+        num_heads_q * num_kv_splits * head_size_vo,
+        Int<1>{},
+        head_size_vo,
+        head_size_vo * num_heads_q * num_kv_splits * seq_len_qo);
+    stride_exp_sums = cutlass::make_stride(
+        num_heads_q * num_kv_splits, Int<1>{}, num_kv_splits, num_heads_q * num_kv_splits * seq_len_qo);
+    stride_max_logits = stride_exp_sums;
+
+    if constexpr (isVarLen) {
+      shape.seq_len_qo.cumulative_length = params.cu_seqlens_q;
+      shape.seq_len_kv.cumulative_length = params.cu_seqlens_knew;
+      shape.seq_len_kv_cache.cumulative_length = params.cu_seqlens_k;
+    }
+
+    return shape;
+  }
+
+  static constexpr size_t align_up(size_t value, size_t alignment) {
+    return ((value + alignment - 1) / alignment) * alignment;
+  }
+
+  cutlass::Status run(const Arguments& params, const cutlass::KernelHardwareInfo& hw_info, int num_kv_splits) {
+    ProblemShapeType shape = initialize(params, num_kv_splits);
+
+    size_t total_q = params.total_q > 0 ? static_cast<size_t>(params.total_q)
+                                        : static_cast<size_t>(params.b) * params.seqlen_q;
+    size_t oaccum_count = total_q * params.h * params.dv * num_kv_splits;
+    size_t lse_count = total_q * params.h * num_kv_splits;
+
+    size_t offset = 0;
+    size_t oaccum_offset = offset;
+    offset += oaccum_count * sizeof(ElementAccum);
+    offset = align_up(offset, alignof(ElementLSE));
+    size_t exp_sums_offset = offset;
+    offset += lse_count * sizeof(ElementLSE);
+    offset = align_up(offset, alignof(ElementLSE));
+    size_t max_logits_offset = offset;
+    offset += lse_count * sizeof(ElementLSE);
+    offset = align_up(offset, 128);
+
+    typename FMHAPrefillKernel::Arguments arguments{
+        {
+            shape,
+            static_cast<const ElementQ*>(params.q_ptr),
+            stride_Q,
+            nullptr,
+            stride_K,
+            nullptr,
+            stride_V,
+            nullptr,
+            stride_Oaccum,
+            nullptr,
+            stride_exp_sums,
+            nullptr,
+            stride_max_logits,
+            static_cast<const ElementK*>(params.k_ptr),
+            stride_K_cache,
+            static_cast<const ElementV*>(params.v_ptr),
+            stride_V_cache,
+            static_cast<const bool*>(params.skip_batch_mask_ptr),
+            params.k_scale_ptr,
+            params.v_scale_ptr,
+        },
+        {
+            params.softmax_scale,
+            params.page_table,
+            params.page_size,
+            params.max_num_pages_per_seq,
+            params.window_size_left,
+            params.window_size_right,
+            params.page_table_identity,
+        },
+        {},
+        hw_info,
+        num_kv_splits};
+
+    typename ReductionSplitKernel::Arguments reduce_arg{
+        {
+            shape,
+            static_cast<ElementO*>(params.o_ptr),
+            stride_O,
+            nullptr,
+            stride_Oaccum,
+            nullptr,
+            stride_exp_sums,
+            nullptr,
+            stride_max_logits,
+            static_cast<const bool*>(params.skip_batch_mask_ptr),
+        },
+        hw_info,
+        num_kv_splits};
+
+    size_t kernel_workspace_size = FMHAPrefillKernel::get_workspace_size(arguments);
+    size_t reduce_workspace_size = ReductionSplitKernel::get_workspace_size(reduce_arg);
+    size_t kernel_workspace_offset = offset;
+    offset += kernel_workspace_size;
+    offset = align_up(offset, 128);
+    size_t reduce_workspace_offset = offset;
+    offset += reduce_workspace_size;
+
+#ifdef SGL_KERNEL_STANDALONE_NO_TORCH
+    auto* workspace = static_cast<uint8_t*>(sgl_standalone::workspace(offset));
+#else
+    auto workspace_tensor =
+        torch::empty({static_cast<int64_t>(offset)}, torch::device(torch::kXPU).dtype(torch::kByte));
+    auto* workspace = static_cast<uint8_t*>(workspace_tensor.data_ptr());
+#endif
+
+    auto* oaccum_ptr = reinterpret_cast<ElementAccum*>(workspace + oaccum_offset);
+    auto* exp_sums_ptr = reinterpret_cast<ElementLSE*>(workspace + exp_sums_offset);
+    auto* max_logits_ptr = reinterpret_cast<ElementLSE*>(workspace + max_logits_offset);
+
+    arguments.kernel.Oaccum = oaccum_ptr;
+    arguments.kernel.exp_sums = exp_sums_ptr;
+    arguments.kernel.max_logits = max_logits_ptr;
+    reduce_arg.kernel.Oaccum = oaccum_ptr;
+    reduce_arg.kernel.exp_sums = exp_sums_ptr;
+    reduce_arg.kernel.max_logits = max_logits_ptr;
+
+    if (!FMHAPrefillKernel::can_implement(arguments) || !ReductionSplitKernel::can_implement(reduce_arg)) {
+      return cutlass::Status::kErrorInvalidProblem;
+    }
+
+    auto neg_inf = cutlass::platform::numeric_limits<ElementLSE>::lowest();
+#ifdef SGL_KERNEL_STANDALONE_NO_TORCH
+    auto fill_sum = compat::fill_async(exp_sums_ptr, ElementLSE(0), lse_count, sgl_standalone::queue());
+    sgl_standalone::set_last_event(fill_sum);
+    auto fill_max = compat::fill_async(max_logits_ptr, neg_inf, lse_count, sgl_standalone::queue());
+    sgl_standalone::set_last_event(fill_max);
+#else
+    compat::fill(exp_sums_ptr, ElementLSE(0), lse_count);
+    compat::fill(max_logits_ptr, neg_inf, lse_count);
+#endif
+
+    auto* kernel_workspace = workspace + kernel_workspace_offset;
+    auto* reduce_workspace = workspace + reduce_workspace_offset;
+    FMHAPrefillKernel::initialize_workspace(arguments, kernel_workspace);
+    ReductionSplitKernel::initialize_workspace(reduce_arg, reduce_workspace);
+    auto kernel_params = FMHAPrefillKernel::to_underlying_arguments(arguments, kernel_workspace);
+    auto reduce_params = ReductionSplitKernel::to_underlying_arguments(reduce_arg, reduce_workspace);
+
     launch<FMHAPrefillKernel>(kernel_params);
+    launch<ReductionSplitKernel>(reduce_params);
     return cutlass::Status::kSuccess;
   }
 };
@@ -420,7 +666,7 @@ struct FMHAConfig {
       decltype(cutlass::fmha::collective::get_sg_layout_pv(SubgroupLayoutQK{})),
       SubgroupLayoutPV_>;
 
-  template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
+  template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler, bool PageTableIdentity = false>
   static int run(const Arguments& params) {
     // The KernelHardwareInfo struct holds the number of EUs on the GPU with a given device ID. This
     // information is used by the underlying kernel.
@@ -470,7 +716,9 @@ struct FMHAConfig {
         GmemTiledCopyV,
         GmemTiledCopyK_cache,
         GmemTiledCopyV_cache,
-        LocalMask>;
+        LocalMask,
+        false,
+        PageTableIdentity>;
 
     // Epilogue
     using CollectiveEpilogue =
@@ -501,6 +749,85 @@ struct FMHAConfig {
   static int run_paged(const Arguments& params) {
     // template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
     return run<true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+  }
+
+  static int run_paged_identity(const Arguments& params) {
+    return run<true, true, true, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler, true>(params);
+  }
+
+  static int run_paged_identity_contiguous(const Arguments& params) {
+    return run<false, true, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(params);
+  }
+
+  template <int NumKvSplits>
+  static int run_paged_split(const Arguments& params) {
+    static_assert(NumKvSplits > 1, "split prefill path requires more than one KV split");
+    cutlass::KernelHardwareInfo hw_info;
+    hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+
+    using ProblemShapeType = cutlass::fmha::kernel::FMHAProblemShape<true>;
+
+    using TiledMMAQK = typename TiledMMAHelper<MMA_Atom<MMAOperation>, Layout<TileShapeQK>, SubgroupLayoutQK>::TiledMMA;
+    using TiledMMAPV = typename TiledMMAHelper<MMA_Atom<MMAOperation>, Layout<TileShapePV>, SubgroupLayoutPV>::TiledMMA;
+
+    static_assert(
+        get<0>(TileShapeOutput{}) == get<0>(TileShapePV{}),
+        "Output tile and P*V tile have different sizes in Q dimension");
+    constexpr int VTiles = get<1>(TileShapeOutput{}) / get<1>(TileShapePV{});
+
+    auto make_dummy_tensor = [&](auto val, auto stride) {
+      return make_tensor(make_gmem_ptr(&val), make_layout(repeat<rank_v<decltype(stride)>>(1), stride));
+    };
+
+    using TensorQ = decltype(make_dummy_tensor(ElementQ{}, StrideQ{}));
+    using TensorK = decltype(make_dummy_tensor(ElementK{}, StrideK{}));
+    using TensorV = decltype(make_dummy_tensor(ElementV{}, StrideV{}));
+    using TensorOAccum = decltype(make_dummy_tensor(float{}, StrideO{}));
+    using TensorOFinal = decltype(make_dummy_tensor(ElementO{}, StrideO{}));
+    using TensorK_cache = TensorK;
+    using TensorV_cache = TensorV;
+    using GmemTiledCopyK_cache = GmemTiledCopyK;
+    using GmemTiledCopyV_cache = GmemTiledCopyV;
+
+    using MainloopDispatchPolicy = cutlass::fmha::XeDefault<PipelineStages>;
+    using CollectiveMainloop = cutlass::fmha::collective::FMHAFwdMainloop<
+        MainloopDispatchPolicy,
+        Causal,
+        true,
+        true,
+        TiledMMAQK,
+        TiledMMAPV,
+        VTiles,
+        TensorQ,
+        TensorK,
+        TensorV,
+        TensorK_cache,
+        TensorV_cache,
+        GmemTiledCopyQ,
+        GmemTiledCopyK,
+        GmemTiledCopyV,
+        GmemTiledCopyK_cache,
+        GmemTiledCopyV_cache,
+        LocalMask>;
+
+    using CollectiveEpilogue =
+        cutlass::fmha::collective::FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorOAccum, void, Sink>;
+
+    using FMHAKernel = cutlass::fmha::kernel::XeFMHAFwdPrefillSplitKVKernel<
+        ProblemShapeType,
+        CollectiveMainloop,
+        CollectiveEpilogue,
+        cutlass::fmha::kernel::XeFHMASplitKVPrefillTileScheduler>;
+
+    using ReduceSplitKernel = cutlass::reduction::kernel::ReducePrefillSplitK<
+        ProblemShapeType,
+        cutlass::fmha::kernel::XeReduceSplitKTileScheduler,
+        FMHAKernel,
+        TensorOFinal>;
+
+    SplitPrefillRunner<FMHAKernel, ReduceSplitKernel, true> launcher;
+    launcher.run(params, hw_info, NumKvSplits);
+    return 0;
   }
 
   // Non-paged (contiguous ragged) KV cache: addressed via cu_seqlens_k offsets.

@@ -31,6 +31,7 @@ struct Config {
   int head_dim_v = 64;
   int page_size = 64;
   bool paged = true;
+  bool page_table_identity = true;
   bool causal = true;
   int window_left = -1;
   int window_right = -1;
@@ -91,7 +92,7 @@ Config parse_args(int argc, char** argv) {
       std::cout
           << "Usage: fmha_prefill_kvcache [options]\n"
           << "  --batch N --seqlen-q N --seqlen-k N --heads-q N --heads-kv N\n"
-          << "  --head-dim N --head-dim-v N --paged 0|1 --page-size N\n"
+          << "  --head-dim N --head-dim-v N --paged 0|1 --page-size N --page-table-identity 0|1\n"
           << "  --causal 0|1 --window-left N --window-right N --sink 0|1\n"
           << "  --warmup N --iters N --seed N --verify 0|1 --atol F --rtol F\n";
       std::exit(0);
@@ -124,6 +125,7 @@ Config parse_args(int argc, char** argv) {
   get_int("head-dim-v", cfg.head_dim_v);
   get_int("page-size", cfg.page_size);
   get_bool("paged", cfg.paged);
+  get_bool("page-table-identity", cfg.page_table_identity);
   get_bool("causal", cfg.causal);
   get_int("window-left", cfg.window_left);
   get_int("window-right", cfg.window_right);
@@ -244,6 +246,16 @@ std::vector<int32_t> make_identity_page_table(int batch, int pages_per_seq) {
   return table;
 }
 
+std::vector<int32_t> make_reverse_page_table(int batch, int pages_per_seq) {
+  std::vector<int32_t> table(batch * pages_per_seq);
+  for (int b = 0; b < batch; ++b) {
+    for (int p = 0; p < pages_per_seq; ++p) {
+      table[b * pages_per_seq + p] = b * pages_per_seq + (pages_per_seq - 1 - p);
+    }
+  }
+  return table;
+}
+
 std::vector<bf16_t> make_random_bf16(std::size_t n, std::mt19937& rng) {
   std::normal_distribution<float> dist(0.0f, 1.0f);
   std::vector<bf16_t> host(n);
@@ -357,6 +369,7 @@ void run_prefill(
   params.window_size_left = window_left;
   params.window_size_right = window_right;
   params.page_table = cfg.paged ? reinterpret_cast<int*>(page_table) : nullptr;
+  params.page_table_identity = cfg.paged && cfg.page_table_identity;
   params.page_table_batch_stride = cfg.paged ? pages_per_seq : 0;
   params.max_num_pages_per_seq = pages_per_seq;
   params.page_size = cfg.paged ? cfg.page_size : 0;
@@ -463,6 +476,7 @@ bool verify_output(const Config& cfg, const std::vector<bf16_t>& out, const std:
   double max_abs = 0.0;
   double max_ref = 0.0;
   int64_t bad_count = 0;
+  int printed_bad = 0;
   for (std::size_t i = 0; i < out.size(); ++i) {
     const double actual = bf16_to_float(out[i]);
     const double expected = ref[i];
@@ -470,7 +484,19 @@ bool verify_output(const Config& cfg, const std::vector<bf16_t>& out, const std:
     const double tol = std::abs(expected) * cfg.rtol + cfg.atol;
     max_abs = std::max(max_abs, diff);
     max_ref = std::max(max_ref, std::abs(expected));
-    if (diff > tol) ++bad_count;
+    if (diff > tol) {
+      if (printed_bad < 8) {
+        const std::size_t elem = i / cfg.head_dim_v;
+        const int dv = int(i % cfg.head_dim_v);
+        const int hq = int(elem % cfg.heads_q);
+        const int q = int(elem / cfg.heads_q);
+        std::cout << "bad_sample: idx=" << i << " q=" << q << " h=" << hq << " dv=" << dv
+                  << " actual=" << actual << " expected=" << expected
+                  << " diff=" << diff << " tol=" << tol << "\n";
+        ++printed_bad;
+      }
+      ++bad_count;
+    }
   }
   const double max_rel = max_abs / std::max(max_ref, 1e-12);
   std::cout << "verify: max_abs=" << max_abs << " max_rel=" << max_rel << " bad=" << bad_count << "/"
@@ -523,7 +549,8 @@ int main(int argc, char** argv) {
       k_host = make_random_bf16(static_cast<std::size_t>(num_pages) * cfg.page_size * cfg.heads_kv * cfg.head_dim, rng);
       v_host =
           make_random_bf16(static_cast<std::size_t>(num_pages) * cfg.page_size * cfg.heads_kv * cfg.head_dim_v, rng);
-      page_table_host = make_identity_page_table(cfg.batch, pages_per_seq);
+      page_table_host = cfg.page_table_identity ? make_identity_page_table(cfg.batch, pages_per_seq)
+                                                : make_reverse_page_table(cfg.batch, pages_per_seq);
       cu_k_or_cache_lens_host = make_cache_lengths(cfg.batch, cfg.seqlen_k);
     } else {
       k_host =
@@ -566,6 +593,7 @@ int main(int argc, char** argv) {
               << ") sink=" << cfg.sink << "\n";
 
     auto launch_once = [&] {
+      sgl_standalone::clear_events();
       run_prefill(
           cfg,
           q_dev.data(),
@@ -576,11 +604,11 @@ int main(int argc, char** argv) {
           cu_k_dev.data(),
           cfg.paged ? page_table_dev.data() : nullptr,
           cfg.sink ? sinks_dev.data() : nullptr);
-      return sgl_standalone::last_event();
+      return sgl_standalone::last_events();
     };
 
-    auto first_event = launch_once();
-    first_event.wait();
+    auto first_events = launch_once();
+    sycl::event::wait(first_events);
     q.wait();
 
     if (cfg.verify) {
@@ -601,7 +629,8 @@ int main(int argc, char** argv) {
     measured_events.reserve(std::max(cfg.iters, 0));
     const auto start = std::chrono::steady_clock::now();
     for (int i = 0; i < cfg.iters; ++i) {
-      measured_events.push_back(launch_once());
+      auto events = launch_once();
+      measured_events.insert(measured_events.end(), events.begin(), events.end());
     }
     q.wait();
     const auto end = std::chrono::steady_clock::now();
