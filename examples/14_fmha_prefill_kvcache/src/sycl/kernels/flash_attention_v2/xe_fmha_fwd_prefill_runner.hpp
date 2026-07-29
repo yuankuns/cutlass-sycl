@@ -121,6 +121,12 @@ struct Arguments {
   void* softmax_sink_ptr;
   float softcap;
 
+  // FP8 KV cache per-tensor descale. The single scalar lives on-device; the
+  // kernel dereferences these pointers so no host-side D2H sync (.item()) is
+  // needed. Null => no fp8 dequant (scale = 1.0f).
+  const float* k_scale_ptr = nullptr;
+  const float* v_scale_ptr = nullptr;
+
   // array of length b+1 holding starting offset of each sequence.
   int* __restrict__ cu_seqlens_q;
   int* __restrict__ cu_seqlens_k;
@@ -190,7 +196,8 @@ struct Arguments {
 
   bool is_bf16;
   bool is_fp32;
-  bool is_e4m3;
+  bool is_e4m3 = false;
+  bool is_e5m2 = false;
   bool is_causal;
   bool is_local;
 
@@ -331,6 +338,8 @@ struct PrefillRunner {
             stride_V_cache,
             static_cast<const typename FMHAPrefillKernel::ElementSink*>(params.softmax_sink_ptr),
             static_cast<const bool*>(params.skip_batch_mask_ptr),
+            params.k_scale_ptr,
+            params.v_scale_ptr,
         },
         {
             params.softmax_scale,
@@ -347,8 +356,10 @@ struct PrefillRunner {
     size_t workspace_size = FMHAPrefillKernel::get_workspace_size(arguments);
 #ifdef SGL_KERNEL_STANDALONE_NO_TORCH
     void* workspace = sgl_standalone::workspace(workspace_size);
+    void* workspace_ptr = workspace;
 #else
     auto workspace = torch::empty(workspace_size, params.tensor_opts);
+    void* workspace_ptr = workspace.data_ptr();
 #endif
 
     if (!FMHAPrefillKernel::can_implement(arguments)) {
@@ -356,20 +367,18 @@ struct PrefillRunner {
     }
 
     // Initialize the workspace
-#ifdef SGL_KERNEL_STANDALONE_NO_TORCH
-    FMHAPrefillKernel::initialize_workspace(arguments, workspace);
-
-    // Convert host-side arguments to device-side arguments to be passed to the kernel
-    auto kernel_params = FMHAPrefillKernel::to_underlying_arguments(arguments, workspace);
-#else
-    FMHAPrefillKernel::initialize_workspace(arguments, workspace.data_ptr());
-
-    // Convert host-side arguments to device-side arguments to be passed to the kernel
-    auto kernel_params = FMHAPrefillKernel::to_underlying_arguments(arguments, workspace.data_ptr());
-#endif
+    FMHAPrefillKernel::initialize_workspace(arguments, workspace_ptr);
 
     // Run
-    launch<FMHAPrefillKernel>(kernel_params);
+    if constexpr (CollectiveMainloop::ScoreBlock2D) {
+      using ScoreStoreKernel = typename FMHAPrefillKernel::template WithStaticScoreMode<0>;
+      using ScoreLoadKernel = typename FMHAPrefillKernel::template WithStaticScoreMode<1>;
+
+      launch<ScoreStoreKernel>(ScoreStoreKernel::to_underlying_arguments(arguments, workspace_ptr));
+      launch<ScoreLoadKernel>(ScoreLoadKernel::to_underlying_arguments(arguments, workspace_ptr));
+    } else {
+      launch<FMHAPrefillKernel>(FMHAPrefillKernel::to_underlying_arguments(arguments, workspace_ptr));
+    }
     return cutlass::Status::kSuccess;
   }
 };

@@ -370,6 +370,70 @@ fi
 # the tile suite is the accuracy baseline, while these cases measure steady
 # kernel latency with warmup and five measured launches by default.
 if suite_enabled perf; then
+run_perf_case "perf.hd512.paged_b1_hkv4_sq128_sk4096_nocausal" \
+  --batch 1 --seqlen-q 128 --seqlen-k 4096 --heads-q 16 --heads-kv 4 \
+  --head-dim 512 --head-dim-v 512 --paged 1 --page-size 128 --causal 0
+
+run_perf_case "perf.hd512.paged_b1_hkv8_sq128_sk4096_nocausal" \
+  --batch 1 --seqlen-q 128 --seqlen-k 4096 --heads-q 16 --heads-kv 8 \
+  --head-dim 512 --head-dim-v 512 --paged 1 --page-size 128 --causal 0
+
+run_perf_case "perf.hd512.paged_b8_hkv4_sq128_sk4096_nocausal" \
+  --batch 8 --seqlen-q 128 --seqlen-k 4096 --heads-q 16 --heads-kv 4 \
+  --head-dim 512 --head-dim-v 512 --paged 1 --page-size 128 --causal 0
+
+run_perf_case "perf.hd512.paged_b8_hkv8_sq128_sk4096_nocausal" \
+  --batch 8 --seqlen-q 128 --seqlen-k 4096 --heads-q 16 --heads-kv 8 \
+  --head-dim 512 --head-dim-v 512 --paged 1 --page-size 128 --causal 0
+
+run_perf_case "perf.hd512.paged_b16_hkv4_sq128_sk4096_nocausal" \
+  --batch 16 --seqlen-q 128 --seqlen-k 4096 --heads-q 16 --heads-kv 4 \
+  --head-dim 512 --head-dim-v 512 --paged 1 --page-size 128 --causal 0
+
+run_perf_case "perf.hd512.paged_b16_hkv8_sq128_sk4096_nocausal" \
+  --batch 16 --seqlen-q 128 --seqlen-k 4096 --heads-q 16 --heads-kv 8 \
+  --head-dim 512 --head-dim-v 512 --paged 1 --page-size 128 --causal 0
+
+run_perf_case "perf.hd512.paged_b1_hkv4_sq128_sk4096_causal" \
+  --batch 1 --seqlen-q 128 --seqlen-k 4096 --heads-q 16 --heads-kv 4 \
+  --head-dim 512 --head-dim-v 512 --paged 1 --page-size 128 --causal 1
+
+run_perf_case "perf.hd512.paged_b1_hkv8_sq128_sk4096_causal" \
+  --batch 1 --seqlen-q 128 --seqlen-k 4096 --heads-q 16 --heads-kv 8 \
+  --head-dim 512 --head-dim-v 512 --paged 1 --page-size 128 --causal 1
+
+run_perf_case "perf.hd512.paged_b8_hkv4_sq128_sk4096_causal" \
+  --batch 8 --seqlen-q 128 --seqlen-k 4096 --heads-q 16 --heads-kv 4 \
+  --head-dim 512 --head-dim-v 512 --paged 1 --page-size 128 --causal 1
+
+run_perf_case "perf.hd512.paged_b8_hkv8_sq128_sk4096_causal" \
+  --batch 8 --seqlen-q 128 --seqlen-k 4096 --heads-q 16 --heads-kv 8 \
+  --head-dim 512 --head-dim-v 512 --paged 1 --page-size 128 --causal 1
+
+run_perf_case "perf.hd512.paged_b16_hkv4_sq128_sk4096_causal" \
+  --batch 16 --seqlen-q 128 --seqlen-k 4096 --heads-q 16 --heads-kv 4 \
+  --head-dim 512 --head-dim-v 512 --paged 1 --page-size 128 --causal 1
+
+run_perf_case "perf.hd512.paged_b16_hkv8_sq128_sk4096_causal" \
+  --batch 16 --seqlen-q 128 --seqlen-k 4096 --heads-q 16 --heads-kv 8 \
+  --head-dim 512 --head-dim-v 512 --paged 1 --page-size 128 --causal 1
+
+run_perf_case "perf.hd512.paged_b1_hkv8_sq512_sk4096_nocausal" \
+  --batch 1 --seqlen-q 512 --seqlen-k 4096 --heads-q 16 --heads-kv 8 \
+  --head-dim 512 --head-dim-v 512 --paged 1 --page-size 128 --causal 0
+
+run_perf_case "perf.hd512.paged_b1_hkv8_sq512_sk4096_causal" \
+  --batch 1 --seqlen-q 512 --seqlen-k 4096 --heads-q 16 --heads-kv 8 \
+  --head-dim 512 --head-dim-v 512 --paged 1 --page-size 128 --causal 1
+
+run_perf_case "perf.hd512.paged_b16_hkv8_sq4096_sk4096_nocausal" \
+  --batch 16 --seqlen-q 4096 --seqlen-k 4096 --heads-q 16 --heads-kv 8 \
+  --head-dim 512 --head-dim-v 512 --paged 1 --page-size 128 --causal 0
+
+run_perf_case "perf.hd512.paged_b16_hkv8_sq4096_sk4096_causal" \
+  --batch 16 --seqlen-q 4096 --seqlen-k 4096 --heads-q 16 --heads-kv 8 \
+  --head-dim 512 --head-dim-v 512 --paged 1 --page-size 128 --causal 1
+
 run_perf_case "perf.model.gemma4_26b.paged_sq512_sk4096" \
   --batch 1 --seqlen-q 512 --seqlen-k 4096 --heads-q 16 --heads-kv 8 \
   --head-dim 128 --head-dim-v 128 --paged 1 --page-size 64 --causal 1
