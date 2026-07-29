@@ -609,6 +609,24 @@ int main(int argc, char** argv) {
     }
     const double host_avg_ms = total_ms / std::max(cfg.iters, 1);
     const double kernel_avg_ms = kernel_total_ms / std::max(cfg.iters, 1);
+    // Per-launch breakdown, for shapes that dispatch more than one kernel. The
+    // events arrive grouped by iteration, so averaging every k-th event gives
+    // the cost of the k-th kernel in the dispatch.
+    if (std::getenv("FMHA_PROFILE_PER_LAUNCH") != nullptr) {
+      const auto& events = sgl_standalone::recorded_events();
+      const int per_iter = static_cast<int>(events.size()) / std::max(cfg.iters, 1);
+      if (per_iter > 1) {
+        std::cout << "per_launch:";
+        for (int k = 0; k < per_iter; ++k) {
+          double sum = 0.0;
+          for (int i = 0; i < cfg.iters; ++i) {
+            sum += event_duration_ms(events[i * per_iter + k]);
+          }
+          std::cout << " k" << k << "=" << sum / std::max(cfg.iters, 1);
+        }
+        std::cout << "\n";
+      }
+    }
     std::cout << "profile: kernel_avg_ms=" << kernel_avg_ms << " host_avg_ms=" << host_avg_ms
               << " iters=" << cfg.iters << " estimated_tflops=" << estimate_tflops(cfg, kernel_avg_ms) << "\n";
 
