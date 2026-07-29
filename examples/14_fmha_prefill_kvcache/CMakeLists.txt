@@ -76,6 +76,12 @@ set(FMHA_PREFILL_NUM_SG_512 32 CACHE STRING "Subgroups per workgroup for paged H
 # work-group limit -- so the split is the only option here.
 set(FMHA_PREFILL_TILED_OUT_512 256 CACHE STRING "Output tile head-dim extent for paged HEAD_DIM=512 prefill (512 = pre-optimization single-tile baseline)")
 option(FMHA_PREFILL_ENABLE_SCORE_BLOCK2D_512 "Reuse QK scores across the two output tiles for paged HEAD_DIM=512 prefill" ON)
+# Head-dim step of GEMM1's Q*K reduction. Each step issues one Q load and one K load
+# per subgroup, so a wider step moves the same bytes in half as many load instructions.
+# That matters at head_dim=512 because subgroups split Q only: every subgroup loads the
+# whole K block, making K's L1 request volume 8x Q's. Wider steps cost registers (the
+# Q/K fragments scale with it), which is the same pressure that makes TILED_KV=128 spill.
+set(FMHA_PREFILL_QK_KSTEP_512 32 CACHE STRING "GEMM1 head-dim reduction step for paged HEAD_DIM=512 prefill")
 
 set(FMHA_PREFILL_TILED_Q_NP_64 128)
 set(FMHA_PREFILL_TILED_KV_NP_64 64)
@@ -124,6 +130,10 @@ foreach(HEAD_DIM ${FMHA_STANDALONE_HEAD_DIMS})
     if(HEAD_DIM STREQUAL "512" AND FMHA_PREFILL_ENABLE_SCORE_BLOCK2D_512)
       set(ENABLE_SCORE_BLOCK2D 1)
     endif()
+    set(QK_KSTEP 32)
+    if(DEFINED FMHA_PREFILL_QK_KSTEP_${HEAD_DIM})
+      set(QK_KSTEP ${FMHA_PREFILL_QK_KSTEP_${HEAD_DIM}})
+    endif()
     if(HEAD_DIM STREQUAL "128" AND FMHA_STANDALONE_PAGED_HD128_LARGE_TILE)
       set(HD128_PAGED_LARGE_TILE 1)
     else()
@@ -158,6 +168,7 @@ foreach(HEAD_DIM ${FMHA_STANDALONE_HEAD_DIMS})
     set(NUM_SG 8)
     set(TILED_OUT 128)
     set(ENABLE_SCORE_BLOCK2D 0)
+    set(QK_KSTEP 32)
   endif()
 
   if(HEAD_DIM IN_LIST FMHA_PREFILL_NP_HEAD_DIMS)
