@@ -65,7 +65,9 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
 #endif
 
 #if @EMIT_PAGED@
-  using TileShapeQK = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_KV@>, cute::_32>;
+  // The third mode is GEMM1's head-dim reduction step: one Q and one K load per step,
+  // so widening it moves the same bytes in fewer load instructions (see QK_KSTEP).
+  using TileShapeQK = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_KV@>, cute::Int<@QK_KSTEP@>>;
   using TileShapePV = cute::Shape<cute::Int<@TILED_Q@>, cute::_32, cute::Int<@TILED_KV@>>;
   // Round the head-dim of the output tile up to a multiple of get<1>(TileShapePV) (32) so that
   // VTiles = get<1>(TileShapeOutput) / get<1>(TileShapePV) covers the full head dimension when
