@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "standalone_profiling.hpp"
 #include "standalone_runtime.hpp"
 #include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_dispatch.hpp"
 
@@ -1069,18 +1070,20 @@ int main(int argc, char** argv) {
       event.wait();
     }
 
-    std::vector<sycl::event> measured_events;
-    measured_events.reserve(std::max(cfg.iters, 0));
+    // Measure device time over every kernel the prefill call enqueues: a single
+    // launch may dispatch more than one kernel, in which case timing only the
+    // last event would omit most of the work. clear_events() drops the warmup
+    // events so only the measured iterations are summed.
+    sgl_standalone::clear_events();
     const auto start = std::chrono::steady_clock::now();
     for (int i = 0; i < cfg.iters; ++i) {
       auto event = launch_once();
       event.wait();
-      measured_events.push_back(event);
     }
     const auto end = std::chrono::steady_clock::now();
     const double total_ms = std::chrono::duration<double, std::milli>(end - start).count();
     double kernel_total_ms = 0.0;
-    for (const auto& event : measured_events) {
+    for (const auto& event : sgl_standalone::recorded_events()) {
       kernel_total_ms += event_duration_ms(event);
     }
     const double host_avg_ms = total_ms / std::max(cfg.iters, 1);

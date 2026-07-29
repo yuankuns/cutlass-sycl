@@ -377,8 +377,10 @@ struct PrefillRunner {
     size_t workspace_size = FMHAPrefillKernel::get_workspace_size(arguments);
 #ifdef SGL_KERNEL_STANDALONE_NO_TORCH
     void* workspace = sgl_standalone::workspace(workspace_size);
+    void* workspace_ptr = workspace;
 #else
     auto workspace = torch::empty(workspace_size, params.tensor_opts);
+    void* workspace_ptr = workspace.data_ptr();
 #endif
 
     if (!FMHAPrefillKernel::can_implement(arguments)) {
@@ -386,20 +388,18 @@ struct PrefillRunner {
     }
 
     // Initialize the workspace
-#ifdef SGL_KERNEL_STANDALONE_NO_TORCH
-    FMHAPrefillKernel::initialize_workspace(arguments, workspace);
-
-    // Convert host-side arguments to device-side arguments to be passed to the kernel
-    auto kernel_params = FMHAPrefillKernel::to_underlying_arguments(arguments, workspace);
-#else
-    FMHAPrefillKernel::initialize_workspace(arguments, workspace.data_ptr());
-
-    // Convert host-side arguments to device-side arguments to be passed to the kernel
-    auto kernel_params = FMHAPrefillKernel::to_underlying_arguments(arguments, workspace.data_ptr());
-#endif
+    FMHAPrefillKernel::initialize_workspace(arguments, workspace_ptr);
 
     // Run
-    launch<FMHAPrefillKernel>(kernel_params);
+    if constexpr (CollectiveMainloop::ScoreBlock2D) {
+      using ScoreStoreKernel = typename FMHAPrefillKernel::template WithStaticScoreMode<0>;
+      using ScoreLoadKernel = typename FMHAPrefillKernel::template WithStaticScoreMode<1>;
+
+      launch<ScoreStoreKernel>(ScoreStoreKernel::to_underlying_arguments(arguments, workspace_ptr));
+      launch<ScoreLoadKernel>(ScoreLoadKernel::to_underlying_arguments(arguments, workspace_ptr));
+    } else {
+      launch<FMHAPrefillKernel>(FMHAPrefillKernel::to_underlying_arguments(arguments, workspace_ptr));
+    }
     return cutlass::Status::kSuccess;
   }
 };
