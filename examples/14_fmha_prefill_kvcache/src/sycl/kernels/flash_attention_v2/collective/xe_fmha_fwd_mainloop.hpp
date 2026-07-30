@@ -74,7 +74,12 @@
 // up front evicts the front of Q before GEMM1 reaches it. Addresses the "limit D
 // prefetch for large head size" TODO below.
 #ifndef FMHA_PREFILL_INIT_PF_DEPTH
-#define FMHA_PREFILL_INIT_PF_DEPTH 0
+// Now default 8. Measured neutral (47.30 vs 47.7) before D_SKEW existed and left off; once
+// the walk is skewed it helps, because the initial burst then spans the whole head-dim
+// spread instead of 32 subgroups piling onto the same leading chunks. With PF_ZIGZAG=1 at
+// b1/hq32/sq4096: uncapped 49.55, depth 4 -> 49.57, depth 8 -> 49.62, depth 12 -> see the
+// D-skew note. Re-measure alongside a same-batch reference before changing it.
+#define FMHA_PREFILL_INIT_PF_DEPTH 8
 #endif
 
 // Issue the next K block's head-dim prefetches in the order that block will actually
@@ -83,7 +88,10 @@
 // head_dim=512 there are 16 chunks in flight, so that chunk can be evicted before use.
 // Addresses the "reorder K prefetches" TODO below. Costs no registers.
 #ifndef FMHA_PREFILL_PF_ZIGZAG
-#define FMHA_PREFILL_PF_ZIGZAG 0
+// Now default 1. Measured neutral (47.58 vs 47.7) before D_SKEW existed; with the skewed
+// walk it is a small consistent win (49.50-49.55 vs 49.32), since matching the consume
+// order matters more once that order differs per subgroup.
+#define FMHA_PREFILL_PF_ZIGZAG 1
 #endif
 
 // Stage GEMM1's K through SLM, a head-dim *group* at a time. SubgroupLayoutQK splits Q
