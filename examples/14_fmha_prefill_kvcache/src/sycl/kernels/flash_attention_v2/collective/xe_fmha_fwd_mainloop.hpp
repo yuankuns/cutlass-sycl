@@ -89,6 +89,56 @@
 #define FMHA_PREFILL_PF_ZIGZAG 0
 #endif
 
+// Stage GEMM1's K through SLM, a head-dim *group* at a time. SubgroupLayoutQK splits Q
+// only, so all NUM_SG subgroups load the entire K block out of L1: K's request volume is
+// NUM_SG x its footprint, 8x Q's at head_dim=512 (see the K-request-volume analysis).
+// Staging cooperatively means each subgroup loads 1/NUM_SG of the group from global once
+// and everyone then reads it from SLM.
+//
+// A group, rather than a single reduction step, for the two reasons that killed the
+// per-step attempt:
+//   1. make_coop_block_2d_copy_B cannot split a tile more ways than it has DPAS atom
+//      blocks, and one step's (TILED_KV, KSTEP) K tile has only (TILED_KV/16)*(KSTEP/16)
+//      = 8 -> an 8-way split, not 32. A group of K_SLM steps has K_SLM times as many.
+//   2. Per-step staging costs 2 workgroup barriers per step = 2 * head_dim/KSTEP = 32 per
+//      K block; a group of 4 costs 8.
+//
+// K_SLM is that group width in units of KSTEP, so it must satisfy
+// (TILED_KV/16) * (KSTEP*K_SLM/16) >= NUM_SG: at TILED_KV=64, KSTEP=32, NUM_SG=32 the
+// minimum is 4, giving a 128-wide head-dim group and 16KB of SLM. 0 disables staging.
+//
+// MEASURED AND REJECTED, kept default-off as a recorded refutation. At
+// b1/hq32/sq4096/sk4096/dv512: 13.7 TFLOPS staged vs 47.7 direct, correct either way
+// (bad=0 on all six verify shapes). FMHA_PREFILL_K_SLM_STAGES=2 changes nothing (13.6 ->
+// 13.7), so it is not exposed load latency, and FMHA_PREFILL_K_SLM_NO_S2R splits the cost:
+// keeping the cooperative load + SLM write but feeding the DPAS from global still only
+// reaches 34.2. So the write side costs ~13 TFLOPS and the SLM->register read another ~21.
+// The redundant L1 requests this was meant to remove are worth only 3.3 TFLOPS (the pin-K
+// probe), and the read side alone cannot be removed -- the DPAS needs its B operand in
+// registers -- so no variant of this approach can pay for itself. The SLM round trip is
+// simply more expensive than re-requesting K from L1.
+#ifndef FMHA_PREFILL_K_SLM
+#define FMHA_PREFILL_K_SLM 0
+#endif
+
+// Number of SLM buffers K staging rotates through. With one buffer the global load for
+// group g+1 cannot start until every subgroup has finished reading group g, so the load
+// latency is fully exposed and GEMM1 stalls on it; measured 13.6 TFLOPS vs 47.7 direct.
+// Two or more let the next group's load overlap this group's DPAS, at K_SLM * TILED_KV *
+// KSTEP * sizeof(ElementK) = 16KB of SLM per stage.
+#ifndef FMHA_PREFILL_K_SLM_STAGES
+#define FMHA_PREFILL_K_SLM_STAGES 2
+#endif
+
+// Diagnostic: keep the whole staging path (cooperative global load, SLM write, barriers)
+// but feed the DPAS from the direct global K load instead of from SLM. Results stay
+// correct -- the staged copy simply becomes dead weight -- so this splits the staged
+// path's cost into "write side" (which this keeps) and "read side" (which it drops)
+// without a skip-the-load probe's instruction-stream distortion.
+#ifndef FMHA_PREFILL_K_SLM_NO_S2R
+#define FMHA_PREFILL_K_SLM_NO_S2R 0
+#endif
+
 // Drop GEMM1/GEMM2's workgroup split barrier. This mainloop shares nothing through
 // SLM (SharedStorage is empty), so the barrier is only a heuristic that keeps the
 // subgroups marching in step to improve locality on the shared K/V loads.
@@ -123,6 +173,65 @@ struct AppendKVParams<true, ElementK_, ElementV_> {
   int const* ptr_cache_seqlens = nullptr;
   int seq_len_kv_new = 0;
   int total_k_new = 0;
+};
+
+// ---- K SLM staging (FMHA_PREFILL_K_SLM) ----
+// Types for staging GEMM1's K through SLM one head-dim group at a time. They live in a
+// template specialized on Enable so that the cooperative-copy machinery -- and in
+// particular its "block size should not be less than sg size" assertion, which a single
+// reduction step cannot satisfy -- is only instantiated when staging is switched on.
+template <
+    bool Enable,
+    class TiledMMAQK,
+    class SubgroupLayoutQK,
+    class TensorK2D,
+    class TiledCopyKStep,
+    int Steps,
+    int Stages>
+struct KSlmTraits {};
+
+template <class TiledMMAQK, class SubgroupLayoutQK, class TensorK2D, class TiledCopyKStep, int Steps, int Stages>
+struct KSlmTraits<true, TiledMMAQK, SubgroupLayoutQK, TensorK2D, TiledCopyKStep, Steps, Stages> {
+  using TileShapeQK = decltype(TiledMMAQK{}.tile_mnk());
+  // A GEMM1-shaped MMA whose reduction mode spans a whole head-dim group instead of a
+  // single step. Widening it is what supplies the DPAS atom blocks the cooperative copy
+  // needs in order to split the tile NUM_SG ways.
+  using TileShapeGrp =
+      decltype(make_shape(get<0>(TileShapeQK{}), get<1>(TileShapeQK{}), get<2>(TileShapeQK{}) * Int<Steps>{}));
+  using TiledMMAGrp =
+      typename cute::TiledMMAHelper<typename TiledMMAQK::Atom, Layout<TileShapeGrp>, SubgroupLayoutQK>::TiledMMA;
+
+  // Global -> registers, one 1/NUM_SG slice of the group per subgroup, and the matching
+  // registers -> SLM write.
+  using CoopCopy = decltype(make_coop_block_2d_copy_B(TiledMMAGrp{}, TensorK2D{}));
+  using GrpCopies = decltype(make_B_slm_copies(TiledMMAGrp{}, CoopCopy{}));
+  using R2S = remove_cvref_t<std::tuple_element_t<0, GrpCopies>>;
+
+  // SLM -> registers for one reduction step. Built from the *unwidened* MMA so the K
+  // fragment feeding the DPAS keeps its original width: staging must not cost registers,
+  // which is the whole reason the group only exists in SLM and not in the MMA.
+  using StepCopies = decltype(make_B_slm_copies(TiledMMAQK{}, TiledCopyKStep{}));
+  using S2R = remove_cvref_t<std::tuple_element_t<1, StepCopies>>;
+
+  using Element = typename TiledMMAGrp::ValTypeB;
+  // Three views of the same Stages-deep buffer. The r2s tiler is the group tile
+  // (TILED_KV, KSTEP*Steps), laid out compactly; the per-step view splits its second mode
+  // so GEMM1 can read one reduction step at a time. Both are compact in the same order, so
+  // they address SLM identically, and the trailing mode selects the stage.
+  using GrpLayout = decltype(make_layout(append<3>(typename R2S::Tiler_MN{}, Int<Stages>{})));
+  using StepLayout = decltype(make_layout(
+      make_shape(get<1>(TileShapeQK{}), get<2>(TileShapeQK{}), Int<Steps>{}, Int<Stages>{})));
+  static_assert(cosize_v<GrpLayout> == cosize_v<StepLayout>, "group and per-step SLM views must agree");
+};
+
+// Storage for the above. Empty when staging is off, so the kernel's mainloop/epilogue
+// SLM union -- and therefore the launch's work-group scratch request -- stays at zero.
+template <class Traits, bool Enable>
+struct KSlmStorage {};
+
+template <class Traits>
+struct KSlmStorage<Traits, true> {
+  cute::array_aligned<typename Traits::Element, cute::cosize_v<typename Traits::GrpLayout>> smem_k;
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -316,6 +425,31 @@ struct FMHAFwdMainloop<
   // When set, ScoreBlock2D mode 0 is store-only: it skips GEMM2 and the epilogue,
   // so the number of launches is one more than the number of output tiles.
   static constexpr bool SplitStore = ScoreBlock2D && FMHA_PREFILL_SPLIT_STORE;
+  // Head-dim group width for K SLM staging, in units of the GEMM1 reduction step.
+  static constexpr int KSlmSteps = FMHA_PREFILL_K_SLM;
+  // Staging publishes K through SLM, so its barriers must be reached by every subgroup
+  // the same number of times. Under CausalMask they are not: the kernel derives the K
+  // block count from seq_coord, which carries a per-subgroup Q offset, so each subgroup
+  // runs its own trip count. Causal therefore keeps the direct per-subgroup loads.
+  static constexpr bool KSlm = KSlmSteps > 0 && !CausalMask_;
+  static constexpr int KSlmStages = FMHA_PREFILL_K_SLM_STAGES;
+  // The staged loop writes the next group's buffer while reading this group's, which is
+  // what lets one barrier per group suffice; with a single buffer those are the same
+  // memory and the loop would need a second barrier (and would expose the load latency
+  // anyway -- the reason this knob exists).
+  static_assert(!KSlm || KSlmStages >= 2, "FMHA_PREFILL_K_SLM_STAGES must be at least 2");
+  using KSlmT = KSlmTraits<
+      KSlm,
+      TiledMMAQK,
+      SubgroupLayoutQK,
+      TensorK_cache2D,
+      TiledCopyK_cache,
+      (KSlm ? KSlmSteps : 1),
+      (KSlm ? KSlmStages : 1)>;
+  // The staged path publishes one K block's group at a time, so it has no place to put a
+  // second block's. Grouping exists to amortize Q loads and staging to cut K requests;
+  // combining them would need one SLM buffer per block in the group.
+  static_assert(!KSlm || QKGroup == 1, "FMHA_PREFILL_K_SLM and FMHA_PREFILL_QK_GROUP > 1 are exclusive");
 
   // User-facing arguments
   struct Arguments {
@@ -333,16 +467,18 @@ struct FMHAFwdMainloop<
   // Kernel-facing parameters
   using Params = Arguments;
 
-  // SLM data
-  struct SharedStorage {};
+  // SLM data: a staging buffer for one head-dim group of the K block, empty unless
+  // FMHA_PREFILL_K_SLM is set.
+  struct SharedStorage : KSlmStorage<KSlmT, KSlm> {};
 
   Params params;
+  SharedStorage& shared;
 
   //
   // Methods
   //
 
-  FMHAFwdMainloop(Params const& params_, SharedStorage&) : params(params_) {}
+  FMHAFwdMainloop(Params const& params_, SharedStorage& shared_) : params(params_), shared(shared_) {}
 
   static constexpr Params to_underlying_arguments(Arguments const& args, void* workspace) {
     constexpr double kLog2e = 1.4426950408889634074;  // log_2(e)
@@ -891,7 +1027,95 @@ struct FMHAFwdMainloop<
           }
           clear(tSrS_grp[g]);
         }
-        if constexpr (ReuseQFragments) {
+        if constexpr (KSlm) {
+          // Stage K through SLM one head-dim group at a time. All NUM_SG subgroups need
+          // the whole K block, so loading it directly (below) costs NUM_SG identical L1
+          // request streams; here each subgroup instead fetches 1/NUM_SG of the group and
+          // publishes it, and everyone reads the block back out of SLM.
+          //
+          // Requires head_dim % (KSTEP * KSlmSteps) == 0, otherwise the trailing group
+          // would stage out-of-bounds columns and feed them to the DPAS.
+          typename KSlmT::CoopCopy coop_copy_k{K_cache_2D};
+          typename KSlmT::R2S r2s_k{};
+          typename KSlmT::S2R s2r_k{};
+
+          // The group tile is (TILED_KV, KSTEP * KSlmSteps), so the head dim is walked in
+          // nDg groups rather than nD single steps.
+          Tensor gK_cache_grp =
+              local_tile(cK_cache, typename KSlmT::TileShapeGrp{}, make_coord(_, _, _), Step<X, _1, _1>{});
+
+          // Two views of the same KSlmStages-deep buffer: the group shape the cooperative
+          // copy writes, and the (TILED_KV, KSTEP, KSlmSteps) shape GEMM1 reads a step at a
+          // time. Both are compact in the same order, so they address SLM identically.
+          Tensor sK_grp = make_tensor(make_smem_ptr(shared.smem_k.data()), typename KSlmT::GrpLayout{});
+          Tensor sK_step = make_tensor(make_smem_ptr(shared.smem_k.data()), typename KSlmT::StepLayout{});
+
+          auto thr_coop_k = coop_copy_k.get_slice(thr_id);
+          auto thr_r2s_k = r2s_k.get_slice(thr_id);
+          auto thr_s2r_k = s2r_k.get_slice(thr_id);
+
+          Tensor tKgK_coop = thr_coop_k.partition_S(gK_cache_grp);  // (atom_val,k',d',K,Dg)
+          auto tKrK_coop = thr_coop_k.partition_sg_fragment_D(gK_cache_grp(_, _, 0, 0));
+          auto tKrK_stage = thr_r2s_k.partition_sg_fragment_S(gK_cache_grp(_, _, 0, 0));
+          auto tKrK_out = thr_r2s_k.retile_S(tKrK_stage);
+          auto tKsK_out = thr_r2s_k.partition_D(sK_grp);   // (atom_val,k',d',stage)
+          auto tKsK_in = thr_s2r_k.partition_S(sK_step);   // (atom_val,k',d',KSlmSteps,stage)
+          auto tSrK_in = thr_s2r_k.retile_D(tSrK);
+
+          const int nDg = size<4>(tKgK_coop);
+          // Same serpentine motivation as the direct path below, at group granularity.
+          auto dg_of = [&](int i) { return (ZigzagD && (K_grp & 1)) ? (nDg - 1 - i) : i; };
+          auto load_grp = [&](int i, int stage) {
+            copy(coop_copy_k, tKgK_coop(_, _, _, grp_page_idx[0], dg_of(i)), tKrK_coop);
+            reorder(tKrK_coop, tKrK_stage);
+            copy(r2s_k, tKrK_out, tKsK_out(_, _, _, stage));
+          };
+          auto publish = [] {
+            barrier_arrive(ScopeWorkgroup, SemanticsRelease | SemanticsWGMemory);
+            barrier_wait(ScopeWorkgroup, SemanticsAcquire | SemanticsWGMemory);
+          };
+
+          // Prologue: fill all but one stage, so the steady-state loop always has the group
+          // it is about to consume already resident.
+          CUTLASS_PRAGMA_UNROLL
+          for (int p = 0; p < KSlmStages - 1; p++) {
+            if (p < nDg) {
+              load_grp(p, p);
+            }
+          }
+          publish();
+
+          for (int Dgi = 0; Dgi < nDg; Dgi++) {
+            const int rd_stage = Dgi % KSlmStages;
+            const int wr = Dgi + KSlmStages - 1;
+            // Issue the next group's global load *before* consuming this one, so its
+            // latency hides behind the DPAS below rather than stalling the whole
+            // workgroup at the barrier. This is the entire reason for multiple stages.
+            if (wr < nDg) {
+              load_grp(wr, wr % KSlmStages);
+            }
+
+            CUTLASS_PRAGMA_UNROLL
+            for (int s = 0; s < KSlmSteps; s++) {
+              const int D = dg_of(Dgi) * KSlmSteps + s;
+              copy(copy_q, tQgQ(_, _, _, D), tQrQ);
+              reorder(tQrQ, tSrQ);
+              if constexpr (FMHA_PREFILL_K_SLM_NO_S2R) {
+                copy(copy_k_cache, tKgK_cache(_, _, _, grp_page_idx[0], D), tKrK);
+                reorder(tKrK, tSrK);
+              } else {
+                copy(s2r_k, tKsK_in(_, _, _, s, rd_stage), tSrK_in);
+              }
+              cute::gemm(mma_qk, tSrQ, tSrK, tSrS_grp[0]);
+            }
+
+            // One barrier per group, doing double duty: it publishes the group just
+            // written and, because the writer is always at least one stage ahead of every
+            // reader, it also guarantees the reads of the stage about to be overwritten
+            // have all retired.
+            publish();
+          }
+        } else if constexpr (ReuseQFragments) {
           CUTLASS_PRAGMA_UNROLL
           for (int g = 0; g < KGrp; g++) {
             copy(copy_k_cache, tKgK_cache(_, _, _, grp_page_idx[g], 0), tKrK);
@@ -907,7 +1131,10 @@ struct FMHAFwdMainloop<
           for (int Di = 0; Di < nD; Di++) {
             // Serpentine walk over the head-dim chunks: consecutive K blocks traverse D
             // in opposite directions, so the Q chunk loaded last by one block is the
-            // first one the next block needs and is still resident.
+            // first one the next block needs and is still resident. The WG's Q tile is
+            // 256KB at head_dim=512 -- right at L1 capacity -- so a straight 0..nD-1
+            // walk evicts the front of Q before it comes back around. Costs no extra
+            // registers, unlike widening TILED_KV or grouping K blocks.
             const int D = (ZigzagD && ((K_grp / KGrp) & 1)) ? (nD - 1 - Di) : Di;
             copy(copy_q, tQgQ(_, _, _, D), tQrQ);
             reorder(tQrQ, tSrQ);
