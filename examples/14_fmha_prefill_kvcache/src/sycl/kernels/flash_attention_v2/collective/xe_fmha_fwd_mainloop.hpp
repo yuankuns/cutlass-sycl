@@ -192,6 +192,51 @@
 #define FMHA_PREFILL_Q_RESIDENT 0
 #endif
 
+// Split GEMM1's head-dim reduction across several partial S accumulators, summed once at the
+// end of the K block. Purely an instruction-level-parallelism knob: it moves no data, issues
+// the same loads, and leaves every cache footprint unchanged.
+//
+// Motivated by the per-launch device-time breakdown (FMHA_PROFILE_PER_LAUNCH), which shows
+// the two launches doing the same amount of GEMM2 but taking 18.4 ms and 4.6 ms at
+// b1/hq32/sq4096. Subtracting gives GEMM1 ~13.7 ms for the same FLOP count GEMM2 does in
+// ~4.6, i.e. ~40 vs ~59 TFLOPS. The structural difference is dependency depth, not
+// bandwidth: GEMM2 splits V into VTiles independent accumulators, so it runs VTiles
+// concurrent DPAS chains, while GEMM1 chains every head-dim chunk into the single S
+// accumulator. At head_dim=512 with KSTEP=32 that is a 16-deep serial chain per n-position,
+// so each DPAS waits on its predecessor's writeback.
+//
+// This is NOT FMHA_PREFILL_QK_GROUP: grouping adds one accumulator per K *block*, and each
+// still carries the full-depth chain. This splits the chain itself, so it is the only knob
+// here that touches GEMM1's latency rather than its traffic.
+//
+// Costs SPLIT-1 extra S accumulators (FragS is small next to the O accumulator, unlike the
+// Q residency fragments) plus SPLIT-1 fragment adds per K block. Must be a power of two so
+// the accumulator index stays a compile-time constant inside the unrolled loop; there is no
+// divisibility requirement, since slot 0 is the existing group accumulator and a partial
+// final round is summed in like any other.
+//
+// MEASURED AND REJECTED; kept default-off as a recorded refutation. Correct at every setting
+// (bad=0, six verify shapes) and slower at every setting, and the per-launch numbers show
+// exactly where it goes wrong -- k1 (the load launch, which runs no GEMM1) is unchanged to
+// three digits, so the change is properly isolated, while k0 balloons:
+//
+//   split | spill B/thread | k0 ms | k1 ms | TFLOPS @ b1/hq32/sq4096
+//   1     | 640/704        | 18.41 | 4.65  | 47.69  (keeper)
+//   2     | 6464-7360      | 34.97 | 4.66  | 27.74
+//   4     | 1984-2688      | 60.38 | 4.63  | 16.91
+//
+// So GEMM1's ~40 TFLOPS is not a dependency-depth problem. FragS is small -- a few hundred
+// bytes per lane -- yet asking for one more copy of it across the D loop costs thousands of
+// bytes of spill, the same disproportion Q residency hit (~600 B/thread per 32 B/lane
+// chunk). The generalization worth keeping: inside GEMM1's head-dim loop there is no
+// register slack at all, so *any* variant whose mechanism is "hold one more thing across
+// that loop" is refuted in advance -- Q residency, KSTEP widening, TILED_KV widening,
+// N-split and this. Note spill is not even monotone in the split (4 spills less than 2 and
+// is slower still), which means the scheduler is thrashing rather than simply overflowing.
+#ifndef FMHA_PREFILL_QK_ACC_SPLIT
+#define FMHA_PREFILL_QK_ACC_SPLIT 1
+#endif
+
 namespace cutlass::fmha {
 
 template <int Stages>
@@ -470,6 +515,17 @@ struct FMHAFwdMainloop<
   // both would keep KGrp S accumulators live for no remaining benefit.
   static_assert(!QResident || QKGroup == 1, "FMHA_PREFILL_Q_RESIDENT and QK_GROUP > 1 are exclusive");
   static_assert(!QResident || FMHA_PREFILL_K_SLM == 0, "FMHA_PREFILL_Q_RESIDENT and K_SLM are exclusive");
+  // GEMM1 dependency-chain split. Confined to the plain (non-grouped, non-staged,
+  // non-resident) GEMM1 path: each of the other paths already restructures the same loop,
+  // and combining them would multiply accumulator counts for no separable measurement.
+  static constexpr int QKAccSplit = FMHA_PREFILL_QK_ACC_SPLIT;
+  static_assert(QKAccSplit >= 1, "FMHA_PREFILL_QK_ACC_SPLIT must be at least 1");
+  // Power of two: the loop indexes the accumulator array with `Di & (QKAccSplit-1)`, which
+  // must fold to a constant in each unrolled body or the array lands in scratch.
+  static_assert((QKAccSplit & (QKAccSplit - 1)) == 0, "FMHA_PREFILL_QK_ACC_SPLIT must be a power of two");
+  static_assert(QKAccSplit == 1 || QKGroup == 1, "FMHA_PREFILL_QK_ACC_SPLIT and QK_GROUP > 1 are exclusive");
+  static_assert(QKAccSplit == 1 || FMHA_PREFILL_Q_RESIDENT == 0, "QK_ACC_SPLIT and Q_RESIDENT are exclusive");
+  static_assert(QKAccSplit == 1 || FMHA_PREFILL_K_SLM == 0, "QK_ACC_SPLIT and K_SLM are exclusive");
   static constexpr bool ZigzagD = FMHA_PREFILL_ZIGZAG_D;
   static constexpr bool PfZigzag = FMHA_PREFILL_PF_ZIGZAG;
   static constexpr int InitPfDepth = FMHA_PREFILL_INIT_PF_DEPTH;
@@ -1210,6 +1266,50 @@ struct FMHAFwdMainloop<
             copy(copy_k_cache, tKgK_cache(_, _, _, grp_page_idx[0], D), tKrK);
             reorder(tKrK, tSrK);
             cute::gemm(mma_qk, tSrQ, tSrK, tSrS_grp[0]);
+          }
+        } else if constexpr (QKAccSplit > 1) {
+          // Identical loads in an identical order to the plain path below -- the only change
+          // is which accumulator each DPAS targets. Head-dim chunks are dealt round-robin
+          // into QKAccSplit independent accumulators, so the serial DPAS chain each one
+          // carries is QKAccSplit times shorter, and QKAccSplit chains are in flight at
+          // once. The partials are summed at the end of the K block: QKAccSplit-1 fragment
+          // adds against nD DPAS, so the overhead shrinks as head_dim grows.
+          // The loop shape below is deliberately identical to the plain path's -- one
+          // CUTLASS_PRAGMA_UNROLL loop over nD, same serpentine index, same two copies. An
+          // earlier version stepped whole rounds of QKAccSplit in a dynamic outer loop with
+          // a scalar tail; that broke the unroll the copy fragments depend on and spill went
+          // 640 B/thread -> 8.5 KB, doubling GEMM1's time. Only the accumulator index may
+          // change. QKAccSplit is required to be a power of two so `Di & (QKAccSplit-1)` is
+          // a constant in each unrolled body: a non-constant index would put the
+          // accumulator array in scratch, which is the same failure by another route.
+          const int nD = size<4>(tKgK);
+          FragS tSrS_part[QKAccSplit - 1];
+          CUTLASS_PRAGMA_UNROLL
+          for (int s = 0; s < QKAccSplit - 1; s++) {
+            clear(tSrS_part[s]);
+          }
+          CUTLASS_PRAGMA_UNROLL
+          for (int Di = 0; Di < nD; Di++) {
+            const int D = (ZigzagD && ((K_grp / KGrp) & 1)) ? (nD - 1 - Di) : Di;
+            copy(copy_q, tQgQ(_, _, _, D), tQrQ);
+            reorder(tQrQ, tSrQ);
+            copy(copy_k_cache, tKgK_cache(_, _, _, grp_page_idx[0], D), tKrK);
+            reorder(tKrK, tSrK);
+            // Slot 0 is the group accumulator itself, so a partial round needs no tail: any
+            // chunk count lands somewhere valid and every slot is summed in below.
+            const int slot = Di & (QKAccSplit - 1);
+            if (slot == 0) {
+              cute::gemm(mma_qk, tSrQ, tSrK, tSrS_grp[0]);
+            } else {
+              cute::gemm(mma_qk, tSrQ, tSrK, tSrS_part[slot - 1]);
+            }
+          }
+          CUTLASS_PRAGMA_UNROLL
+          for (int s = 0; s < QKAccSplit - 1; s++) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < FragS{}.size(); i++) {
+              tSrS_grp[0](i) += tSrS_part[s](i);
+            }
           }
         } else if constexpr (ReuseQFragments) {
           CUTLASS_PRAGMA_UNROLL
