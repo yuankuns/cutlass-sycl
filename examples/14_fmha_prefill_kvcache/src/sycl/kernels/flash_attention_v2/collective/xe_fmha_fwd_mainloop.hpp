@@ -331,6 +331,66 @@
 #define FMHA_PREFILL_V_PF_SKEW 0
 #endif
 
+// Advance the D_SKEW rotation by this many chunks per K block as well (0 = fixed rotation).
+// The idea was that D_SKEW spreads the 32 subgroups in space but leaves the *same*
+// arrangement every K block, so any residual collision recurs identically 64 times.
+// Free for the same reason D_SKEW is -- it only permutes a reduction's traversal order --
+// and it is spill-neutral (640/704) and correct (bad=0 on all six shapes).
+//
+// Measured 49.43 (skew 1) and 49.33 (skew 2) against an in-batch reference holding at
+// 49.66/49.57, i.e. a small consistent regression, so this stays off. The reason is that
+// there is no residual collision left to move: nD = 16 at head_dim=512 and there are 32
+// subgroups, so `sg * 1 % 16` already lands exactly 2 subgroups on each chunk, which is
+// the pigeonhole optimum for any function of sg alone. A per-K-block phase rotates both
+// members of every colliding pair by the same amount, so the pairs are unchanged; all it
+// does is break the serpentine Q reuse ZIGZAG_D relies on. Kept for the record: the
+// spatial-arrangement axis is closed, not merely untried.
+#ifndef FMHA_PREFILL_K_SKEW
+#define FMHA_PREFILL_K_SKEW 0
+#endif
+
+// Issue the *next* K block's prefetch before softmax/GEMM2 instead of after them.
+// By default those 16 prefetches sit at the very end of the loop body, immediately
+// before the split barrier, so they have almost no time to land before the next
+// block's GEMM1 issues the matching loads. Hoisting them above softmax+GEMM2 gives
+// them that entire window -- the prefetch distance goes from ~0 to one GEMM2.
+// Free in the same sense PF_ZIGZAG is: prefetch feeds no DPAS and writes no fragment,
+// so only the issue point moves. Implemented as two guarded copies of the same loop
+// rather than a hoist, so the default path's statements stay textually identical
+// (this mainloop's register allocation is sensitive to far less than that).
+//
+// Measured neutral -- 49.64/49.70 against an interleaved reference at 49.69/49.63,
+// spill unchanged -- so K's prefetches already land in time even from the loop tail
+// and this stays off. It is kept because the probe is what identified the real gap:
+// V had no such one-block distance at all, and giving it one is V_PF_NEXT below.
+#ifndef FMHA_PREFILL_PF_EARLY
+#define FMHA_PREFILL_PF_EARLY 0
+#endif
+
+// Prefetch the *next* K block's V instead of the current block's.
+// K is prefetched a whole block ahead, but V is not: the V prefetch sits immediately
+// before the GEMM2 consume loop that loads the very same page, so its prefetch
+// distance is a softmax rather than a K block. Retargeting it at next_page_idx gives
+// V the same one-block distance K already has, at the cost of the first block's V
+// arriving cold. Register-free (prefetch only), and unlike V_PF_SKEW it changes which
+// block is fetched rather than the order within one. The next index must be *clamped*
+// to the last block: the first version reused the unclamped next_page_idx (as the K
+// prefetch does) and hung the device, RC=124 at sq2048 and sq4096, though the six small
+// verify shapes all passed -- so a prefetch address one past the page table is not
+// harmless here even though it is for K.
+//
+// 0 = off, 1 = every launch, 2 = only the ScoreBlock2D load launches.
+// Mode 1 splits sharply by launch, which is what makes 2 the useful setting: k1 (score
+// load + GEMM2, no GEMM1) went 4.68 -> 4.43 ms, a 5.3% win, while k0 (GEMM1 + store +
+// GEMM2) went 17.48 -> 18.75, a 7% loss -- net 47.42 vs 49.60. The asymmetry is the
+// point: in k0 the extra block of V in flight competes with GEMM1's Q and K for L1,
+// and GEMM1 is what the whole kernel is bound on; in k1 there is no GEMM1 to compete
+// with, so V's latency is exposed and covering it is free. Same launch-conditional
+// shape as NO_SPLIT_BARRIER=2, for the same reason.
+#ifndef FMHA_PREFILL_V_PF_NEXT
+#define FMHA_PREFILL_V_PF_NEXT 2
+#endif
+
 namespace cutlass::fmha {
 
 template <int Stages>
@@ -604,6 +664,15 @@ struct FMHAFwdMainloop<
   // which pins specific chunks in registers and so requires a fixed per-subgroup order.
   static constexpr int DSkew = FMHA_PREFILL_D_SKEW;
   static_assert(DSkew == 0 || FMHA_PREFILL_Q_RESIDENT == 0, "D_SKEW and Q_RESIDENT are exclusive");
+  // Extra per-K-block phase on top of D_SKEW; 0 = the rotation is fixed for the whole K loop.
+  // Only meaningful with D_SKEW > 0, which is where it is applied.
+  static constexpr int KSkew = FMHA_PREFILL_K_SKEW;
+  // Move the next block's K prefetch ahead of softmax/GEMM2 instead of after them.
+  static constexpr bool PfEarly = FMHA_PREFILL_PF_EARLY;
+  // Aim the V prefetch one K block ahead, matching the distance K already gets.
+  // Mode 2 restricts it to the load launches; resolved in the mainloop body, since
+  // StaticScoreMode is a parameter of that function rather than of this class.
+  static constexpr int VPfNextMode = FMHA_PREFILL_V_PF_NEXT;
   // Per-subgroup rotation of GEMM2's V-tile *prefetch* order; 0 = off.
   static constexpr int VPfSkew = FMHA_PREFILL_V_PF_SKEW;
   static constexpr bool PfZigzag = FMHA_PREFILL_PF_ZIGZAG;
@@ -926,6 +995,9 @@ struct FMHAFwdMainloop<
     constexpr bool SkipSplitBarrier =
         (NoSplitBarrierMode == 1) || (NoSplitBarrierMode == 2 && ScoreBlock2D && StaticScoreMode >= 1);
 
+    constexpr bool VPfNext =
+        (VPfNextMode == 1) || (VPfNextMode == 2 && ScoreBlock2D && StaticScoreMode >= 1);
+
     /* Load the subgroup's whole Q slice once, ahead of the K loop, when it stays resident. */
     if constexpr (QRes) {
       CUTLASS_PRAGMA_UNROLL
@@ -1129,7 +1201,10 @@ struct FMHAFwdMainloop<
               // requests hit distinct chunks instead. Costs no registers, unlike every other
               // way of reducing K pressure. Subtract-if instead of modulo: nD is a dynamic
               // int, so % would emit a division inside the hot loop.
-              D += (int(thr_id / intel::sg_size) * DSkew) % nD;
+              // KSkew advances the phase per K block as well, so the 32-way arrangement is
+              // not merely spread but also moves in time; with a fixed rotation every K
+              // block reproduces the identical collision pattern.
+              D += (int(thr_id / intel::sg_size) * DSkew + (KSkew > 0 ? (K_grp / KGrp) * KSkew : 0)) % nD;
               if (D >= nD) {
                 D -= nD;
               }
@@ -1180,6 +1255,14 @@ struct FMHAFwdMainloop<
         /* V prefetch for GEMM 2 -- the store-only launch runs no GEMM2, so V never
            enters its cache footprint. */
         if constexpr (!(SplitStore && StaticScoreMode == 0)) {
+          // One block ahead when VPfNext, clamped: on the final block next_page_idx is
+          // derived from K+1 == kblocks_cache, i.e. one past the page table, and an
+          // out-of-range physical page here hangs the device (measured RC=124 unclamped).
+          int v_pf_idx = page_idx;
+          if constexpr (VPfNext) {
+            const int Knext = cute::min(K + 1, k_end - 1);
+            v_pf_idx = PagedKV ? get_physical_k_tile(Knext, l_coord, seq_len_kv_cache) : Knext;
+          }
           CUTLASS_PRAGMA_UNROLL
           for (int VVi = 0; VVi < VTiles; VVi++) {
             // Prefetch only -- the tile index need not be a compile-time constant here,
@@ -1188,7 +1271,7 @@ struct FMHAFwdMainloop<
             if constexpr (VPfSkew > 0) {
               VV = (VVi + int(thr_id / intel::sg_size) * VPfSkew) % VTiles;
             }
-            prefetch(prefetch_v_cache, pVgV_cache(_, _, _, VV, page_idx));
+            prefetch(prefetch_v_cache, pVgV_cache(_, _, _, VV, v_pf_idx));
           }
         }
 
@@ -1267,6 +1350,29 @@ struct FMHAFwdMainloop<
         }
 #endif
 
+        /* K prefetch, early placement -- see FMHA_PREFILL_PF_EARLY. Identical to the
+           block at the end of the loop body; exactly one of the two is compiled in.
+           next_page_idx already points at the next block here (it is advanced above,
+           before the score store), so the addresses are the same either way. */
+        if constexpr (!(ScoreBlock2D && StaticScoreMode >= 1) && PfEarly) {
+          const int nPf = size<4>(pKgK);
+          const bool rev = PfZigzag && ZigzagD && (((K_grp / KGrp) + 1) & 1);
+          const int pf_skew =
+              (DSkew > 0)
+                  ? (int(thr_id / intel::sg_size) * DSkew + (KSkew > 0 ? (K_grp / KGrp + 1) * KSkew : 0)) % nPf
+                  : 0;
+          for (int Di = 0; Di < nPf; Di++) {
+            int D = rev ? (nPf - 1 - Di) : Di;
+            if constexpr (DSkew > 0) {
+              D += pf_skew;
+              if (D >= nPf) {
+                D -= nPf;
+              }
+            }
+            prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
+          }
+        }
+
         // Store-only launch: the scores are on their way to the scratch and no output
         // tile belongs to this launch, so skip softmax and GEMM2 entirely. Leaving the
         // O accumulator untouched is the point -- it is what frees the registers.
@@ -1315,7 +1421,7 @@ struct FMHAFwdMainloop<
         }
 
         /* K prefetch */
-        if constexpr (!(ScoreBlock2D && StaticScoreMode >= 1)) {
+        if constexpr (!(ScoreBlock2D && StaticScoreMode >= 1) && !PfEarly) {
           const int nPf = size<4>(pKgK);
           // Match the head-dim order the *next* group will walk in, so its first
           // chunk is the first one prefetched rather than the last.
@@ -1326,7 +1432,11 @@ struct FMHAFwdMainloop<
           // 0..nPf-1 prefetch hands each subgroup its first-needed chunk at a different,
           // mostly wrong, position. Prefetch touches no fragment and feeds no DPAS, so
           // reordering it is free even where reordering a load would not be.
-          const int pf_skew = (DSkew > 0) ? (int(thr_id / intel::sg_size) * DSkew) % nPf : 0;
+          // Phase must track the *next* K group, since that is what these lines prefetch.
+          const int pf_skew =
+              (DSkew > 0)
+                  ? (int(thr_id / intel::sg_size) * DSkew + (KSkew > 0 ? (K_grp / KGrp + 1) * KSkew : 0)) % nPf
+                  : 0;
           for (int Di = 0; Di < nPf; Di++) {
             int D = rev ? (nPf - 1 - Di) : Di;
             if constexpr (DSkew > 0) {
