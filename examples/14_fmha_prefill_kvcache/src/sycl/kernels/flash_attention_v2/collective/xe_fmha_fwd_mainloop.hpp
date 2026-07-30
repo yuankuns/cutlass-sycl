@@ -146,6 +146,49 @@
 #define FMHA_PREFILL_NO_SPLIT_BARRIER 2
 #endif
 
+// Hold the subgroup's *entire* Q slice in registers for the whole K loop, so GEMM1 loads
+// Q once per workgroup instead of once per K block.
+//
+// Q re-read traffic is heads*seq_q*head_dim*2*(seq_kv/TILED_KV) bytes and is the measured
+// bottleneck at head_dim=512 (~8.6 GB at b1/hq32/sq4096, all L1/L2 hits). QK_GROUP
+// attacks the same term but only divides it by the group width, and grouping costs one S
+// accumulator per extra block. Full residency divides it by seq_kv/TILED_KV outright --
+// i.e. removes the re-read entirely -- and costs no accumulators.
+//
+// The register arithmetic is what makes this worth trying: with TILED_Q=256 and 32
+// subgroups a subgroup owns 8 Q rows, so its whole Q slice is 8*512*2 = 8 KB, which is
+// 512 B/lane across 16 lanes. That is large but not obviously fatal against a 256-GRF
+// (8 KB/lane) budget, and unlike TILED_KV/TILED_Q changes it leaves every fragment width
+// and the O accumulator untouched. Independent of Q residency the K fragment is still
+// re-loaded per block, so this trades registers for Q traffic only.
+//
+// The value is the *number of head-dim chunks* to hold, up to head_dim / KSTEP (16 at
+// head_dim=512, KSTEP=32); 0 disables the feature, and any smaller value makes residency
+// partial (leading chunks resident, the rest loaded per block as before). It cannot be
+// derived from the tensor, because size<3>(tQgQ) is a dynamic int -- and a compile-time
+// count is required anyway: the fragment array has to be indexed by a statically-unrolled
+// loop variable or the compiler puts it in scratch instead of registers.
+//
+// MEASURED AND REJECTED; kept default-off as a recorded refutation. Every setting is
+// correct (bad=0, six verify shapes) and every setting loses, monotonically in the amount
+// held, because the register arithmetic above is wrong in practice -- spill grows ~600
+// B/thread per resident chunk, roughly 20x the 32 B/lane a chunk's data occupies, so the
+// A fragments do not stay in registers at all:
+//
+//   chunks | spill B/thread | TFLOPS @ b1/hq32/sq2048 | @ sq4096
+//   0      | 640/704        | 44.2                    | 47.77  (keeper)
+//   4      | 1856-2816      | 41.4                    | 42.95
+//   8      | 4096-4928      | 42.7                    | 43.10
+//   16     | 9600-10688     | 19.4                    | timeout
+//
+// This is the same register wall as TILED_KV=128, TILED_Q=512 and N_SPLIT=2: the Q
+// re-read is real and is the bottleneck, but registers are not where the re-read can be
+// removed. Note the K fragment is reloaded per block regardless, so residency never
+// removed more than the Q term.
+#ifndef FMHA_PREFILL_Q_RESIDENT
+#define FMHA_PREFILL_Q_RESIDENT 0
+#endif
+
 namespace cutlass::fmha {
 
 template <int Stages>
@@ -378,6 +421,15 @@ struct FMHAFwdMainloop<
   static constexpr int group_for_mode() {
     return (ScoreBlock2D && Mode >= 1) ? 1 : QKGroup;
   }
+  // Keep the subgroup's whole Q slice live across the K loop. Only meaningful in launches
+  // that actually run GEMM1: the ScoreBlock2D load launches reload S from the scratch, so
+  // there they would hold Q fragments nothing reads.
+  static constexpr int QResidentChunks = FMHA_PREFILL_Q_RESIDENT;
+  static constexpr bool QResident = QResidentChunks > 0;
+  // Residency replaces the per-block Q load outright, so it subsumes grouping; allowing
+  // both would keep KGrp S accumulators live for no remaining benefit.
+  static_assert(!QResident || QKGroup == 1, "FMHA_PREFILL_Q_RESIDENT and QK_GROUP > 1 are exclusive");
+  static_assert(!QResident || FMHA_PREFILL_K_SLM == 0, "FMHA_PREFILL_Q_RESIDENT and K_SLM are exclusive");
   static constexpr bool ZigzagD = FMHA_PREFILL_ZIGZAG_D;
   static constexpr bool PfZigzag = FMHA_PREFILL_PF_ZIGZAG;
   static constexpr int InitPfDepth = FMHA_PREFILL_INIT_PF_DEPTH;
@@ -585,6 +637,14 @@ struct FMHAFwdMainloop<
     // they never fill (see group_for_mode).
     constexpr int KGrp = group_for_mode<StaticScoreMode>();
     FragS tSrS_grp[KGrp];
+
+    // Whole-Q-slice residency: one A fragment per head-dim chunk, filled once before the K
+    // loop. Sized 1 (and left unfilled) in the launches that run no GEMM1, so they pay
+    // nothing.
+    constexpr bool QRes = QResident && !(ScoreBlock2D && StaticScoreMode >= 1);
+    constexpr int NDStatic = QRes ? QResidentChunks : 1;
+    using FragQ = decltype(tSrQ);
+    FragQ tSrQ_all[NDStatic];
     auto tArP = thr_mma_pv.partition_sg_fragment_A(cP);
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
     auto tScoreStoreR = thr_copy_score_store.partition_sg_fragment_S(gScore(_, _, 0));
@@ -650,6 +710,15 @@ struct FMHAFwdMainloop<
 
     constexpr bool SkipSplitBarrier =
         (NoSplitBarrierMode == 1) || (NoSplitBarrierMode == 2 && ScoreBlock2D && StaticScoreMode >= 1);
+
+    /* Load the subgroup's whole Q slice once, ahead of the K loop, when it stays resident. */
+    if constexpr (QRes) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int D = 0; D < NDStatic; D++) {
+        copy(copy_q, tQgQ(_, _, _, D), tQrQ);
+        reorder(tQrQ, tSrQ_all[D]);
+      }
+    }
 
     /* Main loop, blocked in k -- outer loop steps whole groups of KGrp blocks. */
     const int k_end = cute::min(blk_k1, kblocks_cache);
@@ -753,6 +822,33 @@ struct FMHAFwdMainloop<
             // reader, it also guarantees the reads of the stage about to be overwritten
             // have all retired.
             publish();
+          }
+        } else if constexpr (QRes) {
+          // Q is already in registers, so this walks only K. The bound must be the
+          // compile-time chunk count -- not size<4>(tKgK), which is a dynamic int -- so
+          // that Di, and hence the tSrQ_all index, is a constant in each unrolled body;
+          // a runtime index would turn the fragment array into indirect scratch. The
+          // caller must set FMHA_PREFILL_Q_RESIDENT <= head_dim / KSTEP; setting it equal
+          // holds all of Q and removes the re-read outright, while a smaller value makes
+          // residency partial -- the leading NDStatic chunks come from registers and the
+          // rest are loaded per block as before. Partial residency is what grades the
+          // register cost against the traffic saved.
+          //
+          // Serpentine order is dropped here: it exists to keep the previously-loaded Q
+          // chunk resident in L1, and the resident chunks have no Q load left to help.
+          CUTLASS_PRAGMA_UNROLL
+          for (int D = 0; D < NDStatic; D++) {
+            copy(copy_k_cache, tKgK_cache(_, _, _, grp_page_idx[0], D), tKrK);
+            reorder(tKrK, tSrK);
+            cute::gemm(mma_qk, tSrQ_all[D], tSrK, tSrS_grp[0]);
+          }
+          const int nD_tail = size<4>(tKgK);
+          for (int D = NDStatic; D < nD_tail; D++) {
+            copy(copy_q, tQgQ(_, _, _, D), tQrQ);
+            reorder(tQrQ, tSrQ);
+            copy(copy_k_cache, tKgK_cache(_, _, _, grp_page_idx[0], D), tKrK);
+            reorder(tKrK, tSrK);
+            cute::gemm(mma_qk, tSrQ, tSrK, tSrS_grp[0]);
           }
         } else {
           const int nD = size<4>(tKgK);
