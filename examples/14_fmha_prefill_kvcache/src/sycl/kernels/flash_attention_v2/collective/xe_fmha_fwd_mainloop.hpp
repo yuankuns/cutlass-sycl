@@ -394,6 +394,30 @@
 #define FMHA_PREFILL_V_PF_NEXT 2
 #endif
 
+// Prefetch the score workspace in the load launches. `copy_score_load` is the only
+// operand in the whole kernel with no prefetch path at all: make_block_2d_prefetch is
+// built for q/k/v but never for Score, so the block-2d load at the top of each K block
+// is consumed by the reorder into tSrS immediately after it issues. V_PF_NEXT showed the
+// load launches are bound by exactly this -- their operands' latency, not their ALU work
+// (SHARE_SOFTMAX_STATS priced that at 0.2%) -- and V was the other of the two operands.
+//
+// N is the prefetch distance in K blocks: the loop prefetches block K+N while consuming
+// block K. Unlike V's page index this needs no clamping -- the score workspace is a dense
+// per-WG (TILED_Q, seq_len_kv) surface, and the tile coordinate is clamped to k_end-1
+// anyway so the address never leaves the allocation.
+//
+// 0 = off. Restricted to the load launches by construction (mode >= 1 is where
+// copy_score_load runs at all); in mode 0 the scores are being stored, not loaded, so
+// there is nothing to prefetch. Register-free: a prefetch writes no fragment.
+//
+// "Score prefetch in the load path" is in the refuted table at +0.5% on the largest
+// shapes / -2% on mid, but that was measured before D_SKEW and V_PF_NEXT changed which
+// launch is latency-bound -- the same situation as PF_ZIGZAG and INIT_PF_DEPTH, both of
+// which measured neutral pre-skew and are now default-on wins.
+#ifndef FMHA_PREFILL_SCORE_PF
+#define FMHA_PREFILL_SCORE_PF 0
+#endif
+
 namespace cutlass::fmha {
 
 template <int Stages>
@@ -622,6 +646,14 @@ struct FMHAFwdMainloop<
   using FragSCol = decltype(reduce<0>(FragS{}, sycl::plus<void>{}));
   using ElementS = typename TiledMMAQK::ValTypeD;
 
+  // How many DPAS M-blocks each subgroup holds along Q: 1 in every shipped config
+  // (TILED_Q/NUM_SG == 8 == the atom's M), 2 when the store launch takes a taller Q tile
+  // (FMHA_PREFILL_STORE_TILED_Q). The causal mask's closed form assumes 1 -- it walks the
+  // fragment as one contiguous run of rows -- so it switches to coordinate-tensor form
+  // when this is greater.
+  static constexpr int SGTileQBlocks = (int(get<0>(TileShapeQK{})) / int(SGPerWG::value)) /
+                                       int(size<0>(typename TiledMMAQK::AtomShape_MNK{}));
+
   // ScoreBlock2D scratch element type. The values round-tripped through the
   // workspace are pre-softmax logits consumed immediately by exp2, so half
   // precision suffices: the store folds in params.scale and the load path's
@@ -713,6 +745,8 @@ struct FMHAFwdMainloop<
   // Mode 2 restricts it to the load launches; resolved in the mainloop body, since
   // StaticScoreMode is a parameter of that function rather than of this class.
   static constexpr int VPfNextMode = FMHA_PREFILL_V_PF_NEXT;
+  // Prefetch distance, in K blocks, for the score workspace in the load launches; 0 = off.
+  static constexpr int ScorePfDist = FMHA_PREFILL_SCORE_PF;
   // Per-subgroup rotation of GEMM2's V-tile *prefetch* order; 0 = off.
   static constexpr int VPfSkew = FMHA_PREFILL_V_PF_SKEW;
   static constexpr bool PfZigzag = FMHA_PREFILL_PF_ZIGZAG;
@@ -1096,6 +1130,11 @@ struct FMHAFwdMainloop<
       TensorV_cache2D const& V_cache_2D = TensorV_cache2D{},
       float scale_k = 1.0f,  // FP8 K per-tensor dequant scale
       ElementScoreStore* score_head_ptr = nullptr,
+      // Height of the score-workspace region score_head_ptr points at, and this
+      // launch's Q-tile index inside it. 0/0 means "the region is exactly this
+      // launch's own Q tile", which is the case whenever every launch shares a tile.
+      int score_region_rows = 0,
+      int score_blk_in_region = 0,
       // Base of this workgroup's softmax-statistics slot (2 * TILED_Q floats: maxima then
       // sums). Null unless ShareSoftmaxStats.
       ElementS* stats_wg_ptr = nullptr) {
@@ -1120,12 +1159,18 @@ struct FMHAFwdMainloop<
     Tensor cV_cache = make_identity_tensor(V_cache_2D.shape());   // (v,k)
     Tensor cP = make_identity_tensor(take<0, 2>(TileShapeQK{}));  // (q,k)
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
-    // score_head_ptr already points at this workgroup's own block, so the score
-    // surface is exactly one Q tile tall (not the whole seq_len_qo) and rows are
-    // addressed block-locally. Element type is ElementScoreStore, narrower than
-    // ElementS, so the block-2D atoms below are selected for that width and move
-    // half the bytes.
-    auto score_shape = make_shape(get<0>(TileShapeQK{}), seq_len_kv_cache);
+    // score_head_ptr points at this workgroup's score *region* -- not at its own Q
+    // tile -- so the surface spans the whole region and rows are addressed
+    // region-locally. Both matter: a region is one store tile, and when the store
+    // tile is taller than the load tile (FMHA_PREFILL_STORE_TILED_Q) the load
+    // launches must describe the very same surface the store described, differing
+    // only in the tile coordinate. Folding the intra-region row offset into the base
+    // pointer instead would hand the two launches different block-2D base addresses
+    // for identical rows, which was measured wrong for every seq_len_kv that is not a
+    // multiple of TILED_KV. Element type is ElementScoreStore, narrower than ElementS, so the
+    // block-2D atoms below are selected for that width and move half the bytes.
+    const int score_rows = score_region_rows > 0 ? score_region_rows : int(get<0>(TileShapeQK{}));
+    auto score_shape = make_shape(score_rows, seq_len_kv_cache);
     auto score_layout = make_layout(score_shape, make_stride(seq_len_kv_cache, Int<1>{}));
     Tensor Score = make_tensor(make_gmem_ptr(score_head_ptr), score_layout);
     Tensor cScore = make_identity_tensor(score_shape);  // (q,k)
@@ -1141,8 +1186,8 @@ struct FMHAFwdMainloop<
     Tensor gV_cache = local_tile(cV_cache, tile_shape_v, make_coord(get<1>(blk_qv), _));                  // (v,k,K)
     Tensor gV_cache_split = local_tile(gV_cache, TileShapePV{}, make_coord(_, _, 0), Step<X, _1, _1>{});  // (v,k,VV,K)
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
-    // Q coord is 0: this block holds only this workgroup's Q tile.
-    Tensor gScore = local_tile(cScore, take<0, 2>(TileShapeQK{}), make_coord(_0{}, _));  // (q,k,K)
+    // Q coord selects this launch's tile within the region; 0 when the two coincide.
+    Tensor gScore = local_tile(cScore, take<0, 2>(TileShapeQK{}), make_coord(score_blk_in_region, _));  // (q,k,K)
 #endif
 
     /* Create global -> register copies */
@@ -1219,6 +1264,11 @@ struct FMHAFwdMainloop<
     auto prefetch_v = make_block_2d_prefetch(copy_v);
     auto prefetch_k_cache = make_block_2d_prefetch(copy_k_cache);
     auto prefetch_v_cache = make_block_2d_prefetch(copy_v_cache);
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+    // Score's prefetch, built from the same load atom so it walks the identical tiling.
+    // See FMHA_PREFILL_SCORE_PF: this is the one operand that had no prefetch path.
+    auto prefetch_score = make_block_2d_prefetch(copy_score_load);
+#endif
 
     /* Partition global tensors for prefetch */
     auto pQgQ = prefetch_q.get_slice(thr_id).partition_S(gQ);
@@ -1226,6 +1276,9 @@ struct FMHAFwdMainloop<
     auto pVgV = prefetch_v.get_slice(thr_id).partition_S(gV_split);
     auto pKgK_cache = prefetch_k_cache.get_slice(thr_id).partition_S(gK_cache);
     auto pVgV_cache = prefetch_v_cache.get_slice(thr_id).partition_S(gV_cache_split);
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+    auto pScoreG = prefetch_score.get_slice(thr_id).partition_S(gScore);  // (atom_val,q',k',K)
+#endif
 
     // ------
     // Kernel
@@ -1623,6 +1676,12 @@ struct FMHAFwdMainloop<
 
         if constexpr (ScoreBlock2D && StaticScoreMode >= 1) {
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+          // Aim ScorePfDist blocks ahead, so this block's load finds its lines already
+          // in flight. Clamped to the last block: past k_end there is nothing to warm,
+          // and a repeat of the final tile is a harmless hit rather than a stray address.
+          if constexpr (ScorePfDist > 0) {
+            prefetch(prefetch_score, pScoreG(_, _, _, cute::min(K + ScorePfDist, k_end - 1)));
+          }
           copy(copy_score_load, tScoreLoadG(_, _, _, K), tScoreLoadR);
           reorder(tScoreLoadR, tSrS);
 #endif
@@ -1658,15 +1717,19 @@ struct FMHAFwdMainloop<
         /* Causal masking */
         if constexpr (CausalMask && !(ScoreBlock2D && StaticScoreMode >= 1)) {
           if (need_causal) {
-            if constexpr (ReuseQFragments && SingleAppendKV) {
-              auto cS_thread = thr_mma_qk.partition_C(cP);
-              int const row_base = get<0>(blk_qv) * get<0>(TileShapeQK{});
-              int const col_base = K * get<1>(TileShapeQK{});
+            if constexpr ((ReuseQFragments && SingleAppendKV) || SGTileQBlocks > 1) {
+              // More than one DPAS M-block per subgroup: the fragment's rows are no longer
+              // one contiguous run starting at sg * sg_tile_q. The MMA repeats the M
+              // blocks at its own stride, so the closed form below would mask the wrong
+              // rows -- which showed up as bad>0 on causal shapes only, and only where the
+              // Q extent spans more than one tile. Ask the MMA where each element lives
+              // instead; same predicate, coordinates from the partitioner.
+              Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
+              Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
+              auto cS_thread = thr_mma_qk.partition_C(gP);
               CUTLASS_PRAGMA_UNROLL
               for (int i = 0; i < tSrS.size(); ++i) {
-                int const row_idx = row_base + get<0>(cS_thread(i));
-                int const col_idx = col_base + get<1>(cS_thread(i));
-                if (row_idx < col_idx - full_tile_offset) {
+                if (get<1>(cS_thread(i)) > get<0>(cS_thread(i)) + full_tile_offset) {
                   tSrS(i) = ElementS(-INFINITY);
                 }
               }

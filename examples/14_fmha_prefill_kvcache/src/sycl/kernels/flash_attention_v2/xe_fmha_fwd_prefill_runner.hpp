@@ -223,7 +223,12 @@ using LayoutK = cutlass::layout::ColumnMajor;
 using LayoutV = cutlass::layout::RowMajor;
 using LayoutO = cutlass::layout::RowMajor;
 
-template <class FMHAPrefillKernel, bool isVarLen = false>
+// StoreKernel: an alternative kernel type used for the ScoreBlock2D store launch
+// (mode 0) only. void -> every launch uses FMHAPrefillKernel. It exists so GEMM1 can
+// run at a different Q tile than the load launches; see FMHA_PREFILL_STORE_TILED_Q.
+// Both kernels must frame the score workspace on the same region height, which is
+// what the static_assert in run() checks.
+template <class FMHAPrefillKernel, bool isVarLen = false, class StoreKernel = void>
 struct PrefillRunner {
   using StrideQ = typename FMHAPrefillKernel::StrideQ;
   using StrideK = typename FMHAPrefillKernel::StrideK;
@@ -329,10 +334,13 @@ struct PrefillRunner {
     return shape;
   }
 
-  cutlass::Status run(const Arguments& params, const cutlass::KernelHardwareInfo& hw_info) {
-    ProblemShapeType shape = initialize(params);
-
-    typename FMHAPrefillKernel::MainloopArguments mainloop_args{
+  // Built per kernel type: the ScoreBlock2D store launch may be a different kernel
+  // instantiation (a different Q tile), whose Arguments is then a distinct type even
+  // though every field in it is identical.
+  template <class Kernel>
+  typename Kernel::Arguments make_arguments(
+      const Arguments& params, ProblemShapeType const& shape, const cutlass::KernelHardwareInfo& hw_info) const {
+    typename Kernel::MainloopArguments mainloop_args{
         params.softmax_scale,
         params.page_table,
         params.page_size,
@@ -340,16 +348,16 @@ struct PrefillRunner {
         params.window_size_left,
         params.window_size_right};
     mainloop_args.page_table_contiguous = params.page_table_contiguous;
-    if constexpr (CollectiveMainloop::AppendKV) {
-      mainloop_args.append.ptr_K_new = static_cast<const ElementK*>(params.knew_ptr);
-      mainloop_args.append.ptr_V_new = static_cast<const ElementV*>(params.vnew_ptr);
+    using KernelMainloop = typename Kernel::CollectiveMainloop;
+    if constexpr (KernelMainloop::AppendKV) {
+      mainloop_args.append.ptr_K_new = static_cast<const typename Kernel::ElementK*>(params.knew_ptr);
+      mainloop_args.append.ptr_V_new = static_cast<const typename Kernel::ElementV*>(params.vnew_ptr);
       mainloop_args.append.ptr_cu_seqlens_k_new = params.cu_seqlens_knew;
       mainloop_args.append.ptr_cache_seqlens = params.cache_seqlens_old;
       mainloop_args.append.seq_len_kv_new = params.seqlen_knew;
       mainloop_args.append.total_k_new = params.total_knew;
     }
-
-    typename FMHAPrefillKernel::Arguments arguments{
+    return typename Kernel::Arguments{
         {
             shape,
             static_cast<const ElementQ*>(params.q_ptr),
@@ -364,7 +372,7 @@ struct PrefillRunner {
             stride_K_cache,
             static_cast<const ElementV*>(params.v_ptr),
             stride_V_cache,
-            static_cast<const typename FMHAPrefillKernel::ElementSink*>(params.softmax_sink_ptr),
+            static_cast<const typename Kernel::ElementSink*>(params.softmax_sink_ptr),
             static_cast<const bool*>(params.skip_batch_mask_ptr),
             params.k_scale_ptr,
             params.v_scale_ptr,
@@ -372,6 +380,12 @@ struct PrefillRunner {
         mainloop_args,
         {},
         hw_info};
+  }
+
+  cutlass::Status run(const Arguments& params, const cutlass::KernelHardwareInfo& hw_info) {
+    ProblemShapeType shape = initialize(params);
+
+    auto arguments = make_arguments<FMHAPrefillKernel>(params, shape, hw_info);
 
     // Define device-global scratch memory
     size_t workspace_size = FMHAPrefillKernel::get_workspace_size(arguments);
@@ -401,9 +415,32 @@ struct PrefillRunner {
       static constexpr int kLaunches =
           FMHAPrefillKernel::kOutputTiles + (CollectiveMainloop::SplitStore ? 1 : 0);
       static_assert(kLaunches >= 2, "ScoreBlock2D needs at least a store and a load launch");
+      // A distinct store kernel is only meaningful when mode 0 owns no output tile,
+      // i.e. under SPLIT_STORE: otherwise mode 0 also writes O and its Q tile has to
+      // match the epilogue's.
+      static constexpr bool kSplitStoreKernel = !cute::is_void_v<StoreKernel> && CollectiveMainloop::SplitStore;
+      // The discarded branch of the `if constexpr` below is still parsed, so give it a
+      // real kernel type to name when there is no separate store kernel.
+      using StoreKernelOr = cute::conditional_t<kSplitStoreKernel, StoreKernel, FMHAPrefillKernel>;
+      if constexpr (kSplitStoreKernel) {
+        // Both kernels must agree on where each score block lives, which the
+        // workspace region framing guarantees only if the heights coincide.
+        static_assert(
+            StoreKernelOr::kScoreRowsPerRegion == FMHAPrefillKernel::kScoreRowsPerRegion,
+            "the store and load launches must frame the score workspace identically");
+      }
       auto launch_mode = [&](auto mode) {
-        using ScoreKernel = typename FMHAPrefillKernel::template WithStaticScoreMode<decltype(mode)::value>;
-        launch<ScoreKernel>(ScoreKernel::to_underlying_arguments(arguments, workspace_ptr));
+        constexpr int kMode = decltype(mode)::value;
+        if constexpr (kSplitStoreKernel && kMode == 0) {
+          // GEMM1 runs at the store kernel's own Q tile. Its workspace is framed on the
+          // same region, so the blocks it writes are the ones the load launches read.
+          using ScoreKernel = typename StoreKernelOr::template WithStaticScoreMode<kMode>;
+          auto store_arguments = make_arguments<StoreKernelOr>(params, shape, hw_info);
+          launch<ScoreKernel>(ScoreKernel::to_underlying_arguments(store_arguments, workspace_ptr));
+        } else {
+          using ScoreKernel = typename FMHAPrefillKernel::template WithStaticScoreMode<kMode>;
+          launch<ScoreKernel>(ScoreKernel::to_underlying_arguments(arguments, workspace_ptr));
+        }
       };
       [&]<int... Modes>(cute::integer_sequence<int, Modes...>) {
         (launch_mode(cute::C<Modes>{}), ...);
@@ -441,7 +478,11 @@ template <
     typename GmemTiledCopyQ = void, /* void -> default block 2D */
     typename GmemTiledCopyK = void,
     typename GmemTiledCopyV = void,
-    typename GmemTiledCopyO = void>
+    typename GmemTiledCopyO = void,
+    // Q tile for the ScoreBlock2D store launch (mode 0) only; 0 = same as every other
+    // launch. See FMHA_PREFILL_STORE_TILED_Q: GEMM1 wants more Q rows per subgroup
+    // than the O accumulator in the load launches can afford.
+    int StoreTiledQ = 0>
 struct FMHAConfig {
   // How many output tiles tile the head dimension, and therefore how many launches the
   // ScoreBlock2D path needs: launch i owns output tile i, and only launch 0 runs GEMM1
@@ -461,6 +502,32 @@ struct FMHAConfig {
       is_void_v<SubgroupLayoutPV_>,
       decltype(cutlass::fmha::collective::get_sg_layout_pv(SubgroupLayoutQK{})),
       SubgroupLayoutPV_>;
+
+  // Per-mode Q tile. The store launch's tile replaces the Q extent of all three tile
+  // shapes; the subgroup layout is unchanged, so its subgroups get StoreTiledQ/NUM_SG
+  // Q rows each rather than TILED_Q/NUM_SG.
+  static constexpr int kStoreTiledQ = StoreTiledQ == 0 ? int(get<0>(TileShapeQK{})) : StoreTiledQ;
+  static_assert(
+      StoreTiledQ == 0 || StoreTiledQ % int(get<0>(TileShapeQK{})) == 0,
+      "the store launch's Q tile must be a whole multiple of the load launches' Q tile, so "
+      "one score region is an exact number of load-launch blocks");
+  // Both kernels frame the score workspace on the taller (store) tile, so a load launch
+  // addresses a sub-block of the region the store wrote. See kScoreRowsPerRegion.
+  static constexpr int kScoreQTile = StoreTiledQ == 0 ? 0 : kStoreTiledQ;
+  using StoreTileShapeQK = decltype(cute::replace<0>(TileShapeQK{}, cute::Int<kStoreTiledQ>{}));
+  using StoreTileShapePV = decltype(cute::replace<0>(TileShapePV{}, cute::Int<kStoreTiledQ>{}));
+  using StoreTileShapeOutput = decltype(cute::replace<0>(TileShapeOutput{}, cute::Int<kStoreTiledQ>{}));
+  static constexpr int kStoreSGTileQ = get<0>(shape_div(StoreTileShapeQK{}, shape(SubgroupLayoutQK{})))();
+  // GEMM1's whole point here: the DPAS atom's M is what gives each K load more than one
+  // DPAS to feed. gcd(.,8) caps it at 8 rows, so the extra Q rows arrive as a second
+  // DPAS row over the same B operand.
+  using StoreMMAOperation = cute::conditional_t<
+      is_void_v<MMAOperation_>,
+      typename cute::conditional_t<
+          cute::is_same_v<ElementQ, cutlass::float_e5m2_t> || cute::is_same_v<ElementQ, cutlass::float_e4m3_t>,
+          XE_DPAS_TT<cute::gcd(kStoreSGTileQ, 8), float, half_t>,
+          XE_DPAS_TT<cute::gcd(kStoreSGTileQ, 8), float, ElementQ>>,
+      MMAOperation_>;
 
   template <
       bool isVarLen,
@@ -529,6 +596,38 @@ struct FMHAConfig {
     using CollectiveEpilogue =
         cutlass::fmha::collective::FMHAFwdEpilogue<CollectiveMainloop, TileShapeOutput, TensorO, GmemTiledCopyO, Sink>;
 
+    // The store launch's stack at its own Q tile. Identical in every other respect, so
+    // the two launches read the same Q/K/V and write the same score regions.
+    using StoreTiledMMAQK =
+        typename TiledMMAHelper<MMA_Atom<StoreMMAOperation>, Layout<StoreTileShapeQK>, SubgroupLayoutQK>::TiledMMA;
+    using StoreTiledMMAPV =
+        typename TiledMMAHelper<MMA_Atom<StoreMMAOperation>, Layout<StoreTileShapePV>, SubgroupLayoutPV>::TiledMMA;
+    using StoreMainloop = cutlass::fmha::collective::FMHAFwdMainloop<
+        MainloopDispatchPolicy,
+        Causal,
+        CachedKV,
+        PagedKV,
+        StoreTiledMMAQK,
+        StoreTiledMMAPV,
+        VTiles,
+        TensorQ,
+        TensorK,
+        TensorV,
+        TensorK_cache,
+        TensorV_cache,
+        GmemTiledCopyQ,
+        GmemTiledCopyK,
+        GmemTiledCopyV,
+        GmemTiledCopyK_cache,
+        GmemTiledCopyV_cache,
+        LocalMask,
+        false,
+        AppendKV,
+        IdentityPagedKV,
+        SingleAppendKV>;
+    using StoreEpilogue = cutlass::fmha::collective::
+        FMHAFwdEpilogue<StoreMainloop, StoreTileShapeOutput, TensorO, GmemTiledCopyO, Sink>;
+
     static_assert(!(persistent & Causal), "persistent SDPA kernel not support Causal yet");
     using FMHAPrefillKernel = conditional_t<
         is_same_v<Scheduler, cutlass::fmha::kernel::XeFHMAIndividualPersistentTileScheduler>,
@@ -545,9 +644,38 @@ struct FMHAConfig {
             Step<_2, _0, _1, _3>,
             /*PackGQA=*/false,
             /*StaticScoreMode=*/-1,
-            kOutputTiles>>;
+            kOutputTiles,
+            /*ScoreQTile=*/kScoreQTile>>;
 
-    PrefillRunner<FMHAPrefillKernel, isVarLen> kernel;
+    // The store launch's kernel, when it runs a taller Q tile than the rest. It is a
+    // complete second stack (its own MMA, mainloop and epilogue) because the Q tile
+    // reaches all of them; only the store launch's GEMM1 is actually executed from it,
+    // and its epilogue is dead code, since SPLIT_STORE mode 0 returns before it.
+    //
+    // MEASURED: GEMM1's own launch runs 14.22 ms at 8 Q rows per subgroup and 10.94 ms
+    // spill-free at 16, a 23% win -- each transposed K load feeds 2 DPAS instead of 1
+    // and the DPAS operand bank conflicts drop from BC>=2 to BC=1. The load launches
+    // cannot follow, because doubling their Q rows doubles the O accumulator and spills
+    // ~1 KB/thread. Splitting the Q tile per mode is what lets each launch take the
+    // tile it wants.
+    using StoreKernel = cute::conditional_t<
+        StoreTiledQ == 0,
+        void,
+        cutlass::fmha::kernel::XeFMHAFwdKernel<
+            ProblemShapeType,
+            StoreMainloop,
+            StoreEpilogue,
+            Scheduler,
+            Step<_2, _0, _1, _3>,
+            Step<_2, _0, _1, _3>,
+            Step<_0, _2, _1, _3>,
+            Step<_2, _0, _1, _3>,
+            /*PackGQA=*/false,
+            /*StaticScoreMode=*/-1,
+            kOutputTiles,
+            /*ScoreQTile=*/kScoreQTile>>;
+
+    PrefillRunner<FMHAPrefillKernel, isVarLen, StoreKernel> kernel;
 
     kernel.run(params, hw_info);
     return 0;

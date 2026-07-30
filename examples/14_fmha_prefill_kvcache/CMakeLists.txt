@@ -82,6 +82,11 @@ option(FMHA_PREFILL_ENABLE_SCORE_BLOCK2D_512 "Reuse QK scores across the two out
 # whole K block, making K's L1 request volume 8x Q's. Wider steps cost registers (the
 # Q/K fragments scale with it), which is the same pressure that makes TILED_KV=128 spill.
 set(FMHA_PREFILL_QK_KSTEP_512 32 CACHE STRING "GEMM1 head-dim reduction step for paged HEAD_DIM=512 prefill")
+# Q tile for the score-store launch alone (0 = same as TILED_Q). GEMM1 retires 23% faster
+# with twice the Q rows per subgroup, because each transposed K load then feeds two DPAS
+# instead of one; the load launches cannot follow, since their O accumulator doubles with
+# it and spills. Needs FMHA_PREFILL_SPLIT_STORE=1, which gives GEMM1 its own launch.
+set(FMHA_PREFILL_STORE_TILED_Q_512 0 CACHE STRING "Q tile extent for the score-store launch of paged HEAD_DIM=512 prefill (0 = same as TILED_Q)")
 
 set(FMHA_PREFILL_TILED_Q_NP_64 128)
 set(FMHA_PREFILL_TILED_KV_NP_64 64)
@@ -134,6 +139,10 @@ foreach(HEAD_DIM ${FMHA_STANDALONE_HEAD_DIMS})
     if(DEFINED FMHA_PREFILL_QK_KSTEP_${HEAD_DIM})
       set(QK_KSTEP ${FMHA_PREFILL_QK_KSTEP_${HEAD_DIM}})
     endif()
+    set(STORE_TILED_Q 0)
+    if(DEFINED FMHA_PREFILL_STORE_TILED_Q_${HEAD_DIM})
+      set(STORE_TILED_Q ${FMHA_PREFILL_STORE_TILED_Q_${HEAD_DIM}})
+    endif()
     if(HEAD_DIM STREQUAL "128" AND FMHA_STANDALONE_PAGED_HD128_LARGE_TILE)
       set(HD128_PAGED_LARGE_TILE 1)
     else()
@@ -169,6 +178,7 @@ foreach(HEAD_DIM ${FMHA_STANDALONE_HEAD_DIMS})
     set(TILED_OUT 128)
     set(ENABLE_SCORE_BLOCK2D 0)
     set(QK_KSTEP 32)
+    set(STORE_TILED_Q 0)
   endif()
 
   if(HEAD_DIM IN_LIST FMHA_PREFILL_NP_HEAD_DIMS)

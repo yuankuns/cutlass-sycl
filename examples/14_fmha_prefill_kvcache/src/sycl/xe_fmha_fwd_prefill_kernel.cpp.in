@@ -105,6 +105,38 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
 #ifndef FMHA_PREFILL_N_SPLIT_512
 #define FMHA_PREFILL_N_SPLIT_512 1
 #endif
+  // Q tile for the ScoreBlock2D *store* launch alone; 0 = same tile as every launch.
+  //
+  // Requires FMHA_PREFILL_SPLIT_STORE=1, which is what makes mode 0 own no output tile
+  // and therefore free to pick its own Q extent. GEMM1's cost is dominated by how many
+  // DPAS each of its transposed K loads feeds: at TILED_Q/NUM_SG = 8 Q rows per subgroup
+  // the DPAS atom's M is 8 and each `load_block2d.ugm.d32t` K message feeds exactly one
+  // DPAS (the ISA is literally 9 loads then 8 dpas). At 16 rows there are two DPAS rows
+  // over the same B operand, so each K message feeds two, and the operand bank conflicts
+  // IGC annotates drop from mostly BC>=2 to BC=1.
+  //
+  // Measured on the isolated GEMM1 launch: 14.216 ms at 8 rows vs 10.94 ms at 16,
+  // spill-free both times. The load launches cannot take the same tile -- their O
+  // accumulator doubles with it and spills ~1 KB/thread -- which is exactly why the tile
+  // is per-mode here rather than in TILED_Q. 32 rows per subgroup (STORE_TILED_Q=1024)
+  // collapses to 27 TFLOPS, so 16 is the optimum, not simply "taller".
+  //
+  // KNOWN LIMITATION, which is why this ships off: causal shapes whose seq_len_kv is not
+  // a multiple of 8 are wrong (measured bad>0 at sk = 333/511/700/777, bad=0 at
+  // 320/512/768/784/800/1000/4096; non-causal is correct at every sk). Two DPAS M-blocks
+  // per subgroup already moved the causal mask to the coordinate-tensor form and the K
+  // loop bound to Q-tile granularity, and both are necessary -- but something in the
+  // remainder-K interaction is still tied to one M-block. A padded score row pitch was
+  // built and measured twice: it changes no bad count at all, so it is refuted.
+  // Also regresses mid/small shapes on launch count: 36.8 at sq2048 and 34.3 at
+  // b4/sq1024 against 47.6/40.3, even though its own GEMM1 launch is faster there too.
+#ifndef FMHA_PREFILL_STORE_TILED_Q
+#define FMHA_PREFILL_STORE_TILED_Q @STORE_TILED_Q@
+#endif
+  static_assert(
+      FMHA_PREFILL_STORE_TILED_Q == 0 || FMHA_PREFILL_SPLIT_STORE,
+      "FMHA_PREFILL_STORE_TILED_Q needs FMHA_PREFILL_SPLIT_STORE: without it mode 0 also "
+      "writes an output tile, whose Q extent must match the load launches'");
   static_assert(@NUM_SG@ % FMHA_PREFILL_N_SPLIT_512 == 0, "N split must divide NUM_SG");
   static_assert(
       cute::Int<@TILED_KV@>{} % (16 * FMHA_PREFILL_N_SPLIT_512) == 0,
@@ -303,7 +335,24 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
           TileShapePV,
           TileShapeOutput,
           SubgroupLayoutQK,
-          ((@HEAD_DIM@ + 31) / 32) * 32>::run_paged(params);
+          ((@HEAD_DIM@ + 31) / 32) * 32,
+          /*SubgroupLayoutPV=*/void,
+          /*PipelineStages=*/2,
+          /*persistent=*/false,
+          cutlass::bfloat16_t,
+          cutlass::bfloat16_t,
+          cutlass::bfloat16_t,
+          cutlass::bfloat16_t,
+          /*MMAOperation=*/void,
+          cute::Stride<int, cute::_1, int, int>,
+          cute::Stride<int, cute::_1, int, int>,
+          cute::Stride<cute::_1, int, int, int>,
+          cute::Stride<int, cute::_1, int, int>,
+          /*GmemTiledCopyQ=*/void,
+          /*GmemTiledCopyK=*/void,
+          /*GmemTiledCopyV=*/void,
+          /*GmemTiledCopyO=*/void,
+          FMHA_PREFILL_STORE_TILED_Q>::run_paged(params);
     });
   });
 #endif

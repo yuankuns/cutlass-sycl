@@ -75,7 +75,18 @@ template <
     int StaticScoreMode_ = -1,
     // Number of output tiles covering the head dimension. In the ScoreBlock2D path
     // this equals the number of launches, and StaticScoreMode_ indexes both.
-    int OutputTiles_ = 2>
+    int OutputTiles_ = 2,
+    // Q rows one score-workspace *region* holds. 0 means "this kernel's own Q tile",
+    // which is the only sensible value when every launch shares one tile shape.
+    //
+    // The per-mode Q tile (FMHA_PREFILL_STORE_TILED_Q) launches the store with a
+    // taller Q tile than the load launches, so the two disagree about how many
+    // blocks tile the Q extent. Framing the workspace on a single region height --
+    // the *larger* of the two -- makes them agree: a region is one store tile, and
+    // a load launch addresses the sub-block of it that its own (smaller) tile owns.
+    // Since a region is contiguous and row-major with stride score_k_extent, the
+    // store's 2N rows are bit-identical to two consecutive load blocks of N rows.
+    int ScoreQTile_ = 0>
 class XeFMHAFwdKernel {
  public:
   //
@@ -96,7 +107,8 @@ class XeFMHAFwdKernel {
       VarLenOLayoutStep_,
       PackGQA_,
       ScoreMode,
-      OutputTiles_>;
+      OutputTiles_,
+      ScoreQTile_>;
   static constexpr int kOutputTiles = OutputTiles_;
   // Mainloop derived types
   using CollectiveMainloop = CollectiveMainloop_;
@@ -236,10 +248,25 @@ class XeFMHAFwdKernel {
     return CollectiveMainloop::can_implement(args.mainloop) && CollectiveEpilogue::can_implement(args.epilogue);
   }
 
-  // Number of score rows a single workgroup owns: one Q tile. Every subgroup in
-  // the workgroup writes into (and reads back from) this one block, so the
-  // scratch is allocated per workgroup rather than per (q,k) matrix element.
-  static constexpr size_t kScoreRowsPerWG = size_t(get<0>(TileShapeQK{}));
+  // Number of score rows one workspace *region* holds. Normally one Q tile: every
+  // subgroup in the workgroup writes into (and reads back from) this one block, so
+  // the scratch is allocated per workgroup rather than per (q,k) matrix element.
+  //
+  // With a per-mode Q tile (ScoreQTile_ != 0) the region is the *tallest* launch's
+  // Q tile, so all launches tile the Q extent into the same number of regions. A
+  // launch whose own tile is shorter then owns a sub-block of one region, selected
+  // by a tile coordinate into the region (not by a shifted base pointer). Regions
+  // stay contiguous and row-major, so the tall launch's rows coincide exactly with
+  // the short launch's.
+  static constexpr size_t kScoreRowsPerRegion =
+      ScoreQTile_ > 0 ? size_t(ScoreQTile_) : size_t(get<0>(TileShapeQK{}));
+  // How many of this kernel's own Q tiles fit in one region (1 for the tall launch).
+  static constexpr int kTilesPerRegion = int(kScoreRowsPerRegion) / int(get<0>(TileShapeQK{}));
+  static_assert(
+      kScoreRowsPerRegion % size_t(get<0>(TileShapeQK{})) == 0,
+      "the score region height must be a whole number of this launch's Q tiles");
+  // Kept for the workspace arithmetic, which is framed on the region.
+  static constexpr size_t kScoreRowsPerWG = kScoreRowsPerRegion;
 
   // Bytes of score scratch one workgroup needs: its Q tile x the KV extent it
   // walks. The store and load kernels visit K blocks in the same order, so a
@@ -432,12 +459,32 @@ class XeFMHAFwdKernel {
       // const int seq_len = seq_len_new + seq_len_kv_cache;
       // const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
 
+      // Causal bounds are per-subgroup: seq_coord is this subgroup's first Q row, so the
+      // K loop runs only as far as that subgroup's rows can see.
+      //
+      // That relies on a subgroup's rows being one contiguous run starting at
+      // q_offset_sg, which holds only while each subgroup owns a single DPAS M-block.
+      // When it owns two (the taller store-launch Q tile), the second block sits a
+      // whole M stride away, so q_offset_sg understates the subgroup's *last* row and
+      // the loop would stop before that row's final K blocks -- silently dropping them
+      // from the softmax. Fall back to Q-tile granularity there: the loop bound comes
+      // from the tile's last row and the mask threshold from its first, so both are
+      // supersets of what any row in the tile needs and the mask zeroes the excess.
+      // All subgroups then agree on the trip count too, which the split barrier wants.
+      constexpr bool kTileGranularCausal = CollectiveMainloop::SGTileQBlocks > 1;
+      const int causal_row_hi =
+          kTileGranularCausal ? cute::min(seq_len_qo, blk_q * get<0>(TileShapeQK{}) + get<0>(TileShapeQK{})) : 0;
+      const int causal_row_lo = kTileGranularCausal ? blk_q * get<0>(TileShapeQK{}) : 0;
       const int seq_len = CollectiveMainloop::CausalMask
-                              ? cute::min(seq_k_eff, full_tile_offset + seq_coord + q_sg_tile)
+                              ? (kTileGranularCausal
+                                     ? cute::min(seq_k_eff, full_tile_offset + causal_row_hi)
+                                     : cute::min(seq_k_eff, full_tile_offset + seq_coord + q_sg_tile))
                               : seq_k_eff;
       const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
-      const int k_blocks_causal =
-          CollectiveMainloop::CausalMask ? (seq_coord + full_tile_offset) / get<1>(TileShapeQK{}) : 0;
+      const int k_blocks_causal = CollectiveMainloop::CausalMask
+                                      ? ((kTileGranularCausal ? causal_row_lo : seq_coord) + full_tile_offset) /
+                                            get<1>(TileShapeQK{})
+                                      : 0;
       int append_store_len = -1;
       if constexpr (CollectiveMainloop::AppendKV) {
         if constexpr (CollectiveMainloop::SingleAppendKV) {
@@ -463,7 +510,6 @@ class XeFMHAFwdKernel {
           }
         }
       }
-
       // Sliding-window pruning: skip K blocks that are entirely outside the
       // [row - window_size_left, row + window_size_right] band for all rows in
       // this Q-tile. Mirrors the LocalMask optimization on the decode path.
@@ -560,6 +606,7 @@ class XeFMHAFwdKernel {
       }
       typename CollectiveMainloop::ElementScoreStore* score_head_ptr = nullptr;
       typename CollectiveMainloop::ElementS* stats_wg_ptr = nullptr;
+      int score_blk_in_region = 0;
       if constexpr (CollectiveMainloop::ScoreBlock2D) {
         int score_q_extent;
         int score_k_extent;
@@ -578,17 +625,26 @@ class XeFMHAFwdKernel {
         // from the same block coord, so the block written by mode 0 is the one
         // mode 1 reads back. Sized in q-tiles (not raw seq_len_qo) so the slot
         // stride matches get_workspace_size()'s per-workgroup framing.
-        constexpr int q_tile = int(get<0>(TileShapeQK{}));
-        const int q_tiles = (score_q_extent + q_tile - 1) / q_tile;
-        const size_t wg_slot = (size_t(score_batch) * s.num_heads_q + q_head_idx) * q_tiles + blk_q;
-        score_head_ptr = params.mainloop.ptr_score + wg_slot * size_t(q_tile) * size_t(score_k_extent);
+        // Framed on the region, not on this launch's Q tile, so a launch with a
+        // shorter tile lands inside the region its rows belong to: region index is
+        // blk_q / kTilesPerRegion, and the leftover tiles select a tile *within* the
+        // region. The pointer stays at the region base and the intra-region position
+        // travels as a tile coordinate -- see the mainloop's score_shape comment for
+        // why offsetting the base instead is wrong.
+        constexpr int q_region = int(kScoreRowsPerRegion);
+        const size_t k_pitch = size_t(score_k_extent);
+        const int q_regions = (score_q_extent + q_region - 1) / q_region;
+        const size_t wg_slot =
+            (size_t(score_batch) * s.num_heads_q + q_head_idx) * q_regions + (blk_q / kTilesPerRegion);
+        score_blk_in_region = blk_q % kTilesPerRegion;
+        score_head_ptr = params.mainloop.ptr_score + wg_slot * size_t(q_region) * k_pitch;
         if constexpr (CollectiveMainloop::ShareSoftmaxStats) {
           // The statistics region begins after every workgroup's score block, so its base
           // needs the *total* workgroup count -- not this workgroup's slot -- which means
           // recomputing the same q_tiles product get_workspace_size() uses.
-          const size_t num_wg = size_t(s.batch) * s.num_heads_q * q_tiles;
+          const size_t num_wg = size_t(s.batch) * s.num_heads_q * q_regions;
           auto* stats_base = reinterpret_cast<typename CollectiveMainloop::ElementS*>(
-              params.mainloop.ptr_score + num_wg * size_t(q_tile) * size_t(score_k_extent));
+              params.mainloop.ptr_score + num_wg * size_t(q_region) * k_pitch);
           stats_wg_ptr = stats_base + wg_slot * 2 * size_t(CollectiveMainloop::kStatsPerWG);
         }
       }
@@ -618,6 +674,8 @@ class XeFMHAFwdKernel {
           V_cache(_, _, head, l_coord),
           scale_k,
           score_head_ptr,
+          int(kScoreRowsPerRegion),
+          score_blk_in_region,
           stats_wg_ptr);
 
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
