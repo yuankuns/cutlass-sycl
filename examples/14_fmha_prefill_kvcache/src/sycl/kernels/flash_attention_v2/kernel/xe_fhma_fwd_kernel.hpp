@@ -268,7 +268,20 @@ class XeFMHAFwdKernel {
       }
       const size_t q_tiles = (score_q_extent + kScoreRowsPerWG - 1) / kScoreRowsPerWG;
       const size_t num_wg = size_t(args.kernel.shape.batch) * size_t(args.kernel.shape.num_heads_q) * q_tiles;
-      return num_wg * get_score_block_bytes(args);
+      // Softmax statistics, when shared between launches, sit after all the score blocks:
+      // two floats per thread per workgroup (final row max, final row sum). Tiny next to the
+      // score blocks -- 8 KB per workgroup against megabytes -- but it must be *after* them,
+      // since the score pointer is the workspace base.
+      return num_wg * get_score_block_bytes(args) + num_wg * get_stats_bytes_per_wg();
+    }
+    return 0;
+  }
+
+  // Bytes of softmax-statistics scratch one workgroup needs. Zero unless the statistics are
+  // shared, so the workspace is unchanged in the default build.
+  static constexpr size_t get_stats_bytes_per_wg() {
+    if constexpr (CollectiveMainloop::ShareSoftmaxStats) {
+      return 2 * size_t(CollectiveMainloop::kStatsPerWG) * sizeof(typename CollectiveMainloop::ElementS);
     }
     return 0;
   }
@@ -546,6 +559,7 @@ class XeFMHAFwdKernel {
         scale_k = *p.scale_k_ptr;
       }
       typename CollectiveMainloop::ElementScoreStore* score_head_ptr = nullptr;
+      typename CollectiveMainloop::ElementS* stats_wg_ptr = nullptr;
       if constexpr (CollectiveMainloop::ScoreBlock2D) {
         int score_q_extent;
         int score_k_extent;
@@ -568,6 +582,15 @@ class XeFMHAFwdKernel {
         const int q_tiles = (score_q_extent + q_tile - 1) / q_tile;
         const size_t wg_slot = (size_t(score_batch) * s.num_heads_q + q_head_idx) * q_tiles + blk_q;
         score_head_ptr = params.mainloop.ptr_score + wg_slot * size_t(q_tile) * size_t(score_k_extent);
+        if constexpr (CollectiveMainloop::ShareSoftmaxStats) {
+          // The statistics region begins after every workgroup's score block, so its base
+          // needs the *total* workgroup count -- not this workgroup's slot -- which means
+          // recomputing the same q_tiles product get_workspace_size() uses.
+          const size_t num_wg = size_t(s.batch) * s.num_heads_q * q_tiles;
+          auto* stats_base = reinterpret_cast<typename CollectiveMainloop::ElementS*>(
+              params.mainloop.ptr_score + num_wg * size_t(q_tile) * size_t(score_k_extent));
+          stats_wg_ptr = stats_base + wg_slot * 2 * size_t(CollectiveMainloop::kStatsPerWG);
+        }
       }
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
       mainloop.template operator()<StaticScoreMode_>(
@@ -594,7 +617,8 @@ class XeFMHAFwdKernel {
           K_cache(_, _, head, l_coord),
           V_cache(_, _, head, l_coord),
           scale_k,
-          score_head_ptr);
+          score_head_ptr,
+          stats_wg_ptr);
 
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
         sycl::group_barrier(get_work_group<3>());

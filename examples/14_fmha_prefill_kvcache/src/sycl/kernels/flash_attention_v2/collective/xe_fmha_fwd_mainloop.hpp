@@ -237,6 +237,44 @@
 #define FMHA_PREFILL_QK_ACC_SPLIT 1
 #endif
 
+// Share the softmax statistics between ScoreBlock2D launches instead of recomputing them.
+//
+// Every launch currently re-derives the whole online softmax from the same stored logits:
+// a row-max reduction, an exp2 per element, a row-sum reduction, and -- the expensive part --
+// a rescale of the *entire* O accumulator on every K block, because the running max keeps
+// moving. Mode 0 already computes the final per-row max and sum by the time it finishes, and
+// those values are identical for every output tile, since all tiles share the same S.
+//
+// So mode 0 writes them once (one max + one sum per Q row, i.e. TILED_Q floats each -- 2 KB
+// per workgroup at TILED_Q=256, next to the score block's megabytes) and the load launches
+// read them back and compute P = exp2(scale*S - final_max) directly. Two things then
+// disappear from the load launches:
+//   1. both row reductions, replaced by a broadcast of a value read from memory;
+//   2. the per-K-block `tArA *= rescale` over the whole O accumulator -- the max is already
+//      final, so there is nothing to rescale. That loop touches rows_per_SG * TILED_OUT
+//      floats per K block, so it is the real target here.
+// The epilogue's division by the sum is unaffected: tA_sum is filled from the stored value.
+//
+// Motivated by the per-launch breakdown: GEMM1 dominates (18.4 ms vs 4.6), but 47.8 -> 50
+// TFLOPS needs only ~1.1 ms of the 23.0, and this removes work from the load launch without
+// touching GEMM1's register-starved head-dim loop at all -- the constraint that refuted
+// Q residency, KSTEP, TILED_KV, N-split and QK_ACC_SPLIT.
+//
+// MEASURED: exactly neutral, so it ships default-off. b1/hq32/dv512/sq4096, same-batch
+// reference, spill unchanged at 640/704:
+//     off: k0=18.400 k1=4.688 total=23.088 -> 47.62 TFLOPS
+//     on:  k0=18.409 k1=4.678 total=23.087 -> 47.62 TFLOPS
+// Accuracy improves slightly (max_abs 0.00129 vs 0.00153), as expected from using a final
+// rather than a moving max. The point is *where* it is neutral: k1 shed both row reductions
+// and the whole-accumulator rescale and moved 0.2%. So the load launch is not bound by the
+// softmax arithmetic at all -- it is bound by its V and score loads plus GEMM2's DPAS, and
+// removing ALU work from it buys nothing. Kept because it is the clean disproof of "the load
+// launches redo work launch 0 already did", and because the seeded path is a building block
+// for anything that wants the final max up front.
+#ifndef FMHA_PREFILL_SHARE_SOFTMAX_STATS
+#define FMHA_PREFILL_SHARE_SOFTMAX_STATS 0
+#endif
+
 namespace cutlass::fmha {
 
 template <int Stages>
@@ -518,6 +556,22 @@ struct FMHAFwdMainloop<
   // GEMM1 dependency-chain split. Confined to the plain (non-grouped, non-staged,
   // non-resident) GEMM1 path: each of the other paths already restructures the same loop,
   // and combining them would multiply accumulator counts for no separable measurement.
+  // Share the final softmax row statistics across launches rather than recomputing them.
+  // Meaningless without the score round-trip, since there is only one launch then.
+  static constexpr bool ShareSoftmaxStats = ScoreBlock2D && FMHA_PREFILL_SHARE_SOFTMAX_STATS;
+  // Floats per workgroup for one statistic. Sized by the thread-flat layout the mainloop
+  // writes (thr_id * FragARow::size()), not by TILED_Q: every thread in the workgroup gets
+  // its own slot, so the maxima occupy [0, kStatsPerWG) and the sums [kStatsPerWG, 2*...).
+  static constexpr int kStatsPerWG =
+      int(SGPerWG::value) * int(intel::sg_size) * int(decltype(reduce<1>(FragA{}, sycl::plus<void>{})){}.size());
+  // Under SplitStore mode 0 skips softmax entirely (it runs no GEMM2), so it has no
+  // statistics to publish -- the two features are mutually exclusive as written.
+  static_assert(
+      !(ScoreBlock2D && FMHA_PREFILL_SHARE_SOFTMAX_STATS && FMHA_PREFILL_SPLIT_STORE),
+      "FMHA_PREFILL_SHARE_SOFTMAX_STATS and FMHA_PREFILL_SPLIT_STORE are exclusive");
+  // Mode 0 is the only launch that runs GEMM1, so it is the only one that can produce the
+  // statistics; with SplitStore it also runs no GEMM2, which is fine -- it still completes
+  // the full online softmax over every K block, which is all the statistics require.
   static constexpr int QKAccSplit = FMHA_PREFILL_QK_ACC_SPLIT;
   static_assert(QKAccSplit >= 1, "FMHA_PREFILL_QK_ACC_SPLIT must be at least 1");
   // Power of two: the loop indexes the accumulator array with `Di & (QKAccSplit-1)`, which
@@ -907,7 +961,10 @@ struct FMHAFwdMainloop<
       TensorK_cache2D const& K_cache_2D = TensorK_cache2D{},
       TensorV_cache2D const& V_cache_2D = TensorV_cache2D{},
       float scale_k = 1.0f,  // FP8 K per-tensor dequant scale
-      ElementScoreStore* score_head_ptr = nullptr) {
+      ElementScoreStore* score_head_ptr = nullptr,
+      // Base of this workgroup's softmax-statistics slot (2 * TILED_Q floats: maxima then
+      // sums). Null unless ShareSoftmaxStats.
+      ElementS* stats_wg_ptr = nullptr) {
     using namespace sycl::ext::oneapi::this_work_item;
 
     // Short dimension names:
@@ -1107,6 +1164,26 @@ struct FMHAFwdMainloop<
       clear(tArA);
       fill(tA_max, cutlass::platform::numeric_limits<ElementA>::lowest());
       clear(tA_sum);
+    }
+
+    // Load launches: seed tA_max/tA_sum with the *final* values mode 0 computed, so the
+    // per-block softmax below has nothing left to discover. Every launch partitions the same
+    // FragARow the same way (same MMA, same subgroup layout), so element i of this thread's
+    // fragment is the same Q row in every launch and a flat per-thread slot needs no
+    // coordinate math. tA_sum is seeded too, so the epilogue's division is unchanged.
+    if constexpr (ShareSoftmaxStats && StaticScoreMode >= 1) {
+      const int stat_base = thr_id * int(FragARow{}.size());
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tA_max.size(); i++) {
+        const ElementA m = stats_wg_ptr[stat_base + i];
+        // A fully-masked row (no unmasked keys anywhere, possible under causal/local) keeps
+        // max == lowest(), and exp2(scale*S - lowest()) would overflow to inf here -- the
+        // online path never evaluates that because such a row's blocks are all -inf and its
+        // sum stays 0, which the epilogue special-cases. Substituting 0 keeps the
+        // exponentials finite; the row's sum is still 0, so the epilogue emits 0 as before.
+        tA_max(i) = (m == cutlass::platform::numeric_limits<ElementA>::lowest()) ? ElementA(0) : m;
+        tA_sum(i) = stats_wg_ptr[kStatsPerWG + stat_base + i];
+      }
     }
 
     /* Check if */
@@ -1481,21 +1558,44 @@ struct FMHAFwdMainloop<
         // O accumulator untouched is the point -- it is what frees the registers.
         if constexpr (!(SplitStore && StaticScoreMode == 0)) {
           /* Apply softmax and scaling (tA rescaling fused into GEMM2 VTile loop) */
-          auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum, qk_scale);
-          reorder(tSrS, tArP);
-
-          /* GEMM 2: A += P * V, split in v dimension. */
-          CUTLASS_PRAGMA_UNROLL
-          for (int VV = 0; VV < VTiles; VV++) {
-            copy(copy_v_cache, tVgV_cache(_, _, _, VV, page_idx), tVrV);
-            reorder(tVrV, tArV);
-            if (K != blk_k0) {
-              CUTLASS_PRAGMA_UNROLL
-              for (int i = 0; i < tArA.size() / VTiles; i++) {
-                tArA(_, _, _, VV)(i) *= broadcast<0>(rescale, tArA, i);
-              }
+          // With shared statistics the load launches already hold the final row max, so the
+          // exponentiation is all that is left: no row reductions, and -- the point of the
+          // whole variant -- no rescale of the O accumulator, since the max cannot move.
+          // Kept as a separate `if constexpr` around only the softmax call rather than a
+          // branch that assigns a `rescale` variable: default-constructing FragSRow here
+          // perturbs register allocation for the entire loop, in every launch (measured:
+          // mode 0 went 18.4 -> 51.7 ms).
+          if constexpr (ShareSoftmaxStats && StaticScoreMode >= 1) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < tSrS.size(); i++) {
+              tSrS(i) = sycl::native::exp2(qk_scale * tSrS(i) - broadcast<0>(tA_max, tSrS, i));
             }
-            cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
+            reorder(tSrS, tArP);
+
+            /* GEMM 2: A += P * V, split in v dimension. No rescale. */
+            CUTLASS_PRAGMA_UNROLL
+            for (int VV = 0; VV < VTiles; VV++) {
+              copy(copy_v_cache, tVgV_cache(_, _, _, VV, page_idx), tVrV);
+              reorder(tVrV, tArV);
+              cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
+            }
+          } else {
+            auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum, qk_scale);
+            reorder(tSrS, tArP);
+
+            /* GEMM 2: A += P * V, split in v dimension. */
+            CUTLASS_PRAGMA_UNROLL
+            for (int VV = 0; VV < VTiles; VV++) {
+              copy(copy_v_cache, tVgV_cache(_, _, _, VV, page_idx), tVrV);
+              reorder(tVrV, tArV);
+              if (K != blk_k0) {
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 0; i < tArA.size() / VTiles; i++) {
+                  tArA(_, _, _, VV)(i) *= broadcast<0>(rescale, tArA, i);
+                }
+              }
+              cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
+            }
           }
         }
 
@@ -1515,6 +1615,18 @@ struct FMHAFwdMainloop<
         if constexpr (!SkipSplitBarrier) {
           barrier_wait(ScopeWorkgroup);
         }
+      }
+    }
+
+    // Mode 0 publishes the finished row statistics for the load launches. Placed after the
+    // whole K loop, so these are the final values; the launch boundary is the synchronization
+    // (a later kernel cannot start before this one retires), so no barrier or fence is needed.
+    if constexpr (ShareSoftmaxStats && StaticScoreMode == 0) {
+      const int stat_base = thr_id * int(FragARow{}.size());
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tA_max.size(); i++) {
+        stats_wg_ptr[stat_base + i] = tA_max(i);
+        stats_wg_ptr[kStatsPerWG + stat_base + i] = tA_sum(i);
       }
     }
   }
