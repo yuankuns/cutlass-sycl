@@ -272,6 +272,38 @@
 #define FMHA_PREFILL_SHARE_SOFTMAX_STATS 0
 #endif
 
+// Stagger where each subgroup starts GEMM1's head-dim walk, by this many chunks per
+// subgroup (0 = off, all subgroups start at chunk 0 as before).
+//
+// Motivated by reconciling three measurements that look contradictory. Pinning K's address
+// is worth +3.3 TFLOPS (51.14 vs 47.82) and pinning Q's ~+2.5 -- yet halving GEMM1's K
+// *request count* (KSTEP=64, once TILED_KV=32 makes it spill-free) is worth exactly 0%, and
+// its reorders 0.03%. If neither request volume nor data movement costs anything but
+// address identity does, then the cost is request *simultaneity*: SubgroupLayoutQK splits Q
+// only, so all 32 subgroups walk D in lockstep and issue the same K address in the same
+// cycle, serializing on a single cache line. Both pin probes remove exactly that collision,
+// which is why they beat every volume-reduction variant.
+//
+// GEMM1's D loop is a reduction into tSrS, so each subgroup may traverse it in any order --
+// only the fp summation order changes, which is why this is free where everything else
+// costs registers. Skewing by 1 gives 32 subgroups 16 distinct chunks at head_dim=512
+// (nD=16), so pressure per chunk drops ~16x. This is the one lever the pin probes' 51.14
+// suggests is real and that no other variant reaches.
+//
+// MEASURED: this works, and it is the first hd=512 variant to beat the baseline.
+// b1/hq32/dv512/sq4096, same-batch reference, bad=0 on all six verify shapes:
+//     off:    k0=18.384 k1=4.649 total=23.033 -> 47.74 TFLOPS
+//     skew=1: k0=17.904 k1=4.643 total=22.547 -> **48.77** TFLOPS
+//     skew=2: k0=17.973 k1=4.660 total=22.633 -> 48.58 TFLOPS
+// The gain is entirely in k0 with k1 unchanged to three digits, which is exactly what the
+// simultaneity diagnosis predicts -- only GEMM1 has the lockstep D walk. Spill rises just
+// 640/704 -> 704/768, i.e. this does not fight the register wall that refuted the rest.
+// skew=1 is the default-worthy value; larger strides spread addresses further but give
+// fewer distinct chunks, and measure slightly worse.
+#ifndef FMHA_PREFILL_D_SKEW
+#define FMHA_PREFILL_D_SKEW 0
+#endif
+
 namespace cutlass::fmha {
 
 template <int Stages>
@@ -541,6 +573,10 @@ struct FMHAFwdMainloop<
   static_assert(QKAccSplit == 1 || FMHA_PREFILL_Q_RESIDENT == 0, "QK_ACC_SPLIT and Q_RESIDENT are exclusive");
   static_assert(QKAccSplit == 1 || FMHA_PREFILL_K_SLM == 0, "QK_ACC_SPLIT and K_SLM are exclusive");
   static constexpr bool ZigzagD = FMHA_PREFILL_ZIGZAG_D;
+  // Per-subgroup rotation of GEMM1's head-dim walk; 0 = off. Exclusive with Q residency,
+  // which pins specific chunks in registers and so requires a fixed per-subgroup order.
+  static constexpr int DSkew = FMHA_PREFILL_D_SKEW;
+  static_assert(DSkew == 0 || FMHA_PREFILL_Q_RESIDENT == 0, "D_SKEW and Q_RESIDENT are exclusive");
   static constexpr bool PfZigzag = FMHA_PREFILL_PF_ZIGZAG;
   static constexpr int InitPfDepth = FMHA_PREFILL_INIT_PF_DEPTH;
   static constexpr int NoSplitBarrierMode = FMHA_PREFILL_NO_SPLIT_BARRIER;
@@ -1037,7 +1073,21 @@ struct FMHAFwdMainloop<
             // 256KB at head_dim=512 -- right at L1 capacity -- so a straight 0..nD-1
             // walk evicts the front of Q before it comes back around. Costs no extra
             // registers, unlike widening TILED_KV or grouping K blocks.
-            const int D = (ZigzagD && ((K_grp / KGrp) & 1)) ? (nD - 1 - Di) : Di;
+            int D = (ZigzagD && ((K_grp / KGrp) & 1)) ? (nD - 1 - Di) : Di;
+            if constexpr (DSkew > 0) {
+              // Rotate each subgroup's start point in the head-dim walk. GEMM1's D loop is a
+              // reduction into tSrS, so any permutation of it is valid; only the fp summation
+              // order changes. Without this every subgroup requests the *same* K chunk at the
+              // same instant -- SubgroupLayoutQK splits Q only, so all 32 issue one identical
+              // address and serialize on one cache line. Skewing makes the 32 in-flight
+              // requests hit distinct chunks instead. Costs no registers, unlike every other
+              // way of reducing K pressure. Subtract-if instead of modulo: nD is a dynamic
+              // int, so % would emit a division inside the hot loop.
+              D += (int(thr_id / intel::sg_size) * DSkew) % nD;
+              if (D >= nD) {
+                D -= nD;
+              }
+            }
             copy(copy_q, tQgQ(_, _, _, D), tQrQ);
             reorder(tQrQ, tSrQ);
             CUTLASS_PRAGMA_UNROLL
