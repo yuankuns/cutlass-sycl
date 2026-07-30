@@ -81,7 +81,15 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
   AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
-        FMHAConfig<Causal, LocalMask, Sink, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_paged(
+        FMHAConfig<
+            Causal,
+            LocalMask,
+            Sink,
+            TileShapeQK,
+            TileShapePV,
+            TileShapeOutput,
+            SubgroupLayoutQK,
+            ((@HEAD_DIM@ + 31) / 32) * 32>::run_paged(
             params);
       });
     });
@@ -92,8 +100,15 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
       "sink is only supported for head_size == 64, got @HEAD_DIM@");
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
-      FMHAConfig<Causal, LocalMask, false, TileShapeQK, TileShapePV, TileShapeOutput, SubgroupLayoutQK>::run_paged(
-          params);
+      FMHAConfig<
+          Causal,
+          LocalMask,
+          false,
+          TileShapeQK,
+          TileShapePV,
+          TileShapeOutput,
+          SubgroupLayoutQK,
+          ((@HEAD_DIM@ + 31) / 32) * 32>::run_paged(params);
     });
   });
 #endif

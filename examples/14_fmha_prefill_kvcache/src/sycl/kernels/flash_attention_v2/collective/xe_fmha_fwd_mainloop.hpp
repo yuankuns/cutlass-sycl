@@ -53,9 +53,37 @@
 #define FMHA_PREFILL_QK_GROUP 1
 #endif
 
+// Give GEMM1 a launch of its own in the ScoreBlock2D path: mode 0 computes Q*K and
+// stores the scores but runs no GEMM2 and no epilogue, and each later mode owns one
+// output tile. Mode 0 then needs no O accumulator, which is the single largest
+// register consumer (rows_per_SG * TILED_OUT floats), so the freed budget is what
+// lets FMHA_PREFILL_QK_GROUP > 1 fit -- at group 1 it spills 3.2KB/thread. The cost
+// is one extra pass over the score scratch, since no launch now fuses store with a
+// tile. Only worth it when GEMM1 dominates, which it does at head_dim=512.
+#ifndef FMHA_PREFILL_SPLIT_STORE
+#define FMHA_PREFILL_SPLIT_STORE 0
+#endif
+
 // Alternate the direction of GEMM1's head-dim walk between consecutive K blocks.
 #ifndef FMHA_PREFILL_ZIGZAG_D
 #define FMHA_PREFILL_ZIGZAG_D 1
+#endif
+
+// Cap how many head-dim chunks the *initial* Q/K prefetch issues (0 = all). The WG's Q
+// tile is 256KB at head_dim=512, already L1-sized, so prefetching all 16 chunks plus K
+// up front evicts the front of Q before GEMM1 reaches it. Addresses the "limit D
+// prefetch for large head size" TODO below.
+#ifndef FMHA_PREFILL_INIT_PF_DEPTH
+#define FMHA_PREFILL_INIT_PF_DEPTH 0
+#endif
+
+// Issue the next K block's head-dim prefetches in the order that block will actually
+// consume them. With ZigzagD the walk direction flips every block, so a fixed 0..nD-1
+// prefetch hands the reverse-walking block its first-needed chunk last -- and at
+// head_dim=512 there are 16 chunks in flight, so that chunk can be evicted before use.
+// Addresses the "reorder K prefetches" TODO below. Costs no registers.
+#ifndef FMHA_PREFILL_PF_ZIGZAG
+#define FMHA_PREFILL_PF_ZIGZAG 0
 #endif
 
 // Drop GEMM1/GEMM2's workgroup split barrier. This mainloop shares nothing through
@@ -232,8 +260,20 @@ struct FMHAFwdMainloop<
   static constexpr bool ScoreBlock2D = FMHA_PREFILL_ENABLE_SCORE_BLOCK2D;
   static constexpr int QKGroup = FMHA_PREFILL_QK_GROUP;
   static_assert(QKGroup >= 1, "FMHA_PREFILL_QK_GROUP must be at least 1");
+  // Grouping only exists to amortize GEMM1's Q loads, so it is pointless in the
+  // ScoreBlock2D load launches -- and there it is actively harmful, since they would
+  // still pay for QKGroup S accumulators they never fill.
+  template <int Mode>
+  static constexpr int group_for_mode() {
+    return (ScoreBlock2D && Mode >= 1) ? 1 : QKGroup;
+  }
   static constexpr bool ZigzagD = FMHA_PREFILL_ZIGZAG_D;
+  static constexpr bool PfZigzag = FMHA_PREFILL_PF_ZIGZAG;
+  static constexpr int InitPfDepth = FMHA_PREFILL_INIT_PF_DEPTH;
   static constexpr int NoSplitBarrierMode = FMHA_PREFILL_NO_SPLIT_BARRIER;
+  // When set, ScoreBlock2D mode 0 is store-only: it skips GEMM2 and the epilogue,
+  // so the number of launches is one more than the number of output tiles.
+  static constexpr bool SplitStore = ScoreBlock2D && FMHA_PREFILL_SPLIT_STORE;
 
   // User-facing arguments
   struct Arguments {
@@ -401,9 +441,12 @@ struct FMHAFwdMainloop<
     auto tKrK = thr_copy_k.partition_sg_fragment_D(gK(_, _, 0, 0));
     auto tSrK = thr_mma_qk.partition_sg_fragment_B(gK(_, _, 0, 0));
 
-    // One S accumulator per K block in the group; QKGroup == 1 reduces to the old
-    // single accumulator, so the extra register cost is opt-in.
-    FragS tSrS_grp[QKGroup];
+    // One S accumulator per K block in the group; KGrp == 1 reduces to the old
+    // single accumulator, so the extra register cost is opt-in. The load launches
+    // run no GEMM1, so they are pinned to 1 rather than paying for accumulators
+    // they never fill (see group_for_mode).
+    constexpr int KGrp = group_for_mode<StaticScoreMode>();
+    FragS tSrS_grp[KGrp];
     auto tArP = thr_mma_pv.partition_sg_fragment_A(cP);
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
     auto tScoreStoreR = thr_copy_score_store.partition_sg_fragment_S(gScore(_, _, 0));
@@ -441,36 +484,44 @@ struct FMHAFwdMainloop<
     if constexpr (PagedKV) {
       next_page_idx = get_physical_k_tile(blk_k0, l_coord, seq_len_kv_cache);
     }
-    if constexpr (!(ScoreBlock2D && StaticScoreMode == 1)) {
-      for (int D = 0; D < size<3>(pQgQ); D++) {
+    if constexpr (!(ScoreBlock2D && StaticScoreMode >= 1)) {
+      // Only the leading chunks: the rest arrive via the in-loop prefetch anyway, and
+      // issuing all of them here just evicts the ones GEMM1 needs first.
+      const int nQpf = InitPfDepth > 0 ? cute::min(int(size<3>(pQgQ)), InitPfDepth) : int(size<3>(pQgQ));
+      const int nKpf = InitPfDepth > 0 ? cute::min(int(size<4>(pKgK)), InitPfDepth) : int(size<4>(pKgK));
+      for (int D = 0; D < nQpf; D++) {
         prefetch(prefetch_q, pQgQ(_, _, _, D));
       }
-      for (int D = 0; D < size<4>(pKgK); D++) {
+      for (int D = 0; D < nKpf; D++) {
         prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
       }
     }
     // Always initialize the per-WG accumulators: the caller (kernel) may pass
     // blk_k0 > 0 when sliding-window pruning skips leading K blocks, so we can
     // no longer key initialization off of (blk_k0 == 0).
-    clear(tArA);
-    fill(tA_max, cutlass::platform::numeric_limits<ElementA>::lowest());
-    clear(tA_sum);
+    // The store-only launch never touches these, and skipping the init is what lets
+    // the compiler drop the accumulator instead of keeping it live.
+    if constexpr (!(SplitStore && StaticScoreMode == 0)) {
+      clear(tArA);
+      fill(tA_max, cutlass::platform::numeric_limits<ElementA>::lowest());
+      clear(tA_sum);
+    }
 
     /* Check if */
     bool check_remainder_k = (seq_len % get<1>(TileShapeQK{}) != 0);
 
     constexpr bool SkipSplitBarrier =
-        (NoSplitBarrierMode == 1) || (NoSplitBarrierMode == 2 && ScoreBlock2D && StaticScoreMode == 1);
+        (NoSplitBarrierMode == 1) || (NoSplitBarrierMode == 2 && ScoreBlock2D && StaticScoreMode >= 1);
 
-    /* Main loop, blocked in k -- outer loop steps whole groups of QKGroup blocks. */
+    /* Main loop, blocked in k -- outer loop steps whole groups of KGrp blocks. */
     const int k_end = cute::min(blk_k1, kblocks_cache);
-    for (int K_grp = blk_k0; K_grp < k_end; K_grp += QKGroup) {
-      /* GEMM 1 for the whole group: one pass of Q loads feeds QKGroup K blocks, so
-         Q is read seq_kv/(TILED_KV*QKGroup) times instead of seq_kv/TILED_KV. */
-      if constexpr (!(ScoreBlock2D && StaticScoreMode == 1)) {
-        int grp_page_idx[QKGroup];
+    for (int K_grp = blk_k0; K_grp < k_end; K_grp += KGrp) {
+      /* GEMM 1 for the whole group: one pass of Q loads feeds KGrp K blocks, so
+         Q is read seq_kv/(TILED_KV*KGrp) times instead of seq_kv/TILED_KV. */
+      if constexpr (!(ScoreBlock2D && StaticScoreMode >= 1)) {
+        int grp_page_idx[KGrp];
         CUTLASS_PRAGMA_UNROLL
-        for (int g = 0; g < QKGroup; g++) {
+        for (int g = 0; g < KGrp; g++) {
           // Clamp the tail so a short final group re-reads a valid page instead of
           // running off the end; those lanes' results are simply never consumed.
           int Kg = cute::min(K_grp + g, k_end - 1);
@@ -486,11 +537,11 @@ struct FMHAFwdMainloop<
           // 256KB at head_dim=512 -- right at L1 capacity -- so a straight 0..nD-1
           // walk evicts the front of Q before it comes back around. Costs no extra
           // registers, unlike widening TILED_KV or grouping K blocks.
-          const int D = (ZigzagD && ((K_grp / QKGroup) & 1)) ? (nD - 1 - Di) : Di;
+          const int D = (ZigzagD && ((K_grp / KGrp) & 1)) ? (nD - 1 - Di) : Di;
           copy(copy_q, tQgQ(_, _, _, D), tQrQ);
           reorder(tQrQ, tSrQ);
           CUTLASS_PRAGMA_UNROLL
-          for (int g = 0; g < QKGroup; g++) {
+          for (int g = 0; g < KGrp; g++) {
             copy(copy_k_cache, tKgK_cache(_, _, _, grp_page_idx[g], D), tKrK);
             reorder(tKrK, tSrK);
             cute::gemm(mma_qk, tSrQ, tSrK, tSrS_grp[g]);
@@ -499,7 +550,7 @@ struct FMHAFwdMainloop<
       }
 
       CUTLASS_PRAGMA_UNROLL
-      for (int g = 0; g < QKGroup; g++) {
+      for (int g = 0; g < KGrp; g++) {
         const int K = K_grp + g;
         if (K >= k_end) {
           break;
@@ -522,21 +573,24 @@ struct FMHAFwdMainloop<
           next_page_idx = get_physical_k_tile(next_page_idx, l_coord, seq_len_kv_cache);
         }
 
-        if constexpr (ScoreBlock2D && StaticScoreMode == 1) {
+        if constexpr (ScoreBlock2D && StaticScoreMode >= 1) {
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
           copy(copy_score_load, tScoreLoadG(_, _, _, K), tScoreLoadR);
           reorder(tScoreLoadR, tSrS);
 #endif
         }
 
-        /* V prefetch for GEMM 2 */
-        CUTLASS_PRAGMA_UNROLL
-        for (int VV = 0; VV < VTiles; VV++) {
-          prefetch(prefetch_v_cache, pVgV_cache(_, _, _, VV, page_idx));
+        /* V prefetch for GEMM 2 -- the store-only launch runs no GEMM2, so V never
+           enters its cache footprint. */
+        if constexpr (!(SplitStore && StaticScoreMode == 0)) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int VV = 0; VV < VTiles; VV++) {
+            prefetch(prefetch_v_cache, pVgV_cache(_, _, _, VV, page_idx));
+          }
         }
 
         /* Causal masking */
-        if constexpr (CausalMask && !(ScoreBlock2D && StaticScoreMode == 1)) {
+        if constexpr (CausalMask && !(ScoreBlock2D && StaticScoreMode >= 1)) {
           if (need_causal) {
             int lane_id = thr_id % intel::sg_size;
             constexpr int sg_tile_q = get<0>(TileShapeQK{}) / SGPerWG::value;
@@ -563,7 +617,7 @@ struct FMHAFwdMainloop<
         }
 
         /* Local/sliding window masking */
-        if constexpr (LocalMask && !(ScoreBlock2D && StaticScoreMode == 1)) {
+        if constexpr (LocalMask && !(ScoreBlock2D && StaticScoreMode >= 1)) {
           Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
           Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
           auto cS_thread = thr_mma_qk.partition_C(gP);
@@ -610,28 +664,38 @@ struct FMHAFwdMainloop<
         }
 #endif
 
-        /* Apply softmax and scaling (tA rescaling fused into GEMM2 VTile loop) */
-        ElementS softmax_scale = params.scale;
-        auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum, softmax_scale);
-        reorder(tSrS, tArP);
+        // Store-only launch: the scores are on their way to the scratch and no output
+        // tile belongs to this launch, so skip softmax and GEMM2 entirely. Leaving the
+        // O accumulator untouched is the point -- it is what frees the registers.
+        if constexpr (!(SplitStore && StaticScoreMode == 0)) {
+          /* Apply softmax and scaling (tA rescaling fused into GEMM2 VTile loop) */
+          ElementS softmax_scale = params.scale;
+          auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum, softmax_scale);
+          reorder(tSrS, tArP);
 
-        /* GEMM 2: A += P * V, split in v dimension. */
-        CUTLASS_PRAGMA_UNROLL
-        for (int VV = 0; VV < VTiles; VV++) {
-          copy(copy_v_cache, tVgV_cache(_, _, _, VV, page_idx), tVrV);
-          reorder(tVrV, tArV);
-          if (K != blk_k0) {
-            CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < tArA.size() / VTiles; i++) {
-              tArA(_, _, _, VV)(i) *= broadcast<0>(rescale, tArA, i);
+          /* GEMM 2: A += P * V, split in v dimension. */
+          CUTLASS_PRAGMA_UNROLL
+          for (int VV = 0; VV < VTiles; VV++) {
+            copy(copy_v_cache, tVgV_cache(_, _, _, VV, page_idx), tVrV);
+            reorder(tVrV, tArV);
+            if (K != blk_k0) {
+              CUTLASS_PRAGMA_UNROLL
+              for (int i = 0; i < tArA.size() / VTiles; i++) {
+                tArA(_, _, _, VV)(i) *= broadcast<0>(rescale, tArA, i);
+              }
             }
+            cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
           }
-          cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
         }
 
         /* K prefetch */
-        if constexpr (!(ScoreBlock2D && StaticScoreMode == 1)) {
-          for (int D = 0; D < size<4>(pKgK); D++) {
+        if constexpr (!(ScoreBlock2D && StaticScoreMode >= 1)) {
+          const int nPf = size<4>(pKgK);
+          // Match the head-dim order the *next* group will walk in, so its first
+          // chunk is the first one prefetched rather than the last.
+          const bool rev = PfZigzag && ZigzagD && (((K_grp / KGrp) + 1) & 1);
+          for (int Di = 0; Di < nPf; Di++) {
+            const int D = rev ? (nPf - 1 - Di) : Di;
             prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
           }
         }

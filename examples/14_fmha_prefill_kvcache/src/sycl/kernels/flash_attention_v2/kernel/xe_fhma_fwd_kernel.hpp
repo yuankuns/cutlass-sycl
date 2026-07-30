@@ -72,7 +72,10 @@ template <
     // case (no causal/local mask, no sink); prefill keeps the default (false)
     // and is therefore unaffected.
     bool PackGQA_ = false,
-    int StaticScoreMode_ = -1>
+    int StaticScoreMode_ = -1,
+    // Number of output tiles covering the head dimension. In the ScoreBlock2D path
+    // this equals the number of launches, and StaticScoreMode_ indexes both.
+    int OutputTiles_ = 2>
 class XeFMHAFwdKernel {
  public:
   //
@@ -92,7 +95,9 @@ class XeFMHAFwdKernel {
       VarLenVLayoutStep_,
       VarLenOLayoutStep_,
       PackGQA_,
-      ScoreMode>;
+      ScoreMode,
+      OutputTiles_>;
+  static constexpr int kOutputTiles = OutputTiles_;
   // Mainloop derived types
   using CollectiveMainloop = CollectiveMainloop_;
   using MainloopArguments = typename CollectiveMainloop::Arguments;
@@ -336,8 +341,15 @@ class XeFMHAFwdKernel {
       // Mix-batch dispatch: skip batches not owned by this kernel launch.
       if (p.skip_batch_mask != nullptr && p.skip_batch_mask[idx_b]) continue;
       if constexpr (CollectiveMainloop::ScoreBlock2D) {
-        static_assert(StaticScoreMode_ == 0 || StaticScoreMode_ == 1);
-        blk_v = StaticScoreMode_;
+        // One launch per output tile: mode 0 computes GEMM1 and stores the scores,
+        // every later mode reloads them. The mode index doubles as the output tile
+        // index, so the number of launches must equal the number of output tiles --
+        // see kOutputTiles in the runner.
+        // With a split store launch, mode 0 owns no output tile and modes 1..N map to
+        // tiles 0..N-1, so there is one more launch than there are tiles.
+        static constexpr int kModeToTile = CollectiveMainloop::SplitStore ? 1 : 0;
+        static_assert(StaticScoreMode_ >= 0 && StaticScoreMode_ < OutputTiles_ + kModeToTile);
+        blk_v = StaticScoreMode_ > kModeToTile ? StaticScoreMode_ - kModeToTile : 0;
       }
       auto blk_qv = make_coord(blk_q, blk_v);
       // PackGQA: the scheduler grids over KV heads, so head_q already is the KV
@@ -506,6 +518,11 @@ class XeFMHAFwdKernel {
 
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
         sycl::group_barrier(get_work_group<3>());
+      }
+
+      // The store-only launch produced no O accumulator, so it has nothing to write.
+      if constexpr (CollectiveMainloop::SplitStore && StaticScoreMode_ == 0) {
+        continue;
       }
 
       // Epilogue

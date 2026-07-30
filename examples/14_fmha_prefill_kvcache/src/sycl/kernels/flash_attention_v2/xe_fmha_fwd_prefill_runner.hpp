@@ -371,11 +371,22 @@ struct PrefillRunner {
 
     // Run
     if constexpr (CollectiveMainloop::ScoreBlock2D) {
-      using ScoreStoreKernel = typename FMHAPrefillKernel::template WithStaticScoreMode<0>;
-      using ScoreLoadKernel = typename FMHAPrefillKernel::template WithStaticScoreMode<1>;
-
-      launch<ScoreStoreKernel>(ScoreStoreKernel::to_underlying_arguments(arguments, workspace_ptr));
-      launch<ScoreLoadKernel>(ScoreLoadKernel::to_underlying_arguments(arguments, workspace_ptr));
+      // One launch per output tile. Mode 0 runs GEMM1 and stores the scores; modes
+      // 1..kLaunches-1 reload them for their own slice of the head dimension.
+      // Must cover every tile: a missing launch leaves that slice of O unwritten,
+      // which shows up as a correctness failure rather than a crash.
+      // One launch per output tile, plus one more when the store is split off into a
+      // launch that owns no tile (see FMHA_PREFILL_SPLIT_STORE).
+      static constexpr int kLaunches =
+          FMHAPrefillKernel::kOutputTiles + (CollectiveMainloop::SplitStore ? 1 : 0);
+      static_assert(kLaunches >= 2, "ScoreBlock2D needs at least a store and a load launch");
+      auto launch_mode = [&](auto mode) {
+        using ScoreKernel = typename FMHAPrefillKernel::template WithStaticScoreMode<decltype(mode)::value>;
+        launch<ScoreKernel>(ScoreKernel::to_underlying_arguments(arguments, workspace_ptr));
+      };
+      [&]<int... Modes>(cute::integer_sequence<int, Modes...>) {
+        (launch_mode(cute::C<Modes>{}), ...);
+      }(cute::make_integer_sequence<int, kLaunches>{});
     } else {
       launch<FMHAPrefillKernel>(FMHAPrefillKernel::to_underlying_arguments(arguments, workspace_ptr));
     }
@@ -390,6 +401,10 @@ template <
     typename TileShapePV,
     typename TileShapeOutput,
     typename SubgroupLayoutQK,
+    // Padded full head-dim of O. TileShapeOutput may cover only part of it, in which
+    // case the head dim is walked by several output tiles, each needing its own
+    // launch in the ScoreBlock2D path. 0 means "one tile covers everything".
+    int PaddedHeadDimVO = 0,
     typename SubgroupLayoutPV_ = void, /* void -> default */
     int PipelineStages = 2,            // TODO: This is hard-coded as 1 in kernel.
     bool persistent = false,
@@ -407,6 +422,12 @@ template <
     typename GmemTiledCopyV = void,
     typename GmemTiledCopyO = void>
 struct FMHAConfig {
+  // How many output tiles tile the head dimension, and therefore how many launches the
+  // ScoreBlock2D path needs: launch i owns output tile i, and only launch 0 runs GEMM1
+  // and stores the scores. Getting this wrong is silent: with fewer launches than
+  // tiles, the unvisited tiles of O are simply never written.
+  static constexpr int kOutputTiles =
+      PaddedHeadDimVO == 0 ? 1 : ceil_div(PaddedHeadDimVO, get<1>(TileShapeOutput{}));
   static constexpr int SGTileQ = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})))();
   using MMAOperation = cute::conditional_t<
       is_void_v<MMAOperation_>,
@@ -489,7 +510,10 @@ struct FMHAConfig {
             Step<_2, _0, _1, _3>,
             Step<_2, _0, _1, _3>,
             Step<_0, _2, _1, _3>,
-            Step<_2, _0, _1, _3>>>;
+            Step<_2, _0, _1, _3>,
+            /*PackGQA=*/false,
+            /*StaticScoreMode=*/-1,
+            kOutputTiles>>;
 
     PrefillRunner<FMHAPrefillKernel, isVarLen> kernel;
 
