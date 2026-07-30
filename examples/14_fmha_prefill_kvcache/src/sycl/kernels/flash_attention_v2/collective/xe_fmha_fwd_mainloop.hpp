@@ -316,6 +316,16 @@
 #define FMHA_PREFILL_D_SKEW 1
 #endif
 
+// Apply the same per-subgroup rotation to GEMM2's V-tile prefetch. Separate from D_SKEW so
+// the two can be attributed independently: D_SKEW only touches GEMM1, and the score-load
+// launch (k1, 4.65 of the 22.6 ms) contains no GEMM1 at all, so if simultaneity also costs
+// there it has to be reachable from the V side. Prefetch order is free to permute -- it
+// feeds no DPAS -- unlike GEMM2's VTiles *consume* loop, whose accumulator index must stay
+// a compile-time constant.
+#ifndef FMHA_PREFILL_V_PF_SKEW
+#define FMHA_PREFILL_V_PF_SKEW 0
+#endif
+
 namespace cutlass::fmha {
 
 template <int Stages>
@@ -626,6 +636,8 @@ struct FMHAFwdMainloop<
   // which pins specific chunks in registers and so requires a fixed per-subgroup order.
   static constexpr int DSkew = FMHA_PREFILL_D_SKEW;
   static_assert(DSkew == 0 || FMHA_PREFILL_Q_RESIDENT == 0, "D_SKEW and Q_RESIDENT are exclusive");
+  // Per-subgroup rotation of GEMM2's V-tile *prefetch* order; 0 = off.
+  static constexpr int VPfSkew = FMHA_PREFILL_V_PF_SKEW;
   static constexpr bool PfZigzag = FMHA_PREFILL_PF_ZIGZAG;
   static constexpr int InitPfDepth = FMHA_PREFILL_INIT_PF_DEPTH;
   static constexpr int NoSplitBarrierMode = FMHA_PREFILL_NO_SPLIT_BARRIER;
@@ -1181,13 +1193,30 @@ struct FMHAFwdMainloop<
       // issuing all of them here just evicts the ones GEMM1 needs first.
       const int nQpf = InitPfDepth > 0 ? cute::min(int(size<3>(pQgQ)), InitPfDepth) : int(size<3>(pQgQ));
       const int nKpf = InitPfDepth > 0 ? cute::min(int(size<4>(pKgK)), InitPfDepth) : int(size<4>(pKgK));
-      for (int D = 0; D < nQpf; D++) {
+      // Same skew as the in-loop prefetch and the loads: start each subgroup at the chunk
+      // it will consume first, and stop all 32 from issuing one address at one instant.
+      const int sg = int(thr_id / intel::sg_size);
+      for (int Di = 0; Di < nQpf; Di++) {
+        int D = Di;
+        if constexpr (DSkew > 0) {
+          D += (sg * DSkew) % nQpf;
+          if (D >= nQpf) {
+            D -= nQpf;
+          }
+        }
         prefetch(prefetch_q, pQgQ(_, _, _, D));
       }
       bool has_prefetch_k = blk_k0 < blk_k1 && blk_k0 < kblocks_cache;
       if (has_prefetch_k) {
-        int const prefetch_page_idx = IdentityPagedKV ? blk_k0 : next_page_idx;
-        for (int D = 0; D < nKpf; D++) {
+        int const prefetch_page_idx = (!PagedKV || IdentityPagedKV) ? blk_k0 : next_page_idx;
+        for (int Di = 0; Di < nKpf; Di++) {
+          int D = Di;
+          if constexpr (DSkew > 0) {
+            D += (sg * DSkew) % nKpf;
+            if (D >= nKpf) {
+              D -= nKpf;
+            }
+          }
           prefetch(prefetch_k_cache, pKgK_cache(_, _, _, prefetch_page_idx, D));
         }
       }
@@ -1520,7 +1549,13 @@ struct FMHAFwdMainloop<
            enters its cache footprint. */
         if constexpr (!(SplitStore && StaticScoreMode == 0)) {
           CUTLASS_PRAGMA_UNROLL
-          for (int VV = 0; VV < VTiles; VV++) {
+          for (int VVi = 0; VVi < VTiles; VVi++) {
+            // Prefetch only -- the tile index need not be a compile-time constant here,
+            // unlike the consume loop below where it indexes the accumulator.
+            int VV = VVi;
+            if constexpr (VPfSkew > 0) {
+              VV = (VVi + int(thr_id / intel::sg_size) * VPfSkew) % VTiles;
+            }
             prefetch(prefetch_v_cache, pVgV_cache(_, _, _, VV, page_idx));
           }
         }
@@ -1662,10 +1697,19 @@ struct FMHAFwdMainloop<
         if constexpr (!(ScoreBlock2D && StaticScoreMode >= 1)) {
           if (K + 1 < k_end) {
             const int nPf = size<4>(pKgK);
-            // Match the head-dim order the next group will walk in.
+            // Match the head-dim order the *next* group will walk in, so its first
+            // chunk is the first one prefetched rather than the last.
             const bool rev = PfZigzag && ZigzagD && (((K_grp / KGrp) + 1) & 1);
+            // Skew the prefetch order to match the skewed consume order.
+            const int pf_skew = (DSkew > 0) ? (int(thr_id / intel::sg_size) * DSkew) % nPf : 0;
             for (int Di = 0; Di < nPf; Di++) {
-              const int D = rev ? (nPf - 1 - Di) : Di;
+              int D = rev ? (nPf - 1 - Di) : Di;
+              if constexpr (DSkew > 0) {
+                D += pf_skew;
+                if (D >= nPf) {
+                  D -= nPf;
+                }
+              }
               prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
             }
           }
