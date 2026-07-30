@@ -121,15 +121,19 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
   // is per-mode here rather than in TILED_Q. 32 rows per subgroup (STORE_TILED_Q=1024)
   // collapses to 27 TFLOPS, so 16 is the optimum, not simply "taller".
   //
-  // KNOWN LIMITATION, which is why this ships off: causal shapes whose seq_len_kv is not
-  // a multiple of 8 are wrong (measured bad>0 at sk = 333/511/700/777, bad=0 at
-  // 320/512/768/784/800/1000/4096; non-causal is correct at every sk). Two DPAS M-blocks
-  // per subgroup already moved the causal mask to the coordinate-tensor form and the K
-  // loop bound to Q-tile granularity, and both are necessary -- but something in the
-  // remainder-K interaction is still tied to one M-block. A padded score row pitch was
-  // built and measured twice: it changes no bad count at all, so it is refuted.
-  // Also regresses mid/small shapes on launch count: 36.8 at sq2048 and 34.3 at
-  // b4/sq1024 against 47.6/40.3, even though its own GEMM1 launch is faster there too.
+  // Correct on every shape swept (sq/sk in {128..4096} x {333,511,512,700,777,1024,
+  // 2048,4096}, causal and not, b1/b2). Getting there needed three things beyond the
+  // tile itself, all because two DPAS M-blocks per subgroup break the assumption that a
+  // subgroup's rows are one contiguous run: the causal mask on tile-shaped coordinates,
+  // the K-loop bound at Q-tile granularity, and the score region addressed by tile
+  // coordinate rather than by an offset base pointer.
+  //
+  // Still ships off for one reason: it regresses mid/small shapes on launch count --
+  // 36.0 at sq2048 and 34.3 at b4/sq1024 against 42.8/40.6 -- even though its own GEMM1
+  // launch is faster there too. The third launch's fixed cost dominates short
+  // sequences, so enabling it wants a runtime seqlen threshold, not a compile-time
+  // default. It is also a loss on causal at sq4096 (83.7 vs 88.7): causal already
+  // halves GEMM1's work, so the launch it adds costs more than the DPAS reuse saves.
 #ifndef FMHA_PREFILL_STORE_TILED_Q
 #define FMHA_PREFILL_STORE_TILED_Q @STORE_TILED_Q@
 #endif

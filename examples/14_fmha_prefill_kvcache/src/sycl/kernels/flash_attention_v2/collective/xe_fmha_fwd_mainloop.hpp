@@ -1724,12 +1724,24 @@ struct FMHAFwdMainloop<
               // rows -- which showed up as bad>0 on causal shapes only, and only where the
               // Q extent spans more than one tile. Ask the MMA where each element lives
               // instead; same predicate, coordinates from the partitioner.
-              Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
-              Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
-              auto cS_thread = thr_mma_qk.partition_C(gP);
+              //
+              // Partition a *tile-shaped* identity tensor (cP) and add the block offsets
+              // by hand, rather than slicing a (seq_len, seq_len) one. local_tile on the
+              // big tensor is only meaningful while both its extents cover the tiles being
+              // indexed, and its shape is the K length on *both* modes -- so as soon as
+              // seq_len_qo exceeds seq_len the Q coordinates run past the extent and
+              // alias. That is exactly the observed signature: wrong only for causal (the
+              // sole consumer of these coordinates), only at SGTileQBlocks > 1 (the closed
+              // form below computes coordinates arithmetically and is immune), and varying
+              // with seq_len's divisibility.
+              auto cS_thread = thr_mma_qk.partition_C(cP);
+              const int row_off = get<0>(blk_qv) * get<0>(TileShapeQK{});
+              const int col_off = K * get<1>(TileShapeQK{});
               CUTLASS_PRAGMA_UNROLL
               for (int i = 0; i < tSrS.size(); ++i) {
-                if (get<1>(cS_thread(i)) > get<0>(cS_thread(i)) + full_tile_offset) {
+                const int row = get<0>(cS_thread(i)) + row_off;
+                const int col = get<1>(cS_thread(i)) + col_off;
+                if (col > row + full_tile_offset) {
                   tSrS(i) = ElementS(-INFINITY);
                 }
               }
