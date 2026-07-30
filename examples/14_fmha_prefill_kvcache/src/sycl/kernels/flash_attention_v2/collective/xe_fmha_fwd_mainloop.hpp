@@ -300,8 +300,17 @@
 // 640/704 -> 704/768, i.e. this does not fight the register wall that refuted the rest.
 // skew=1 is the default-worthy value; larger strides spread addresses further but give
 // fewer distinct chunks, and measure slightly worse.
+//
+// **Default ON at 1**, because the gain holds across every shape measured and never
+// regresses (b1/hq32/sq2048 42.78 -> 43.33, b1/hq32/sq4096 47.68 -> 48.67, b2/hq32/sq2048
+// 45.68 -> 46.24, b1/hq16/sq4096 46.73 -> 47.29, b4/hq32/sq1024 39.18 -> 40.14).
+//
+// It composes with nothing that costs registers, which follows from *why* it is free: it
+// changes only traversal order. Combining it with QK_GROUP=2 spills 7.6KB and gives 23.8
+// TFLOPS; with TILED_KV=96 it spills 4.9KB and gives 24.4. Skew does not buy headroom for
+// the variants the register wall already refuted -- do not retry them with it enabled.
 #ifndef FMHA_PREFILL_D_SKEW
-#define FMHA_PREFILL_D_SKEW 0
+#define FMHA_PREFILL_D_SKEW 1
 #endif
 
 namespace cutlass::fmha {
