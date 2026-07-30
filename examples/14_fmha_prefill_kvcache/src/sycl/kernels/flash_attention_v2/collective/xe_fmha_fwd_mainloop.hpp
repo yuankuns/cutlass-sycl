@@ -38,6 +38,7 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "fmha_fusion.hpp"
+#include "xe_fmha_cache_hint_copy.hpp"
 
 #ifndef FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
 #define FMHA_PREFILL_ENABLE_SCORE_BLOCK2D 0
@@ -187,6 +188,27 @@
 // removed more than the Q term.
 #ifndef FMHA_PREFILL_Q_RESIDENT
 #define FMHA_PREFILL_Q_RESIDENT 0
+#endif
+
+// Give the ScoreBlock2D workspace accesses explicit LSC cache hints: store `.uc.wb` (do
+// not allocate in L1, but keep it in L3 for the reader) and load `.st.ca` (streaming, so
+// the single-use score lines do not evict Q/K).
+//
+// The score round-trip's *bandwidth* is nearly free (see the workspace measurement), but
+// its L1 *footprint* is not: it shares the cache with the Q/K re-reads that bound this
+// kernel. This is the one lever that cuts the re-read cost without moving any operand,
+// which is why it survives after the tile sweep, N-split, K SLM staging, KSTEP, grouping
+// and Q register residency were all refuted. It needs inline asm, hence its own header
+// and its own branch.
+#ifndef FMHA_PREFILL_SCORE_CACHE_HINT
+#define FMHA_PREFILL_SCORE_CACHE_HINT 0
+#endif
+
+// Same mechanism aimed at the actual bottleneck: hint the K-cache loads instead of the score
+// surface. K is the operand whose L1 requests are NUM_SG-redundant, so a streaming hint on K
+// is the only known way to reduce its interference with the Q re-reads without moving data.
+#ifndef FMHA_PREFILL_K_HINT
+#define FMHA_PREFILL_K_HINT 0
 #endif
 
 namespace cutlass::fmha {
@@ -362,9 +384,16 @@ struct FMHAFwdMainloop<
   using TensorV_cache = TensorV_cache_;
   using TensorK_cache2D = decltype(TensorK_cache_{}(append<rank_v<TensorK_cache_>>(make_coord(_, _), 0)));
   using TensorV_cache2D = decltype(TensorV_cache_{}(append<rank_v<TensorV_cache_>>(make_coord(_, _), 0)));
+  // K's L1 request volume is NUM_SG x its footprint (every subgroup loads the whole block),
+  // and those requests evict the Q lines that must survive the block. FMHA_PREFILL_K_HINT
+  // marks the K loads streaming so the cache stops retaining them; it changes no data
+  // movement at all, unlike SLM staging or an N split (both measured and refuted).
   using TiledCopyK_cache = conditional_t<
       is_void_v<TiledCopyK_cache_>,
-      decltype(make_block_2d_copy_B(TiledMMAQK{}, TensorK_cache2D{})),
+      conditional_t<
+          FMHA_PREFILL_K_HINT != 0,
+          decltype(make_block_2d_copy_B_hinted(TiledMMAQK{}, TensorK_cache2D{})),
+          decltype(make_block_2d_copy_B(TiledMMAQK{}, TensorK_cache2D{}))>,
       TiledCopyK_cache_>;
   using TiledCopyV_cache = conditional_t<
       is_void_v<TiledCopyV_cache_>,
@@ -424,6 +453,7 @@ struct FMHAFwdMainloop<
   // Keep the subgroup's whole Q slice live across the K loop. Only meaningful in launches
   // that actually run GEMM1: the ScoreBlock2D load launches reload S from the scratch, so
   // there they would hold Q fragments nothing reads.
+  static constexpr bool ScoreCacheHint = ScoreBlock2D && FMHA_PREFILL_SCORE_CACHE_HINT;
   static constexpr int QResidentChunks = FMHA_PREFILL_Q_RESIDENT;
   static constexpr bool QResident = QResidentChunks > 0;
   // Residency replaces the per-block Q load outright, so it subsumes grouping; allowing
@@ -600,8 +630,24 @@ struct FMHAFwdMainloop<
     TiledMMAQK mma_qk{};
     TiledMMAPV mma_pv{};
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
-    auto copy_score_store = make_block_2d_copy_D(mma_qk, Score);
-    auto copy_score_load = make_block_2d_copy_C(mma_qk, Score);
+    // The score scratch is written once and read once, so it has no reason to occupy L1 --
+    // where it only evicts the Q/K lines GEMM1 re-reads. FMHA_PREFILL_SCORE_CACHE_HINT
+    // swaps in block-2D ops that carry an explicit LSC hint saying so; see
+    // xe_fmha_cache_hint_copy.hpp for why this is reachable from kernel code at all.
+    auto copy_score_store = [&] {
+      if constexpr (ScoreCacheHint) {
+        return make_block_2d_copy_D_hinted(mma_qk, Score);
+      } else {
+        return make_block_2d_copy_D(mma_qk, Score);
+      }
+    }();
+    auto copy_score_load = [&] {
+      if constexpr (ScoreCacheHint) {
+        return make_block_2d_copy_C_hinted(mma_qk, Score);
+      } else {
+        return make_block_2d_copy_C(mma_qk, Score);
+      }
+    }();
 #endif
 
     /* Slice TiledCopy/TiledMMA operations down to to work-item level */
