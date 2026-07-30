@@ -74,8 +74,44 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
   // HEAD_DIM is not a multiple of 32 (e.g. HEAD_DIM=72 -> 96, VTiles=3). The actual O surface is
   // bounded by head_size_vo, so HW clips the OOB tail writes in the epilogue.
   using TileShapeOutput = cute::Shape<cute::Int<@TILED_Q@>, cute::Int<@TILED_OUT@>>;
-  using SubgroupLayoutQK =
-      cute::Layout<cute::Shape<cute::Int<@NUM_SG@>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+  // Subgroup split of the Q*K tile. The default splits M (Q rows) only, so every
+  // subgroup loads the whole K block: K's L1 request volume is NUM_SG x its footprint.
+  // FMHA_PREFILL_N_SPLIT_512 moves that many subgroups onto the N (K-sequence) axis
+  // instead, cutting each subgroup's K footprint by the same factor.
+  //
+  // N is GEMM2's reduction dimension, so each subgroup then holds only a partial
+  // row-max/row-sum and a partial O. Contrary to the earlier note that this needed a
+  // cross-subgroup combine to be written, the epilogue already has one: its ReduceK
+  // path (SharedStorageReduceK) auto-engages when size<3>(TiledMMAPV::ThrLayoutVMNK)
+  // > 1, reducing the maxima, rescaling each subgroup's sums onto the combined max,
+  // and summing O through SLM. The missing-reduction diagnosis was wrong.
+  //
+  // MEASURED AND REJECTED anyway, kept default-off (=1) as a recorded refutation.
+  // N_SPLIT=2 compiles but *hangs* (RC=124) at the smallest verify shape, with
+  // ScoreBlock2D both on and off, so the deadlock is in neither the mask nor the score
+  // path. The register cost is what makes it unsalvageable regardless: splitting N
+  // halves each subgroup's K-sequence slice but leaves its Q rows -- and therefore the
+  // full-height O accumulator -- untouched, while doubling the subgroups that each need
+  // one. Spill goes from ~700 B/thread to 6656-12672 at TILED_OUT=256 and
+  // 24704-26944 at TILED_OUT=512. The prize was the 3.3 TFLOPS the pin-K probe
+  // measured; 6-27 KB/thread of spill costs far more (cf. TILED_KV=128, TILED_Q=512).
+  //
+  // Note the two masks in the mainloop also hard-code an M-only split (the causal mask
+  // derives its row base from thr_id/sg_size and gives the column no per-subgroup
+  // offset), so they would need the coordinate-tensor form to be correct here. That
+  // rewrite was tried, verified bit-identical at N_SPLIT=1, and reverted: it costs 6%
+  // on causal shapes (90.3 -> 84.7 TFLOPS at b1/hq32/sq4096), which is not worth
+  // paying for a refuted variant.
+#ifndef FMHA_PREFILL_N_SPLIT_512
+#define FMHA_PREFILL_N_SPLIT_512 1
+#endif
+  static_assert(@NUM_SG@ % FMHA_PREFILL_N_SPLIT_512 == 0, "N split must divide NUM_SG");
+  static_assert(
+      cute::Int<@TILED_KV@>{} % (16 * FMHA_PREFILL_N_SPLIT_512) == 0,
+      "each subgroup's N slice must stay a whole number of DPAS blocks");
+  using SubgroupLayoutQK = cute::Layout<
+      cute::Shape<cute::Int<@NUM_SG@ / FMHA_PREFILL_N_SPLIT_512>, cute::Int<FMHA_PREFILL_N_SPLIT_512>, cute::_1>,
+      cute::Stride<cute::_1, cute::Int<@NUM_SG@ / FMHA_PREFILL_N_SPLIT_512>, cute::_1>>;
 
 #if @HEAD_DIM@ == 64
   AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
