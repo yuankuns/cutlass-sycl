@@ -13,6 +13,12 @@ FILTER="${FMHA_PREFILL_FILTER:-}"
 SUITE="${FMHA_PREFILL_SUITE:-tile,chunk,perf}"
 PAGED_HD128_TILE_Q="${FMHA_PREFILL_PAGED_HD128_TILE_Q:-128}"
 PAGED_HD128_TILE_KV="${FMHA_PREFILL_PAGED_HD128_TILE_KV:-64}"
+PAGED_HD192_TILE_Q="${FMHA_PREFILL_PAGED_HD192_TILE_Q:-128}"
+PAGED_HD256_TILE_Q="${FMHA_PREFILL_PAGED_HD256_TILE_Q:-128}"
+PAGED_HD256_LARGE_MIN_Q="${FMHA_PREFILL_PAGED_HD256_LARGE_MIN_Q:-129}"
+NP_HD96_SMALL_MAX_Q="${FMHA_PREFILL_NP_HD96_SMALL_MAX_Q:-32}"
+NP_HD96_TILE_Q="${FMHA_PREFILL_NP_HD96_TILE_Q:-128}"
+NP_HD96_LARGE_MIN_Q="${FMHA_PREFILL_NP_HD96_LARGE_MIN_Q:-512}"
 
 usage() {
   cat <<EOF
@@ -398,15 +404,46 @@ run_tile_boundary_family "tile.paged_hd128_q${PAGED_HD128_TILE_Q}_k${PAGED_HD128
 run_tile_boundary_family "tile.nonpaged_hd128_q256_k32" \
   0 64 1 2 1 128 128 256 32
 
-run_case "tile.paged_hd256_q_tile_minus1" \
-  --batch 1 --seqlen-q 255 --seqlen-k 512 --heads-q 2 --heads-kv 1 \
+run_case "tile.paged_hd192_q${PAGED_HD192_TILE_Q}_minus1" \
+  --batch 1 --seqlen-q "$((PAGED_HD192_TILE_Q - 1))" --seqlen-k 512 --heads-q 2 --heads-kv 1 \
+  --head-dim 192 --head-dim-v 192 --paged 1 --page-size 64 --causal 1
+run_case "tile.paged_hd192_q${PAGED_HD192_TILE_Q}" \
+  --batch 1 --seqlen-q "$PAGED_HD192_TILE_Q" --seqlen-k 512 --heads-q 2 --heads-kv 1 \
+  --head-dim 192 --head-dim-v 192 --paged 1 --page-size 64 --causal 1
+run_case "tile.paged_hd192_q${PAGED_HD192_TILE_Q}_plus1" \
+  --batch 1 --seqlen-q "$((PAGED_HD192_TILE_Q + 1))" --seqlen-k 512 --heads-q 2 --heads-kv 1 \
+  --head-dim 192 --head-dim-v 192 --paged 1 --page-size 64 --causal 1
+
+run_case "tile.paged_hd256_q${PAGED_HD256_TILE_Q}_minus1" \
+  --batch 1 --seqlen-q "$((PAGED_HD256_TILE_Q - 1))" --seqlen-k 512 --heads-q 2 --heads-kv 1 \
   --head-dim 256 --head-dim-v 256 --paged 1 --page-size 64 --causal 1
-run_case "tile.paged_hd256_q_tile" \
-  --batch 1 --seqlen-q 256 --seqlen-k 512 --heads-q 2 --heads-kv 1 \
+run_case "tile.paged_hd256_q${PAGED_HD256_TILE_Q}" \
+  --batch 1 --seqlen-q "$PAGED_HD256_TILE_Q" --seqlen-k 512 --heads-q 2 --heads-kv 1 \
   --head-dim 256 --head-dim-v 256 --paged 1 --page-size 64 --causal 1
-run_case "tile.paged_hd256_q_tile_plus1" \
-  --batch 1 --seqlen-q 257 --seqlen-k 512 --heads-q 2 --heads-kv 1 \
+run_case "tile.paged_hd256_q${PAGED_HD256_TILE_Q}_plus1" \
+  --batch 1 --seqlen-q "$((PAGED_HD256_TILE_Q + 1))" --seqlen-k 512 --heads-q 2 --heads-kv 1 \
   --head-dim 256 --head-dim-v 256 --paged 1 --page-size 64 --causal 1
+
+for q_len in "$((PAGED_HD256_LARGE_MIN_Q - 1))" "$PAGED_HD256_LARGE_MIN_Q" "$((PAGED_HD256_LARGE_MIN_Q + 1))"; do
+  run_case "tile.paged_hd256_large_q${q_len}" \
+    --batch 1 --seqlen-q "$q_len" --seqlen-k 512 --heads-q 2 --heads-kv 1 \
+    --head-dim 256 --head-dim-v 256 --paged 1 --page-size 64 --causal 1
+done
+
+for q_len in \
+  "$((NP_HD96_SMALL_MAX_Q - 1))" "$NP_HD96_SMALL_MAX_Q" "$((NP_HD96_SMALL_MAX_Q + 1))" \
+  "$((NP_HD96_TILE_Q - 1))" "$NP_HD96_TILE_Q" "$((NP_HD96_TILE_Q + 1))" \
+  "$((NP_HD96_LARGE_MIN_Q - 1))" "$NP_HD96_LARGE_MIN_Q" "$((NP_HD96_LARGE_MIN_Q + 1))"; do
+  run_case "tile.nonpaged_hd96_q${q_len}" \
+    --batch 1 --seqlen-q "$q_len" --seqlen-k 64 --heads-q 2 --heads-kv 1 \
+    --head-dim 96 --head-dim-v 96 --paged 0 --causal 0
+done
+
+for q_len in 127 128 129; do
+  run_case "tile.paged_hd96_q${q_len}" \
+    --batch 1 --seqlen-q "$q_len" --seqlen-k 256 --heads-q 2 --heads-kv 1 \
+    --head-dim 96 --head-dim-v 96 --paged 1 --page-size 64 --causal 1
+done
 
 run_case "tile.page128_k_page_minus1" \
   --batch 1 --seqlen-q 64 --seqlen-k 127 --heads-q 4 --heads-kv 1 \
@@ -427,7 +464,7 @@ fi
 if suite_enabled chunk; then
 run_chunk_family "paged_hd64" 1 64 64 4 1 128
 run_chunk_family "paged_hd128" 1 64 128 4 1 "$PAGED_HD128_TILE_Q"
-run_chunk_family "paged_hd256" 1 64 256 2 1 256
+run_chunk_family "paged_hd256" 1 64 256 2 1 "$PAGED_HD256_TILE_Q"
 run_chunk_family "nonpaged_hd128" 0 64 128 2 1 256
 
 run_case "chunk.hetero_paged_hd128_lists" \
@@ -505,6 +542,14 @@ run_perf_case "perf.model.qwen3_30b_a3b.paged_tail_sq512_sk8193" \
 run_perf_case "perf.model.flux2_dev.nonpaged_sq1024_sk1024" \
   --batch 1 --seqlen-q 1024 --seqlen-k 1024 --heads-q 8 --heads-kv 8 \
   --head-dim 128 --head-dim-v 128 --paged 0 --causal 0
+
+run_perf_case "perf.model.deepseek_ocr2.nonpaged_hd96_sq32_sk64" \
+  --batch 1 --seqlen-q 32 --seqlen-k 64 --heads-q 8 --heads-kv 8 \
+  --head-dim 96 --head-dim-v 96 --paged 0 --causal 0 --window-left 48 --window-right 16
+
+run_perf_case "perf.model.flux2_klein_9b.nonpaged_hd96_sq32_sk64" \
+  --batch 1 --seqlen-q 32 --seqlen-k 64 --heads-q 12 --heads-kv 12 \
+  --head-dim 96 --head-dim-v 96 --paged 0 --causal 0
 
 run_perf_case "perf.saturate.batch4_h32_hd128_sq1024_sk8192" \
   --batch 4 --seqlen-q 1024 --seqlen-k 8192 --heads-q 32 --heads-kv 8 \

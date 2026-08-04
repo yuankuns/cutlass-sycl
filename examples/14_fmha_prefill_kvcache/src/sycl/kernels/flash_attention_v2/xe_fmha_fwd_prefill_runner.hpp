@@ -121,6 +121,12 @@ struct Arguments {
   void* softmax_sink_ptr;
   float softcap;
 
+  // FP8 KV cache per-tensor descale. The single scalar lives on-device; the
+  // kernel dereferences these pointers so no host-side D2H sync (.item()) is
+  // needed. Null => no fp8 dequant (scale = 1.0f).
+  const float* k_scale_ptr = nullptr;
+  const float* v_scale_ptr = nullptr;
+
   // array of length b+1 holding starting offset of each sequence.
   int* __restrict__ cu_seqlens_q;
   int* __restrict__ cu_seqlens_k;
@@ -193,7 +199,8 @@ struct Arguments {
 
   bool is_bf16;
   bool is_fp32;
-  bool is_e4m3;
+  bool is_e4m3 = false;
+  bool is_e5m2 = false;
   bool is_causal;
   bool is_local;
 
@@ -359,6 +366,8 @@ struct PrefillRunner {
             stride_V_cache,
             static_cast<const typename FMHAPrefillKernel::ElementSink*>(params.softmax_sink_ptr),
             static_cast<const bool*>(params.skip_batch_mask_ptr),
+            params.k_scale_ptr,
+            params.v_scale_ptr,
         },
         mainloop_args,
         {},
@@ -604,6 +613,26 @@ struct FMHAConfig {
 
 template <int HEAD_DIM>
 struct FmhaPrefillRunner {
+  void operator()(const Arguments& params) const;
+};
+
+// Non-paged (no_page) prefill is split into its own runner type so its kernel
+// instantiations are compiled in translation units separate from the paged
+// prefill path, producing independent shared libraries and lowering peak
+// compiler memory. Non-paged prefill supports bf16 queries only (no fp8).
+template <int HEAD_DIM>
+struct FmhaPrefillNpRunner {
+  void operator()(const Arguments& params) const;
+};
+
+// FP8 KV-cache prefill path is split into its own runner type so that the
+// (heavy) e4m3/e5m2 kernel instantiations — which also fan out over
+// is_local x is_causal — are compiled in a separate translation unit from the
+// bf16 paged prefill path. This keeps the peak compiler memory of any
+// single prefill TU low (avoids OOM during AOT build). The dispatch forwards to
+// this when params.is_e4m3 || is_e5m2.
+template <int HEAD_DIM>
+struct FmhaPrefillFp8Runner {
   void operator()(const Arguments& params) const;
 };
 

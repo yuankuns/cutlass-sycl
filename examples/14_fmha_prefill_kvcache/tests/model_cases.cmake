@@ -389,9 +389,49 @@ fmha_prefill_add_case(boundary.nonpaged_hd128_k_half_plus1
   BOUNDARY
   BATCH 1 SEQLEN_Q 128 SEQLEN_K 17 HEADS_Q 2 HEADS_KV 1 HEAD_DIM 128)
 
+foreach(_q IN ITEMS 31 32 33 127 128 129 511 512 513)
+  fmha_prefill_add_case(boundary.nonpaged_hd96_q${_q}
+    BOUNDARY
+    BATCH 1 SEQLEN_Q ${_q} SEQLEN_K 64 HEADS_Q 2 HEADS_KV 1 HEAD_DIM 96)
+endforeach()
+
+foreach(_q IN ITEMS 127 128 129)
+  fmha_prefill_add_case(boundary.paged_hd96_q${_q}
+    BOUNDARY PAGED CAUSAL
+    BATCH 1 SEQLEN_Q ${_q} SEQLEN_K 256 HEADS_Q 2 HEADS_KV 1 HEAD_DIM 96 PAGE_SIZE 64)
+endforeach()
+
+math(EXPR _fmha_prefill_tiled_q_256_plus1 "${FMHA_PREFILL_TILED_Q_256} + 1")
+
+math(EXPR _fmha_prefill_tiled_q_192_minus1 "${FMHA_PREFILL_TILED_Q_192} - 1")
+math(EXPR _fmha_prefill_tiled_q_192_plus1 "${FMHA_PREFILL_TILED_Q_192} + 1")
+
+fmha_prefill_add_case(boundary.paged_hd192_q_tile_minus1
+  BOUNDARY PAGED CAUSAL
+  BATCH 1 SEQLEN_Q ${_fmha_prefill_tiled_q_192_minus1} SEQLEN_K 512 HEADS_Q 2 HEADS_KV 1 HEAD_DIM 192 PAGE_SIZE 64)
+
+fmha_prefill_add_case(boundary.paged_hd192_q_tile
+  BOUNDARY PAGED CAUSAL
+  BATCH 1 SEQLEN_Q ${FMHA_PREFILL_TILED_Q_192} SEQLEN_K 512 HEADS_Q 2 HEADS_KV 1 HEAD_DIM 192 PAGE_SIZE 64)
+
+fmha_prefill_add_case(boundary.paged_hd192_q_tile_plus1
+  BOUNDARY PAGED CAUSAL
+  BATCH 1 SEQLEN_Q ${_fmha_prefill_tiled_q_192_plus1} SEQLEN_K 512 HEADS_Q 2 HEADS_KV 1 HEAD_DIM 192 PAGE_SIZE 64)
+
 fmha_prefill_add_case(boundary.paged_hd256_q_tile_plus1
   BOUNDARY PAGED CAUSAL
-  BATCH 1 SEQLEN_Q 257 SEQLEN_K 512 HEADS_Q 2 HEADS_KV 1 HEAD_DIM 256 PAGE_SIZE 64)
+  BATCH 1 SEQLEN_Q ${_fmha_prefill_tiled_q_256_plus1} SEQLEN_K 512 HEADS_Q 2 HEADS_KV 1 HEAD_DIM 256 PAGE_SIZE 64)
+
+foreach(_q IN ITEMS 128 129 130)
+  fmha_prefill_add_case(boundary.paged_hd256_large_q${_q}
+    BOUNDARY PAGED CAUSAL
+    BATCH 1 SEQLEN_Q ${_q} SEQLEN_K 512 HEADS_Q 2 HEADS_KV 1 HEAD_DIM 256 PAGE_SIZE 64)
+endforeach()
+
+fmha_prefill_add_case(chunk.paged_hd256_large_past64_q129
+  CHUNK PAGED CAUSAL
+  BATCH 1 SEQLEN_Q 129 SEQLEN_K 193 PAST_KV 64
+  HEADS_Q 2 HEADS_KV 1 HEAD_DIM 256 PAGE_SIZE 64)
 
 fmha_prefill_add_case(boundary.page128_k_page_minus1
   BOUNDARY PAGED
@@ -484,6 +524,12 @@ fmha_prefill_add_case(append.paged.hd128_new511_large_nondiv
   BATCH 1 SEQLEN_Q 128 SEQLEN_K 8192
   CACHE_SEQLENS_OLD 7681 K_NEW_SEQLENS 511
   HEADS_Q 8 HEADS_KV 2 HEAD_DIM 128 PAGE_SIZE 128)
+
+fmha_prefill_add_case(append.paged.hd256_q256_cross_page
+  APPENDKV PAGED CAUSAL
+  BATCH 1 SEQLEN_Q 256 SEQLEN_K 383
+  CACHE_SEQLENS_OLD 127 K_NEW_SEQLENS 256
+  HEADS_Q 4 HEADS_KV 1 HEAD_DIM 256 PAGE_SIZE 64)
 
 fmha_prefill_add_case(append.nopaged.hd128_zero
   APPENDKV CAUSAL

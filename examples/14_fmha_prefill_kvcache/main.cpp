@@ -550,45 +550,134 @@ LogicalKV make_reference_kv(
 }
 
 void dispatch_prefill(const prefill::Arguments& params) {
+  const bool paged = params.page_table != nullptr;
   switch (params.d) {
 #ifdef FMHA_STANDALONE_HAS_HD_64
     case 64:
-      DISPATCH_PREFILL_KERNEL(64);
+      if (paged) {
+#ifdef FMHA_STANDALONE_HAS_PAGED_HD_64
+        DISPATCH_PREFILL_KERNEL(64);
+        return;
+#endif
+      } else {
+#ifdef FMHA_STANDALONE_HAS_NP_HD_64
+        DISPATCH_PREFILL_NOPAGE_KERNEL(64);
+        return;
+#endif
+      }
       break;
 #endif
 #ifdef FMHA_STANDALONE_HAS_HD_72
     case 72:
-      DISPATCH_PREFILL_KERNEL(72);
+      if (paged) {
+#ifdef FMHA_STANDALONE_HAS_PAGED_HD_72
+        DISPATCH_PREFILL_KERNEL(72);
+        return;
+#endif
+      } else {
+#ifdef FMHA_STANDALONE_HAS_NP_HD_72
+        DISPATCH_PREFILL_NOPAGE_KERNEL(72);
+        return;
+#endif
+      }
+      break;
+#endif
+#ifdef FMHA_STANDALONE_HAS_HD_80
+    case 80:
+      if (paged) {
+#ifdef FMHA_STANDALONE_HAS_PAGED_HD_80
+        DISPATCH_PREFILL_KERNEL(80);
+        return;
+#endif
+      } else {
+#ifdef FMHA_STANDALONE_HAS_NP_HD_80
+        DISPATCH_PREFILL_NOPAGE_KERNEL(80);
+        return;
+#endif
+      }
       break;
 #endif
 #ifdef FMHA_STANDALONE_HAS_HD_96
     case 96:
-      DISPATCH_PREFILL_KERNEL(96);
+      if (paged) {
+#ifdef FMHA_STANDALONE_HAS_PAGED_HD_96
+        DISPATCH_PREFILL_KERNEL(96);
+        return;
+#endif
+      } else {
+#ifdef FMHA_STANDALONE_HAS_NP_HD_96
+        DISPATCH_PREFILL_NOPAGE_KERNEL(96);
+        return;
+#endif
+      }
       break;
 #endif
 #ifdef FMHA_STANDALONE_HAS_HD_128
     case 128:
-      DISPATCH_PREFILL_KERNEL(128);
+      if (paged) {
+#ifdef FMHA_STANDALONE_HAS_PAGED_HD_128
+        DISPATCH_PREFILL_KERNEL(128);
+        return;
+#endif
+      } else {
+#ifdef FMHA_STANDALONE_HAS_NP_HD_128
+        DISPATCH_PREFILL_NOPAGE_KERNEL(128);
+        return;
+#endif
+      }
       break;
 #endif
 #ifdef FMHA_STANDALONE_HAS_HD_192
     case 192:
-      DISPATCH_PREFILL_KERNEL(192);
+      if (paged) {
+#ifdef FMHA_STANDALONE_HAS_PAGED_HD_192
+        DISPATCH_PREFILL_KERNEL(192);
+        return;
+#endif
+      } else {
+#ifdef FMHA_STANDALONE_HAS_NP_HD_192
+        DISPATCH_PREFILL_NOPAGE_KERNEL(192);
+        return;
+#endif
+      }
       break;
 #endif
 #ifdef FMHA_STANDALONE_HAS_HD_256
     case 256:
-      DISPATCH_PREFILL_KERNEL(256);
+      if (paged) {
+#ifdef FMHA_STANDALONE_HAS_PAGED_HD_256
+        DISPATCH_PREFILL_KERNEL(256);
+        return;
+#endif
+      } else {
+#ifdef FMHA_STANDALONE_HAS_NP_HD_256
+        DISPATCH_PREFILL_NOPAGE_KERNEL(256);
+        return;
+#endif
+      }
       break;
 #endif
 #ifdef FMHA_STANDALONE_HAS_HD_512
     case 512:
-      DISPATCH_PREFILL_KERNEL(512);
+      if (paged) {
+#ifdef FMHA_STANDALONE_HAS_PAGED_HD_512
+        DISPATCH_PREFILL_KERNEL(512);
+        return;
+#endif
+      } else {
+#ifdef FMHA_STANDALONE_HAS_NP_HD_512
+        DISPATCH_PREFILL_NOPAGE_KERNEL(512);
+        return;
+#endif
+      }
       break;
 #endif
     default:
-      throw std::runtime_error("unsupported head_dim");
+      break;
   }
+  std::ostringstream oss;
+  oss << "unsupported head_dim=" << params.d << " for " << (paged ? "paged" : "non-paged") << " prefill";
+  throw std::runtime_error(oss.str());
 }
 
 void run_prefill(

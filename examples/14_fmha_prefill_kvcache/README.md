@@ -4,10 +4,10 @@ This directory builds a C++/SYCL-only executable for the extracted SGL XPU FMHA
 prefill-with-KV-cache kernel through the sycl-tla examples CMake flow. It does not
 use Torch, Python, or the installed `sgl_kernel` extension.
 
-The CMake file generates the same `FmhaPrefillRunner<HEAD_DIM>` translation units from
-`src/sycl/xe_fmha_fwd_prefill_kernel.cpp.in`. The FMHA kernel headers needed by this
-example live under this directory, so the target does not depend on an external SGL
-checkout.
+The CMake file generates the same split paged, non-paged, and FP8 prefill
+translation units from `src/sycl/kernels/flash_attention_v2/*.cpp.in`. The FMHA
+kernel headers needed by this example live under this directory, so the target
+does not depend on an external SGL checkout.
 
 ## Build
 
@@ -35,6 +35,18 @@ by default, enables a q256/k32 path for model-sized requests with
 `seqlen_q >= 512`.  The large-shape path can be disabled with
 `-DFMHA_STANDALONE_PAGED_HD128_LARGE_TILE=OFF`; its threshold and tile sizes are
 exposed as `FMHA_STANDALONE_PAGED_HD128_LARGE_TILE_*` CMake cache variables.
+Paged `head_dim=96` uses q128/k64 with 16 subgroups. Non-paged `head_dim=96`
+uses q32/k64 with 4 subgroups through `seqlen_q=32`, q128/k64 with 16
+subgroups for intermediate requests, and q256/k64 with 16 subgroups from
+`seqlen_q=512`. The short and long paths and their thresholds are exposed as
+`FMHA_STANDALONE_NP_HD96_SMALL_*` and `FMHA_STANDALONE_NP_HD96_LARGE_*`
+CMake cache variables.
+Paged `head_dim=192` defaults to a q128/k64 tile with 16 subgroups, matching
+common `seqlen_q=128` prefill requests without a half-empty q256 work-group.
+Paged `head_dim=256` defaults to a q128/k64 tile with 16 subgroups so common
+`seqlen_q=128` prefill requests fill the Q tile instead of launching a half-full
+q256 work-group. Longer non-append requests with `seqlen_q >= 129` use q256/k64
+with 32 subgroups to preserve throughput at model-sized query lengths.
 
 Tests are enabled by default.  They are registered through CTest and remain
 C++/SYCL-only:
@@ -108,7 +120,7 @@ The program prints:
 
 - dtype: bf16 inputs/outputs, CPU float reference
 - paged KV head dims: 64, 96, 128, 192, 256, 512
-- non-paged KV head dims: 64, 72, 96, 128
+- non-paged KV head dims: 64, 72, 80, 96, 128, 192
 - optional causal/local masking
 - optional softmax sink for the paged head_dim=64 path
 - boundary sweeps for Q/KV tile tails and page-size tails

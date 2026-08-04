@@ -58,7 +58,6 @@ static sycl::event launch(typename Kernel::Params params) {
       syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<GrfSize>};
 
   compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
-
 #ifdef SGL_KERNEL_STANDALONE_NO_TORCH
   auto event =
       compat::experimental::launch<cutlass::device_kernel<Kernel>, Kernel>(policy, sgl_standalone::queue(), params);
