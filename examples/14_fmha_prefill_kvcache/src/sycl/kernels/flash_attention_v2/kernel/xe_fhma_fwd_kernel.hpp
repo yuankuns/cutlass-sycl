@@ -278,6 +278,8 @@ class XeFMHAFwdKernel {
     } else {
       score_k_extent = size_t(args.kernel.shape.seq_len_kv_cache);
     }
+    // Block-2D score load/store surfaces require a tile-aligned row pitch.
+    score_k_extent = cute::round_up(score_k_extent, size_t(get<1>(TileShapeQK{})));
     return kScoreRowsPerWG * score_k_extent * sizeof(typename CollectiveMainloop::ElementScoreStore);
   }
 
@@ -394,12 +396,24 @@ class XeFMHAFwdKernel {
 
     int thr_id = int(ThreadIdxX());
     int sub_group_id = thr_id / intel::sg_size;
-    int q_sg_tile = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})));
 
     auto cS = make_identity_tensor(take<0, 2>(TiledMMAQK{}.tile_mnk()));
     auto tScS = TiledMMAQK{}.get_slice(thr_id).partition_C(cS);
     auto q_offset_wi = get<0>(tScS(0));
-    auto q_offset_sg = group_broadcast(sycl::ext::oneapi::this_work_item::get_sub_group(), q_offset_wi, 0);
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+    auto q_offset_sg = group_broadcast(sg, q_offset_wi, 0);
+    constexpr int q_sg_tile = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})));
+    int q_offset_sg_hi = q_offset_sg + q_sg_tile - 1;
+    if constexpr (CollectiveMainloop::SGTileQBlocks > 1) {
+      if constexpr (CollectiveMainloop::CausalMask && !CollectiveMainloop::ScoreBlock2D) {
+        // M-blocks are distributed round-robin across the Q subgroups.
+        constexpr int atom_q = size<0>(typename TiledMMAQK::AtomShape_MNK{});
+        q_offset_sg_hi = q_offset_sg +
+                         (CollectiveMainloop::SGTileQBlocks - 1) *
+                             int(CollectiveMainloop::SGPerWG::value) * atom_q +
+                         atom_q - 1;
+      }
+    }
 
     TileScheduler tile_scheduler{params.scheduler};
 
@@ -471,14 +485,17 @@ class XeFMHAFwdKernel {
       // from the tile's last row and the mask threshold from its first, so both are
       // supersets of what any row in the tile needs and the mask zeroes the excess.
       // All subgroups then agree on the trip count too, which the split barrier wants.
-      constexpr bool kTileGranularCausal = CollectiveMainloop::SGTileQBlocks > 1;
+      constexpr bool kTileGranularCausal =
+          CollectiveMainloop::ScoreBlock2D && CollectiveMainloop::SGTileQBlocks > 1;
       const int causal_row_hi =
           kTileGranularCausal ? cute::min(seq_len_qo, blk_q * get<0>(TileShapeQK{}) + get<0>(TileShapeQK{})) : 0;
       const int causal_row_lo = kTileGranularCausal ? blk_q * get<0>(TileShapeQK{}) : 0;
+      const int seq_coord_hi =
+          cute::min(seq_len_qo, blk_q * get<0>(TileShapeQK{}) + q_offset_sg_hi + 1);
       const int seq_len = CollectiveMainloop::CausalMask
                               ? (kTileGranularCausal
                                      ? cute::min(seq_k_eff, full_tile_offset + causal_row_hi)
-                                     : cute::min(seq_k_eff, full_tile_offset + seq_coord + q_sg_tile))
+                                     : cute::min(seq_k_eff, full_tile_offset + seq_coord_hi))
                               : seq_k_eff;
       const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
       const int k_blocks_causal = CollectiveMainloop::CausalMask
@@ -607,6 +624,7 @@ class XeFMHAFwdKernel {
       typename CollectiveMainloop::ElementScoreStore* score_head_ptr = nullptr;
       typename CollectiveMainloop::ElementS* stats_wg_ptr = nullptr;
       int score_blk_in_region = 0;
+      int score_region_cols = 0;
       if constexpr (CollectiveMainloop::ScoreBlock2D) {
         int score_q_extent;
         int score_k_extent;
@@ -620,6 +638,8 @@ class XeFMHAFwdKernel {
           score_k_extent = int(s.seq_len_kv_cache);
           score_batch = l_coord;
         }
+        score_k_extent = cute::round_up(score_k_extent, int(get<1>(TileShapeQK{})));
+        score_region_cols = score_k_extent;
         // One block per workgroup, addressed by this workgroup's slot
         // (batch, head, blk_q). The store and load launches derive the same slot
         // from the same block coord, so the block written by mode 0 is the one
@@ -675,6 +695,7 @@ class XeFMHAFwdKernel {
           scale_k,
           score_head_ptr,
           int(kScoreRowsPerRegion),
+          score_region_cols,
           score_blk_in_region,
           stats_wg_ptr);
 
