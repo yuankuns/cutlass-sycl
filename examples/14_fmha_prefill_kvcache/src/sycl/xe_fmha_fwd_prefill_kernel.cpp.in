@@ -339,7 +339,6 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
           TileShapePV,
           TileShapeOutput,
           SubgroupLayoutQK,
-          ((@HEAD_DIM@ + 31) / 32) * 32,
           /*SubgroupLayoutPV=*/void,
           /*PipelineStages=*/2,
           /*persistent=*/false,
@@ -356,6 +355,7 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
           /*GmemTiledCopyK=*/void,
           /*GmemTiledCopyV=*/void,
           /*GmemTiledCopyO=*/void,
+          /*PaddedHeadDimVO=*/((@HEAD_DIM@ + 31) / 32) * 32,
           FMHA_PREFILL_STORE_TILED_Q>::run_paged(params);
     });
   });

@@ -459,10 +459,6 @@ template <
     typename TileShapePV,
     typename TileShapeOutput,
     typename SubgroupLayoutQK,
-    // Padded full head-dim of O. TileShapeOutput may cover only part of it, in which
-    // case the head dim is walked by several output tiles, each needing its own
-    // launch in the ScoreBlock2D path. 0 means "one tile covers everything".
-    int PaddedHeadDimVO = 0,
     typename SubgroupLayoutPV_ = void, /* void -> default */
     int PipelineStages = 2,            // TODO: This is hard-coded as 1 in kernel.
     bool persistent = false,
@@ -479,6 +475,10 @@ template <
     typename GmemTiledCopyK = void,
     typename GmemTiledCopyV = void,
     typename GmemTiledCopyO = void,
+    // Padded full head-dim of O. TileShapeOutput may cover only part of it, in which
+    // case the head dim is walked by several output tiles, each needing its own
+    // launch in the ScoreBlock2D path. 0 means "one tile covers everything".
+    int PaddedHeadDimVO = 0,
     // Q tile for the ScoreBlock2D store launch (mode 0) only; 0 = same as every other
     // launch. See FMHA_PREFILL_STORE_TILED_Q: GEMM1 wants more Q rows per subgroup
     // than the O accumulator in the load launches can afford.
