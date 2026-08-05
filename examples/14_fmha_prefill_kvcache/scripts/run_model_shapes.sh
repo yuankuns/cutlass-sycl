@@ -376,6 +376,14 @@ run_case "coverage.paged_hd512_mqa" \
   --batch 1 --seqlen-q 8 --seqlen-k 64 --heads-q 4 --heads-kv 1 \
   --head-dim 512 --head-dim-v 512 --paged 1 --page-size 64 --causal 1
 
+run_case "coverage.paged_hd512_k_tail" \
+  --batch 1 --seqlen-q 128 --seqlen-k 1025 --heads-q 4 --heads-kv 4 \
+  --head-dim 512 --head-dim-v 512 --paged 1 --page-size 64 --causal 0
+
+run_case "coverage.paged_hd512_gqa_causal_tail" \
+  --batch 2 --seqlen-q 333 --seqlen-k 777 --heads-q 4 --heads-kv 1 \
+  --head-dim 512 --head-dim-v 512 --paged 1 --page-size 64 --causal 1
+
 run_case "coverage.nonpaged_hd72" \
   --batch 1 --seqlen-q 16 --seqlen-k 64 --heads-q 4 --heads-kv 2 \
   --head-dim 72 --head-dim-v 72 --paged 0 --causal 1
