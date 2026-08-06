@@ -122,11 +122,12 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
   // collapses to 27 TFLOPS, so 16 is the optimum, not simply "taller".
   //
   // Correct on every shape swept (sq/sk in {128..4096} x {333,511,512,700,777,1024,
-  // 2048,4096}, causal and not, b1/b2). Getting there needed three things beyond the
-  // tile itself, all because two DPAS M-blocks per subgroup break the assumption that a
-  // subgroup's rows are one contiguous run: the causal mask on tile-shaped coordinates,
-  // the K-loop bound at Q-tile granularity, and the score region addressed by tile
-  // coordinate rather than by an offset base pointer.
+  // 2048,4096}, causal and not, b1/b2). Getting there needed two fixes beyond the tile
+  // itself: the causal mask on tile-shaped coordinates rather than a (seq_len, seq_len)
+  // identity tensor whose Q mode aliased, and the score region addressed by tile
+  // coordinate rather than by an offset base pointer. Both are independent of the taller
+  // tile -- a subgroup's rows stay one contiguous run at two DPAS M-blocks per subgroup,
+  // as the causal-bound note in the kernel header records.
   //
   // Still ships off for one reason: it regresses mid/small shapes on launch count --
   // 36.0 at sq2048 and 34.3 at b4/sq1024 against 42.8/40.6 -- even though its own GEMM1

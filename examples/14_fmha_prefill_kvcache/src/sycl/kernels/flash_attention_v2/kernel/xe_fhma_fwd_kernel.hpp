@@ -396,24 +396,12 @@ class XeFMHAFwdKernel {
 
     int thr_id = int(ThreadIdxX());
     int sub_group_id = thr_id / intel::sg_size;
+    int q_sg_tile = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})));
 
     auto cS = make_identity_tensor(take<0, 2>(TiledMMAQK{}.tile_mnk()));
     auto tScS = TiledMMAQK{}.get_slice(thr_id).partition_C(cS);
     auto q_offset_wi = get<0>(tScS(0));
-    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
-    auto q_offset_sg = group_broadcast(sg, q_offset_wi, 0);
-    constexpr int q_sg_tile = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})));
-    int q_offset_sg_hi = q_offset_sg + q_sg_tile - 1;
-    if constexpr (CollectiveMainloop::SGTileQBlocks > 1) {
-      if constexpr (CollectiveMainloop::CausalMask && !CollectiveMainloop::ScoreBlock2D) {
-        // M-blocks are distributed round-robin across the Q subgroups.
-        constexpr int atom_q = size<0>(typename TiledMMAQK::AtomShape_MNK{});
-        q_offset_sg_hi = q_offset_sg +
-                         (CollectiveMainloop::SGTileQBlocks - 1) *
-                             int(CollectiveMainloop::SGPerWG::value) * atom_q +
-                         atom_q - 1;
-      }
-    }
+    auto q_offset_sg = group_broadcast(sycl::ext::oneapi::this_work_item::get_sub_group(), q_offset_wi, 0);
 
     TileScheduler tile_scheduler{params.scheduler};
 
@@ -474,34 +462,53 @@ class XeFMHAFwdKernel {
       // const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
 
       // Causal bounds are per-subgroup: seq_coord is this subgroup's first Q row, so the
-      // K loop runs only as far as that subgroup's rows can see.
+      // K loop runs only as far as that subgroup's rows can see. That is exact because a
+      // subgroup's rows are the contiguous run [q_offset_sg, +q_sg_tile) -- verified by
+      // enumerating partition_C over every shipped tile config, including all six with
+      // two DPAS M-blocks per subgroup. TiledMMAHelper's M permutation is
+      // (atom, sg, iter):(1, atom*iters, atom), so a subgroup's M-blocks are adjacent,
+      // not round-robin across subgroups.
       //
-      // That relies on a subgroup's rows being one contiguous run starting at
-      // q_offset_sg, which holds only while each subgroup owns a single DPAS M-block.
-      // When it owns two (the taller store-launch Q tile), the second block sits a
-      // whole M stride away, so q_offset_sg understates the subgroup's *last* row and
-      // the loop would stop before that row's final K blocks -- silently dropping them
-      // from the softmax. Fall back to Q-tile granularity there: the loop bound comes
-      // from the tile's last row and the mask threshold from its first, so both are
-      // supersets of what any row in the tile needs and the mask zeroes the excess.
-      // All subgroups then agree on the trip count too, which the split barrier wants.
+      // ScoreBlock2D with a *wider* store tile is the exception, and only because of its
+      // split barrier: the store and load launches would then disagree on the trip count
+      // every subgroup must retire, so the bound goes to Q-tile granularity -- the loop
+      // bound from the tile's last row and the mask threshold from its first, both
+      // supersets of what any row needs, with the mask zeroing the excess. Conditioned on
+      // SGTileQBlocks rather than on ScoreBlock2D alone because the shipped hd=512 tile
+      // has one M-block per subgroup, and the coarser bound costs it 2.7% on causal
+      // (sq4096 88.8 -> 86.5 med TFLOPS).
+      //
+      // Preprocessor-gated so the head dims that never run ScoreBlock2D compile
+      // fmha-cri's two expressions verbatim. Selecting between the two forms with a
+      // constexpr flag instead -- which folds to the identical constant, and left
+      // non-causal shapes untouched -- still cost saturated HD96/HD128 *causal* ~4.5%
+      // (np_hd96 sq4096 106.9 -> 102.0 med TFLOPS, paged hd128 111.8 -> 106.3), because
+      // the two `? :` chains put the causal loop bound behind a runtime-typed select
+      // that IGC no longer hoists out of the causal path.
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
       constexpr bool kTileGranularCausal =
           CollectiveMainloop::ScoreBlock2D && CollectiveMainloop::SGTileQBlocks > 1;
       const int causal_row_hi =
           kTileGranularCausal ? cute::min(seq_len_qo, blk_q * get<0>(TileShapeQK{}) + get<0>(TileShapeQK{})) : 0;
       const int causal_row_lo = kTileGranularCausal ? blk_q * get<0>(TileShapeQK{}) : 0;
-      const int seq_coord_hi =
-          cute::min(seq_len_qo, blk_q * get<0>(TileShapeQK{}) + q_offset_sg_hi + 1);
       const int seq_len = CollectiveMainloop::CausalMask
                               ? (kTileGranularCausal
                                      ? cute::min(seq_k_eff, full_tile_offset + causal_row_hi)
-                                     : cute::min(seq_k_eff, full_tile_offset + seq_coord_hi))
+                                     : cute::min(seq_k_eff, full_tile_offset + seq_coord + q_sg_tile))
                               : seq_k_eff;
       const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
       const int k_blocks_causal = CollectiveMainloop::CausalMask
                                       ? ((kTileGranularCausal ? causal_row_lo : seq_coord) + full_tile_offset) /
                                             get<1>(TileShapeQK{})
                                       : 0;
+#else
+      const int seq_len = CollectiveMainloop::CausalMask
+                              ? cute::min(seq_k_eff, full_tile_offset + seq_coord + q_sg_tile)
+                              : seq_k_eff;
+      const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
+      const int k_blocks_causal =
+          CollectiveMainloop::CausalMask ? (seq_coord + full_tile_offset) / get<1>(TileShapeQK{}) : 0;
+#endif
       int append_store_len = -1;
       if constexpr (CollectiveMainloop::AppendKV) {
         if constexpr (CollectiveMainloop::SingleAppendKV) {
@@ -621,6 +628,9 @@ class XeFMHAFwdKernel {
       if constexpr (CollectiveMainloop::Fp8KV) {
         scale_k = *p.scale_k_ptr;
       }
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
+      // Reads params.mainloop.ptr_score, which only exists under this macro -- see
+      // the Arguments comment in the mainloop for why that field is gated.
       typename CollectiveMainloop::ElementScoreStore* score_head_ptr = nullptr;
       typename CollectiveMainloop::ElementS* stats_wg_ptr = nullptr;
       int score_blk_in_region = 0;
@@ -668,7 +678,9 @@ class XeFMHAFwdKernel {
           stats_wg_ptr = stats_base + wg_slot * 2 * size_t(CollectiveMainloop::kStatsPerWG);
         }
       }
+#endif
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
+#if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
       mainloop.template operator()<StaticScoreMode_>(
           Q(_, _, q_head_idx, l_coord),
           K_cache(_, _, head, l_coord),
@@ -698,6 +710,34 @@ class XeFMHAFwdKernel {
           score_region_cols,
           score_blk_in_region,
           stats_wg_ptr);
+#else
+      // Without ScoreBlock2D the mainloop takes fmha-cri's exact signature; passing the
+      // score plumbing as defaulted-away extras changed the other head dims' codegen.
+      mainloop(
+          Q(_, _, q_head_idx, l_coord),
+          K_cache(_, _, head, l_coord),
+          V_cache(_, _, head, l_coord),
+          tArA,
+          tA_max,
+          tA_sum,
+          blk_qv,
+          blk_k0,
+          blk_k1,
+          k_blocks,
+          k_blocks_causal,
+          thr_id,
+          seq_len,
+          seq_k_eff,
+          idx_b,
+          head,
+          s.num_heads_kv,
+          full_tile_offset,
+          discard_seq_coord,
+          append_store_len,
+          K_cache(_, _, head, l_coord),
+          V_cache(_, _, head, l_coord),
+          scale_k);
+#endif
 
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
         sycl::group_barrier(get_work_group<3>());
