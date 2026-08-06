@@ -635,6 +635,10 @@ class XeFMHAFwdKernel {
       typename CollectiveMainloop::ElementS* stats_wg_ptr = nullptr;
       int score_blk_in_region = 0;
       int score_region_cols = 0;
+      // Query half of the score-prefetch predicate; see FMHA_PREFILL_SCORE_PF_AUTO. Read
+      // here because the mainloop's `seq_len` is a causal-clamped K bound, whereas the
+      // floor was measured against the query length.
+      bool score_pf_q_ok = false;
       if constexpr (CollectiveMainloop::ScoreBlock2D) {
         int score_q_extent;
         int score_k_extent;
@@ -650,6 +654,7 @@ class XeFMHAFwdKernel {
         }
         score_k_extent = cute::round_up(score_k_extent, int(get<1>(TileShapeQK{})));
         score_region_cols = score_k_extent;
+        score_pf_q_ok = score_q_extent >= FMHA_PREFILL_SCORE_PF_AUTO_Q_MIN;
         // One block per workgroup, addressed by this workgroup's slot
         // (batch, head, blk_q). The store and load launches derive the same slot
         // from the same block coord, so the block written by mode 0 is the one
@@ -709,7 +714,8 @@ class XeFMHAFwdKernel {
           int(kScoreRowsPerRegion),
           score_region_cols,
           score_blk_in_region,
-          stats_wg_ptr);
+          stats_wg_ptr,
+          score_pf_q_ok);
 #else
       // Without ScoreBlock2D the mainloop takes fmha-cri's exact signature; passing the
       // score plumbing as defaulted-away extras changed the other head dims' codegen.

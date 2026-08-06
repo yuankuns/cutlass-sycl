@@ -378,8 +378,45 @@
 // shapes / -2% on mid, but that was measured before D_SKEW and V_PF_NEXT changed which
 // launch is latency-bound -- the same situation as PF_ZIGZAG and INIT_PF_DEPTH, both of
 // which measured neutral pre-skew and are now default-on wins.
+//
+// This is a *shape-conditional* knob, which is why it was refuted three times as a
+// global default: swept over the whole K-block range it is net-negative, and the two
+// sparse grids it was rejected on happened to sample mostly loss points. Densely, the
+// sign is a region (see FMHA_PREFILL_SCORE_PF_AUTO below), so the default is the
+// predicate rather than on/off. Values > 0 force that distance everywhere.
 #ifndef FMHA_PREFILL_SCORE_PF
 #define FMHA_PREFILL_SCORE_PF 0
+#endif
+
+// Enable the score prefetch only on the shapes that measured faster with it.
+// Whole-kernel PF=1 vs PF=0 at b1/hq32/dv512/page128, K blocks = ceil(sk/TILED_KV):
+//
+//   kb   16     20     24     28   | 29..40                    | 44     48     56     64
+//   d%  -1.93  -0.69  -1.44  -0.34 | +0.21..+0.77 (8 of 10)    | -0.22  -1.88  -0.38  -0.45
+//
+// so the region is 29 <= kb < 44, and it needs a Q-length floor too: kb=32 loses at
+// sq512 (-0.9%) and sq1024 (-0.8%) but wins at sq2048 (+0.8%), sq3072 (+2.8%) and
+// sq4096. Below the floor the load launches are too short for a prefetch issued one
+// block ahead to land before it is consumed.
+//
+// The two in-region exceptions at sq2048 (kb30 -0.53%, kb36 -0.74%) both *invert* at
+// sq4096 (+1.11%, +0.45%) and kb37/39/41 -- held-out points not used to draw the
+// region -- all win, so the region is contiguous rather than a set of spikes.
+//
+// Worth +0.4 to +0.9% on the mid shapes, of which the one that matters is
+// b1/hq32/sq2048 (kb=32): 44.05 -> 44.48 TFLOPS. 0 = never (the pre-2026-08-06
+// behaviour), 1 = the measured region.
+#ifndef FMHA_PREFILL_SCORE_PF_AUTO
+#define FMHA_PREFILL_SCORE_PF_AUTO 1
+#endif
+#ifndef FMHA_PREFILL_SCORE_PF_AUTO_KB_LO
+#define FMHA_PREFILL_SCORE_PF_AUTO_KB_LO 29
+#endif
+#ifndef FMHA_PREFILL_SCORE_PF_AUTO_KB_HI
+#define FMHA_PREFILL_SCORE_PF_AUTO_KB_HI 44
+#endif
+#ifndef FMHA_PREFILL_SCORE_PF_AUTO_Q_MIN
+#define FMHA_PREFILL_SCORE_PF_AUTO_Q_MIN 2048
 #endif
 
 namespace cutlass::fmha {
@@ -656,7 +693,11 @@ struct FMHAFwdMainloop<
   // StaticScoreMode is a parameter of that function rather than of this class.
   static constexpr int VPfNextMode = FMHA_PREFILL_V_PF_NEXT;
   // Prefetch distance, in K blocks, for the score workspace in the load launches; 0 = off.
+  // Zero here does not mean "no prefetch": with ScorePfAuto the distance is chosen per
+  // shape in the mainloop, since the sign of this knob is a region of (K blocks, seq_len_qo)
+  // rather than a constant. See FMHA_PREFILL_SCORE_PF_AUTO for the measured region.
   static constexpr int ScorePfDist = FMHA_PREFILL_SCORE_PF;
+  static constexpr bool ScorePfAuto = ScoreBlock2D && FMHA_PREFILL_SCORE_PF_AUTO && ScorePfDist == 0;
   // Per-subgroup rotation of GEMM2's V-tile *prefetch* order; 0 = off.
   static constexpr int VPfSkew = FMHA_PREFILL_V_PF_SKEW;
   static constexpr bool PfZigzag = ScoreBlock2D && FMHA_PREFILL_PF_ZIGZAG;
@@ -1048,7 +1089,12 @@ struct FMHAFwdMainloop<
       int score_blk_in_region = 0,
       // Base of this workgroup's softmax-statistics slot (2 * TILED_Q floats: maxima then
       // sums). Null unless ShareSoftmaxStats.
-      ElementS* stats_wg_ptr = nullptr
+      ElementS* stats_wg_ptr = nullptr,
+      // Query half of the score-prefetch predicate (seq_len_qo >= the measured floor).
+      // Passed in because the mainloop's `seq_len` is a K-side bound, and because adding
+      // a parameter outside this preprocessor-gated block would shift codegen in the head
+      // dims that never run ScoreBlock2D. See FMHA_PREFILL_SCORE_PF_AUTO.
+      bool score_pf_q_ok = false
 #endif
   ) {
     using namespace sycl::ext::oneapi::this_work_item;
@@ -1563,6 +1609,22 @@ struct FMHAFwdMainloop<
     // because they reload scores rather than running GEMM1.
     FragS tSrS_grp[KGrp];
     const int k_end = cute::min(blk_k1, kblocks_cache);
+
+    // Score prefetch distance for this shape: a constant when SCORE_PF forces one,
+    // otherwise the measured region. Hoisted out of the K loop so the loop body sees a
+    // plain int -- the whole point of this knob is that it costs no registers, and
+    // re-evaluating the predicate per K block would cost more than the prefetch saves.
+    // Note `seq_len` here is a K-side bound (seq_k_eff, causal-clamped), not the query
+    // length, so the Q half of the predicate is evaluated by the caller and arrives in
+    // score_pf_q_ok rather than being recomputed from it.
+    int score_pf_dist = ScorePfDist;
+    if constexpr (ScorePfAuto) {
+      const int kb = kblocks_cache;
+      score_pf_dist = (score_pf_q_ok && kb >= FMHA_PREFILL_SCORE_PF_AUTO_KB_LO &&
+                       kb < FMHA_PREFILL_SCORE_PF_AUTO_KB_HI)
+                          ? 1
+                          : 0;
+    }
     for (int K_grp = blk_k0; K_grp < k_end; K_grp += KGrp) {
       /* GEMM 1 for the whole group: one pass of Q loads feeds KGrp K blocks, so
          Q is read seq_kv/(TILED_KV*KGrp) times instead of seq_kv/TILED_KV. */
@@ -1761,8 +1823,10 @@ struct FMHAFwdMainloop<
           // Aim ScorePfDist blocks ahead, so this block's load finds its lines already
           // in flight. Clamped to the last block: past k_end there is nothing to warm,
           // and a repeat of the final tile is a harmless hit rather than a stray address.
-          if constexpr (ScorePfDist > 0) {
-            prefetch(prefetch_score, pScoreG(_, _, _, cute::min(K + ScorePfDist, k_end - 1)));
+          if constexpr (ScorePfDist > 0 || ScorePfAuto) {
+            if (score_pf_dist > 0) {
+              prefetch(prefetch_score, pScoreG(_, _, _, cute::min(K + score_pf_dist, k_end - 1)));
+            }
           }
           copy(copy_score_load, tScoreLoadG(_, _, _, K), tScoreLoadR);
           reorder(tScoreLoadR, tSrS);
