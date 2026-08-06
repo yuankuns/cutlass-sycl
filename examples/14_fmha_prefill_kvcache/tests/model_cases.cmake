@@ -325,6 +325,20 @@ fmha_prefill_add_case(coverage.paged_hd512_gqa_causal_tail
   COVERAGE BOUNDARY PAGED CAUSAL
   BATCH 2 SEQLEN_Q 333 SEQLEN_K 777 HEADS_Q 4 HEADS_KV 1 HEAD_DIM 512 PAGE_SIZE 64)
 
+# The hd=512 cases above all sit below FMHA_PREFILL_SCORE_PF_AUTO's query floor
+# (seq_len_qo >= 2048), so none of them exercises the score-workspace prefetch at
+# all. These two do: sk=1985 is inside the dispatch region (31 K blocks at
+# TILED_KV=64) and is deliberately not a multiple of TILED_KV, so the prefetch runs
+# against a rounded-up row pitch; sk=2049 straddles the tail the same way one block
+# further in. Small head counts keep them cheap enough for the default suite.
+fmha_prefill_add_case(coverage.paged_hd512_score_pf
+  COVERAGE PAGED
+  BATCH 1 SEQLEN_Q 2048 SEQLEN_K 1985 HEADS_Q 2 HEADS_KV 2 HEAD_DIM 512 PAGE_SIZE 64)
+
+fmha_prefill_add_case(coverage.paged_hd512_score_pf_tail
+  COVERAGE BOUNDARY PAGED
+  BATCH 1 SEQLEN_Q 2048 SEQLEN_K 2049 HEADS_Q 2 HEADS_KV 2 HEAD_DIM 512 PAGE_SIZE 64)
+
 fmha_prefill_add_case(coverage.nonpaged_hd72
   COVERAGE CAUSAL
   BATCH 1 SEQLEN_Q 16 SEQLEN_K 64 HEADS_Q 4 HEADS_KV 2 HEAD_DIM 72)
