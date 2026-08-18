@@ -463,6 +463,17 @@ struct KSlmStorage<Traits, true> {
   cute::array_aligned<typename Traits::Element, cute::cosize_v<typename Traits::GrpLayout>> smem_k;
 };
 
+template <bool Enabled>
+struct RelativeBiasArguments {};
+
+template <>
+struct RelativeBiasArguments<true> {
+  cutlass::bfloat16_t const* ptr = nullptr;
+  int64_t token_stride = 0;
+  int64_t head_stride = 0;
+  int extent = 0;
+};
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <
@@ -488,7 +499,8 @@ template <
     // (decode only, seq_len_qo == 1). All packed rows share the single decode
     // KV position, so per-row masking must use a fixed decode row. Default
     // false keeps prefill (and non-packed decode) unaffected.
-    bool PackGQA_ = false>
+    bool PackGQA_ = false,
+    bool HasRelBias_ = false>
 struct FMHAFwdMainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
@@ -514,7 +526,8 @@ template <
     class TiledCopyK_cache_,
     class TiledCopyV_cache_,
     bool LocalMask_,
-    bool PackGQA_>
+    bool PackGQA_,
+    bool HasRelBias_>
 struct FMHAFwdMainloop<
     XeDefault<Stages>,
     CausalMask_,
@@ -534,7 +547,8 @@ struct FMHAFwdMainloop<
     TiledCopyK_cache_,
     TiledCopyV_cache_,
     LocalMask_,
-    PackGQA_> {
+    PackGQA_,
+    HasRelBias_> {
   //
   // Type Aliases
   //
@@ -609,6 +623,7 @@ struct FMHAFwdMainloop<
   using ElementA = typename TiledMMAPV::ValTypeD;
 
   static constexpr bool CausalMask = CausalMask_;
+  static constexpr bool HasRelBias = HasRelBias_;
   static constexpr bool CachedKV = CachedKV_;
   static constexpr bool PagedKV = PagedKV_;
   static constexpr bool LocalMask = LocalMask_;
@@ -716,6 +731,7 @@ struct FMHAFwdMainloop<
     int window_size_left = -1;
     int window_size_right = -1;
     ElementScoreStore* ptr_score = nullptr;
+    [[no_unique_address]] RelativeBiasArguments<HasRelBias> relative_bias{};
   };
 
   // Kernel-facing parameters
@@ -737,7 +753,7 @@ struct FMHAFwdMainloop<
   static constexpr Params to_underlying_arguments(Arguments const& args, void* workspace) {
     constexpr double kLog2e = 1.4426950408889634074;  // log_2(e)
     ElementS val = args.scale * static_cast<ElementS>(kLog2e);
-    return Params{
+    Params params{
         val,
         args.ptr_page_table,
         args.page_size,
@@ -745,6 +761,10 @@ struct FMHAFwdMainloop<
         args.window_size_left,
         args.window_size_right,
         ScoreBlock2D ? reinterpret_cast<ElementScoreStore*>(workspace) : nullptr};
+    if constexpr (HasRelBias) {
+      params.relative_bias = args.relative_bias;
+    }
+    return params;
   }
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
@@ -782,6 +802,8 @@ struct FMHAFwdMainloop<
       int seq_len,
       int seq_len_kv_cache,
       int l_coord,
+      int q_head,
+      int q_token_offset,
       int full_tile_offset,
       int discard_seq_coord,
       TensorK_cache2D const& K_cache_2D = TensorK_cache2D{},
@@ -859,6 +881,37 @@ struct FMHAFwdMainloop<
     auto thr_copy_v_cache = copy_v_cache.get_slice(thr_id);
     auto thr_mma_qk = mma_qk.get_slice(thr_id);
     auto thr_mma_pv = mma_pv.get_slice(thr_id);
+
+    constexpr ElementS kLog2e = ElementS(1.4426950408889634074);
+    auto apply_relative_bias = [&](FragS& scores, int K, ElementS& score_scale) {
+      if constexpr (HasRelBias) {
+        constexpr int k_tile = get<1>(TileShapeQK{});
+        auto bias_shape = make_shape(seq_len, params.relative_bias.head_stride);
+        auto bias_layout = make_layout(bias_shape, make_stride(params.relative_bias.token_stride, Int<1>{}));
+        auto bias_head_ptr =
+            params.relative_bias.ptr + int64_t(q_token_offset) * params.relative_bias.token_stride +
+            int64_t(q_head) * params.relative_bias.head_stride;
+        Tensor Bias = make_tensor(make_gmem_ptr(bias_head_ptr), bias_layout);
+        Tensor cBias = make_identity_tensor(bias_shape);
+        Tensor gBias = local_tile(cBias, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), _));
+        auto copy_bias_load = make_block_2d_copy_C(mma_qk, Bias);
+        auto thr_copy_bias_load = copy_bias_load.get_slice(thr_id);
+        auto tBiasLoadG = thr_copy_bias_load.partition_S(gBias);
+        int const bias_col = K * k_tile;
+        if (bias_col + k_tile <= params.relative_bias.head_stride) {
+          auto tBiasLoadR = thr_copy_bias_load.partition_sg_fragment_D(gBias(_, _, 0));
+          auto bias = make_subgroup_tensor(
+              make_fragment_like<cutlass::bfloat16_t>(scores.layout()), scores.tv_layout());
+          copy(copy_bias_load, tBiasLoadG(_, _, _, bias_col / k_tile), tBiasLoadR);
+          reorder(tBiasLoadR, bias);
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < scores.size(); ++i) {
+            scores(i) = score_scale * scores(i) + kLog2e * static_cast<ElementS>(bias(i));
+          }
+          score_scale = ElementS(1);
+        }
+      }
+    };
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
     auto thr_copy_score_store = copy_score_store.get_slice(thr_id);
     auto thr_copy_score_load = copy_score_load.get_slice(thr_id);
@@ -1401,6 +1454,7 @@ struct FMHAFwdMainloop<
               cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
             }
           } else {
+            apply_relative_bias(tSrS, K, softmax_scale);
             auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum, softmax_scale);
             reorder(tSrS, tArP);
 

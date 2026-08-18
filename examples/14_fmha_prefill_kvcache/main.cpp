@@ -36,6 +36,8 @@ struct Config {
   int window_left = -1;
   int window_right = -1;
   bool sink = false;
+  bool relative_bias = false;
+  int rel_extent = 1024;
   int warmup = 5;
   int iters = 5;
   int seed = 0;
@@ -94,6 +96,7 @@ Config parse_args(int argc, char** argv) {
           << "  --batch N --seqlen-q N --seqlen-k N --heads-q N --heads-kv N\n"
           << "  --head-dim N --head-dim-v N --paged 0|1 --page-size N\n"
           << "  --causal 0|1 --window-left N --window-right N --sink 0|1\n"
+          << "  --relative-bias 0|1 --rel-extent N\n"
           << "  --warmup N --iters N --seed N --verify 0|1 --atol F --rtol F\n";
       std::exit(0);
     }
@@ -129,6 +132,8 @@ Config parse_args(int argc, char** argv) {
   get_int("window-left", cfg.window_left);
   get_int("window-right", cfg.window_right);
   get_bool("sink", cfg.sink);
+  get_bool("relative-bias", cfg.relative_bias);
+  get_int("rel-extent", cfg.rel_extent);
   get_int("warmup", cfg.warmup);
   get_int("iters", cfg.iters);
   get_int("seed", cfg.seed);
@@ -150,6 +155,11 @@ Config parse_args(int argc, char** argv) {
   }
   if (cfg.sink && (!cfg.paged || cfg.head_dim != 64)) {
     throw std::runtime_error("the current SGL prefill runner supports sink only on paged head_dim=64");
+  }
+  if (cfg.relative_bias &&
+      (!cfg.paged || cfg.head_dim != 128 || cfg.head_dim_v != 128 || cfg.rel_extent <= 0)) {
+    throw std::runtime_error(
+        "relative attention requires paged=1, head_dim=head_dim_v=128, and rel_extent>0");
   }
   if (!cfg.paged && !(cfg.head_dim == 64 || cfg.head_dim == 72 || cfg.head_dim == 96 || cfg.head_dim == 128)) {
     throw std::runtime_error("non-paged standalone prefill supports head_dim in {64,72,96,128}");
@@ -303,7 +313,8 @@ void run_prefill(
     int32_t* cu_q,
     int32_t* cu_k_or_cache_lens,
     int32_t* page_table,
-    bf16_t* sinks) {
+    bf16_t* sinks,
+    bf16_t* rel_bias) {
   const int total_q = cfg.batch * cfg.seqlen_q;
   const int pages_per_seq = cfg.paged ? (cfg.seqlen_k + cfg.page_size - 1) / cfg.page_size : 0;
   const int num_pages = cfg.paged ? cfg.batch * pages_per_seq : 0;
@@ -322,6 +333,11 @@ void run_prefill(
   params.v_ptr = v;
   params.o_ptr = out;
   params.softmax_sink_ptr = cfg.sink ? sinks : nullptr;
+  params.rel_bias_ptr = cfg.relative_bias ? rel_bias : nullptr;
+  const int rel_bias_padded = ((cfg.seqlen_k + 31) / 32) * 32;
+  params.rel_bias_token_stride = static_cast<int64_t>(cfg.heads_q) * rel_bias_padded;
+  params.rel_bias_head_stride = rel_bias_padded;
+  params.rel_bias_extent = cfg.relative_bias ? cfg.rel_extent : 0;
   params.skip_batch_mask_ptr = nullptr;
   params.cu_seqlens_q = reinterpret_cast<int*>(cu_q);
   params.cu_seqlens_k = reinterpret_cast<int*>(cu_k_or_cache_lens);
@@ -366,7 +382,8 @@ std::vector<float> reference_prefill(
     const std::vector<bf16_t>& k,
     const std::vector<bf16_t>& v,
     const std::vector<int32_t>& page_table,
-    const std::vector<bf16_t>& sinks) {
+    const std::vector<bf16_t>& sinks,
+    const std::vector<bf16_t>& rel_bias) {
   std::vector<float> ref(static_cast<std::size_t>(cfg.batch) * cfg.seqlen_q * cfg.heads_q * cfg.head_dim_v, 0.0f);
   const int head_group = cfg.heads_q / cfg.heads_kv;
   const float scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim));
@@ -417,6 +434,14 @@ std::vector<float> reference_prefill(
             dot += q_at(q_row, hq, d) * k_at(b, ck, hk, d);
           }
           scores[ck] = dot * scale;
+          if (cfg.relative_bias) {
+            const int rel = row_kv - ck;
+            if (rel >= 0 && rel < cfg.rel_extent) {
+              const auto bias_idx =
+                  (static_cast<std::size_t>(q_row) * cfg.heads_q + hq) * cfg.rel_extent + rel;
+              scores[ck] += bf16_to_float(rel_bias[bias_idx]);
+            }
+          }
           max_score = std::max(max_score, scores[ck]);
         }
 
@@ -528,6 +553,34 @@ int main(int argc, char** argv) {
     }
     std::vector<int32_t> cu_q_host = make_prefix_lengths(cfg.batch, cfg.seqlen_q);
     std::vector<bf16_t> sinks_host = cfg.sink ? make_random_bf16(cfg.heads_q, rng) : std::vector<bf16_t>{};
+    std::vector<bf16_t> rel_bias_host =
+        cfg.relative_bias
+            ? make_random_bf16(static_cast<std::size_t>(total_q) * cfg.heads_q * cfg.rel_extent, rng)
+            : std::vector<bf16_t>{};
+    std::vector<bf16_t> aligned_rel_bias_host;
+    if (cfg.relative_bias) {
+      const int padded = ((cfg.seqlen_k + 31) / 32) * 32;
+      aligned_rel_bias_host.resize(
+          static_cast<std::size_t>(total_q + 255) * cfg.heads_q * padded, bf16_t(0.0f));
+      for (int b = 0; b < cfg.batch; ++b) {
+        for (int q_local = 0; q_local < cfg.seqlen_q; ++q_local) {
+          const int q_global = b * cfg.seqlen_q + q_local;
+          const int row_kv = cfg.seqlen_k - cfg.seqlen_q + q_local;
+          for (int h = 0; h < cfg.heads_q; ++h) {
+            const auto src_base =
+                (static_cast<std::size_t>(q_global) * cfg.heads_q + h) * cfg.rel_extent;
+            const auto dst_base =
+                (static_cast<std::size_t>(q_global) * cfg.heads_q + h) * padded;
+            for (int col = 0; col < cfg.seqlen_k; ++col) {
+              const int rel = row_kv - col;
+              if (rel >= 0 && rel < cfg.rel_extent) {
+                aligned_rel_bias_host[dst_base + col] = rel_bias_host[src_base + rel];
+              }
+            }
+          }
+        }
+      }
+    }
 
     DeviceBuffer<bf16_t> q_dev(q, q_host.size());
     DeviceBuffer<bf16_t> k_dev(q, k_host.size());
@@ -537,6 +590,7 @@ int main(int argc, char** argv) {
     DeviceBuffer<int32_t> cu_k_dev(q, cu_k_or_cache_lens_host.size());
     DeviceBuffer<int32_t> page_table_dev;
     DeviceBuffer<bf16_t> sinks_dev;
+    DeviceBuffer<bf16_t> rel_bias_dev;
 
     q_dev.copy_from_host(q_host);
     k_dev.copy_from_host(k_host);
@@ -551,13 +605,18 @@ int main(int argc, char** argv) {
       sinks_dev = DeviceBuffer<bf16_t>(q, sinks_host.size());
       sinks_dev.copy_from_host(sinks_host);
     }
+    if (cfg.relative_bias) {
+      rel_bias_dev = DeviceBuffer<bf16_t>(q, aligned_rel_bias_host.size());
+      rel_bias_dev.copy_from_host(aligned_rel_bias_host);
+    }
 
     std::cout << "device: " << q.get_device().get_info<sycl::info::device::name>() << "\n";
     std::cout << "shape: batch=" << cfg.batch << " sq=" << cfg.seqlen_q << " sk=" << cfg.seqlen_k
               << " hq=" << cfg.heads_q << " hkv=" << cfg.heads_kv << " d=" << cfg.head_dim
               << " dv=" << cfg.head_dim_v << " paged=" << cfg.paged << " page_size=" << cfg.page_size
               << " causal=" << cfg.causal << " window=(" << cfg.window_left << "," << cfg.window_right
-              << ") sink=" << cfg.sink << "\n";
+              << ") sink=" << cfg.sink << " relative_bias=" << cfg.relative_bias
+              << " rel_extent=" << cfg.rel_extent << "\n";
 
     auto launch_once = [&] {
       run_prefill(
@@ -569,7 +628,8 @@ int main(int argc, char** argv) {
           cu_q_dev.data(),
           cu_k_dev.data(),
           cfg.paged ? page_table_dev.data() : nullptr,
-          cfg.sink ? sinks_dev.data() : nullptr);
+          cfg.sink ? sinks_dev.data() : nullptr,
+          cfg.relative_bias ? rel_bias_dev.data() : nullptr);
       return sgl_standalone::last_event();
     };
 
@@ -578,7 +638,8 @@ int main(int argc, char** argv) {
     q.wait();
 
     if (cfg.verify) {
-      std::vector<float> ref = reference_prefill(cfg, q_host, k_host, v_host, page_table_host, sinks_host);
+      std::vector<float> ref =
+          reference_prefill(cfg, q_host, k_host, v_host, page_table_host, sinks_host, rel_bias_host);
       std::vector<bf16_t> out_host = out_dev.copy_to_host();
       if (!verify_output(cfg, out_host, ref)) {
         sgl_standalone::release_workspace();

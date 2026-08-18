@@ -45,6 +45,8 @@ Useful labels:
 - `coverage`: extra head-dim and feature coverage
 - `boundary`: exact tile multiples, non-multiples, +/-1, +/-2, half-tile,
   page-tail, and multi-batch cases
+- `relative`: relative-attention single/multi-Q-tile, Q/K tail, multi-batch,
+  MQA/GQA, extent boundary, non-causal, and 4K production-length cases
 - `paged`, `nonpaged`, `causal`, `noncausal`, `sink`
 
 If `FMHA_STANDALONE_HEAD_DIMS` is restricted at configure time, tests requiring

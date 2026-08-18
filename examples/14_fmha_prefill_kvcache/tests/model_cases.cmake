@@ -1,5 +1,5 @@
 function(fmha_prefill_add_case NAME)
-  set(options PAGED CAUSAL SINK MAIN STRETCH COVERAGE BOUNDARY)
+  set(options PAGED CAUSAL SINK RELATIVE_BIAS MAIN STRETCH COVERAGE BOUNDARY)
   set(one_value_args
       BATCH
       SEQLEN_Q
@@ -11,6 +11,7 @@ function(fmha_prefill_add_case NAME)
       PAGE_SIZE
       WINDOW_LEFT
       WINDOW_RIGHT
+      REL_EXTENT
       WARMUP
       ITERS
       ATOL
@@ -52,6 +53,16 @@ function(fmha_prefill_add_case NAME)
     set(_sink 1)
   else()
     set(_sink 0)
+  endif()
+  if(CASE_RELATIVE_BIAS)
+    set(_relative_bias 1)
+  else()
+    set(_relative_bias 0)
+  endif()
+  if(DEFINED CASE_REL_EXTENT)
+    set(_rel_extent ${CASE_REL_EXTENT})
+  else()
+    set(_rel_extent 1024)
   endif()
 
   if(DEFINED CASE_HEAD_DIM_V)
@@ -120,6 +131,8 @@ function(fmha_prefill_add_case NAME)
       --window-left ${_window_left}
       --window-right ${_window_right}
       --sink ${_sink}
+      --relative-bias ${_relative_bias}
+      --rel-extent ${_rel_extent}
       --warmup ${_warmup}
       --iters ${_iters}
       --verify 1
@@ -151,6 +164,9 @@ function(fmha_prefill_add_case NAME)
   endif()
   if(CASE_SINK)
     list(APPEND _labels sink)
+  endif()
+  if(CASE_RELATIVE_BIAS)
+    list(APPEND _labels relative)
   endif()
 
   set_tests_properties(
@@ -249,6 +265,48 @@ fmha_prefill_add_case(coverage.local_window_paged
   COVERAGE PAGED
   BATCH 1 SEQLEN_Q 24 SEQLEN_K 128 HEADS_Q 4 HEADS_KV 1 HEAD_DIM 96 PAGE_SIZE 64
   WINDOW_LEFT 64 WINDOW_RIGHT 8)
+
+# Relative-attention coverage on the scoreboard hd128 paged path.
+fmha_prefill_add_case(relative.single_q_tile_gqa
+  COVERAGE RELATIVE_BIAS PAGED CAUSAL
+  BATCH 1 SEQLEN_Q 256 SEQLEN_K 512 HEADS_Q 16 HEADS_KV 8
+  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 128 REL_EXTENT 128)
+
+fmha_prefill_add_case(relative.multi_q_tile_gqa
+  COVERAGE RELATIVE_BIAS PAGED CAUSAL
+  BATCH 1 SEQLEN_Q 512 SEQLEN_K 1024 HEADS_Q 16 HEADS_KV 8
+  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 128 REL_EXTENT 128)
+
+fmha_prefill_add_case(relative.qk_tail_mqa
+  COVERAGE BOUNDARY RELATIVE_BIAS PAGED CAUSAL
+  BATCH 1 SEQLEN_Q 300 SEQLEN_K 777 HEADS_Q 4 HEADS_KV 1
+  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 128 REL_EXTENT 127)
+
+fmha_prefill_add_case(relative.multi_batch_gqa
+  COVERAGE BOUNDARY RELATIVE_BIAS PAGED CAUSAL
+  BATCH 2 SEQLEN_Q 300 SEQLEN_K 777 HEADS_Q 4 HEADS_KV 2
+  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 128 REL_EXTENT 128)
+
+fmha_prefill_add_case(relative.extent_one
+  COVERAGE BOUNDARY RELATIVE_BIAS PAGED CAUSAL
+  BATCH 1 SEQLEN_Q 257 SEQLEN_K 513 HEADS_Q 4 HEADS_KV 1
+  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 64 REL_EXTENT 1)
+
+fmha_prefill_add_case(relative.extent_larger_than_k
+  COVERAGE BOUNDARY RELATIVE_BIAS PAGED CAUSAL
+  BATCH 1 SEQLEN_Q 256 SEQLEN_K 257 HEADS_Q 4 HEADS_KV 2
+  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 64 REL_EXTENT 1024)
+
+fmha_prefill_add_case(relative.noncausal_k_tail
+  COVERAGE BOUNDARY RELATIVE_BIAS PAGED
+  BATCH 1 SEQLEN_Q 256 SEQLEN_K 257 HEADS_Q 4 HEADS_KV 2
+  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 64 REL_EXTENT 33)
+
+fmha_prefill_add_case(relative.production_4k
+  COVERAGE RELATIVE_BIAS PAGED CAUSAL
+  BATCH 1 SEQLEN_Q 4096 SEQLEN_K 4096 HEADS_Q 1 HEADS_KV 1
+  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 128 REL_EXTENT 1024
+  WARMUP 1 ITERS 1)
 
 # Tile-boundary scenarios.  These keep head counts small so the CPU reference
 # remains practical, but they cover exact tile multiples, non-multiples, +/-1,

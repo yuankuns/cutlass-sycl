@@ -100,6 +100,13 @@ struct Arguments {
   void* __restrict__ o_ptr;
   void* __restrict__ oaccum_ptr;
 
+  // Optional K-aligned relative logits:
+  // [total_q_padded, h, rel_bias_head_stride]. Strides are in elements.
+  void* __restrict__ rel_bias_ptr = nullptr;
+  int64_t rel_bias_token_stride = 0;
+  int64_t rel_bias_head_stride = 0;
+  int rel_bias_extent = 0;
+
   // The stride between rows of O.
   int64_t o_batch_stride;
   int64_t o_row_stride;
@@ -351,6 +358,12 @@ struct PrefillRunner {
         },
         {},
         hw_info};
+    if constexpr (CollectiveMainloop::HasRelBias) {
+      arguments.mainloop.relative_bias.ptr = static_cast<const cutlass::bfloat16_t*>(params.rel_bias_ptr);
+      arguments.mainloop.relative_bias.token_stride = params.rel_bias_token_stride;
+      arguments.mainloop.relative_bias.head_stride = params.rel_bias_head_stride;
+      arguments.mainloop.relative_bias.extent = params.rel_bias_extent;
+    }
 
     // Define device-global scratch memory
     size_t workspace_size = FMHAPrefillKernel::get_workspace_size(arguments);
@@ -405,6 +418,7 @@ template <
     // case the head dim is walked by several output tiles, each needing its own
     // launch in the ScoreBlock2D path. 0 means "one tile covers everything".
     int PaddedHeadDimVO = 0,
+    bool HasRelBias = false,
     typename SubgroupLayoutPV_ = void, /* void -> default */
     int PipelineStages = 2,            // TODO: This is hard-coded as 1 in kernel.
     bool persistent = false,
@@ -491,7 +505,9 @@ struct FMHAConfig {
         GmemTiledCopyV,
         GmemTiledCopyK_cache,
         GmemTiledCopyV_cache,
-        LocalMask>;
+        LocalMask,
+        false,
+        HasRelBias>;
 
     // Epilogue
     using CollectiveEpilogue =

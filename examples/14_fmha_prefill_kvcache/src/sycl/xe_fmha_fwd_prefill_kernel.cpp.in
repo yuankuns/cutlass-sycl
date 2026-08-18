@@ -113,6 +113,35 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
       cute::Shape<cute::Int<@NUM_SG@ / FMHA_PREFILL_N_SPLIT_512>, cute::Int<FMHA_PREFILL_N_SPLIT_512>, cute::_1>,
       cute::Stride<cute::_1, cute::Int<@NUM_SG@ / FMHA_PREFILL_N_SPLIT_512>, cute::_1>>;
 
+#if @HEAD_DIM@ == 128
+  if (params.rel_bias_ptr != nullptr) {
+    TORCH_CHECK(params.dv == 128, "relative attention requires head_dim_v == 128");
+    TORCH_CHECK(!use_sink, "relative attention does not support sink logits");
+    using RelTileShapeQK = cute::Shape<cute::Int<256>, cute::Int<32>, cute::_32>;
+    using RelTileShapePV = cute::Shape<cute::Int<256>, cute::_32, cute::Int<32>>;
+    using RelTileShapeOutput = cute::Shape<cute::Int<256>, cute::Int<128>>;
+    using RelSubgroupLayoutQK =
+        cute::Layout<cute::Shape<cute::Int<16>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
+        FMHAConfig<
+            Causal,
+            LocalMask,
+            false,
+            RelTileShapeQK,
+            RelTileShapePV,
+            RelTileShapeOutput,
+            RelSubgroupLayoutQK,
+            128,
+            true>::run_paged(params);
+      });
+    });
+    return;
+  }
+#else
+  TORCH_CHECK(params.rel_bias_ptr == nullptr, "relative attention is only compiled for head_dim == 128");
+#endif
+
 #if @HEAD_DIM@ == 64
   AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
