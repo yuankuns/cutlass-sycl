@@ -359,10 +359,10 @@ struct PrefillRunner {
         {},
         hw_info};
     if constexpr (CollectiveMainloop::HasRelBias) {
-      arguments.mainloop.relative_bias.ptr = static_cast<const cutlass::bfloat16_t*>(params.rel_bias_ptr);
-      arguments.mainloop.relative_bias.token_stride = params.rel_bias_token_stride;
-      arguments.mainloop.relative_bias.head_stride = params.rel_bias_head_stride;
-      arguments.mainloop.relative_bias.extent = params.rel_bias_extent;
+      arguments.mainloop.ptr_rel_bias = static_cast<const cutlass::bfloat16_t*>(params.rel_bias_ptr);
+      arguments.mainloop.rel_bias_token_stride = params.rel_bias_token_stride;
+      arguments.mainloop.rel_bias_head_stride = params.rel_bias_head_stride;
+      arguments.mainloop.rel_bias_extent = params.rel_bias_extent;
     }
 
     // Define device-global scratch memory

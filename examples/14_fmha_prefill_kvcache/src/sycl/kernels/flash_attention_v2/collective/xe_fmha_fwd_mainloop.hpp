@@ -463,17 +463,6 @@ struct KSlmStorage<Traits, true> {
   cute::array_aligned<typename Traits::Element, cute::cosize_v<typename Traits::GrpLayout>> smem_k;
 };
 
-template <bool Enabled>
-struct RelativeBiasArguments {};
-
-template <>
-struct RelativeBiasArguments<true> {
-  cutlass::bfloat16_t const* ptr = nullptr;
-  int64_t token_stride = 0;
-  int64_t head_stride = 0;
-  int extent = 0;
-};
-
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <
@@ -731,7 +720,10 @@ struct FMHAFwdMainloop<
     int window_size_left = -1;
     int window_size_right = -1;
     ElementScoreStore* ptr_score = nullptr;
-    [[no_unique_address]] RelativeBiasArguments<HasRelBias> relative_bias{};
+    cutlass::bfloat16_t const* ptr_rel_bias = nullptr;
+    int64_t rel_bias_token_stride = 0;
+    int64_t rel_bias_head_stride = 0;
+    int rel_bias_extent = 0;
   };
 
   // Kernel-facing parameters
@@ -760,10 +752,11 @@ struct FMHAFwdMainloop<
         args.max_num_pages_per_seq,
         args.window_size_left,
         args.window_size_right,
-        ScoreBlock2D ? reinterpret_cast<ElementScoreStore*>(workspace) : nullptr};
-    if constexpr (HasRelBias) {
-      params.relative_bias = args.relative_bias;
-    }
+        ScoreBlock2D ? reinterpret_cast<ElementScoreStore*>(workspace) : nullptr,
+        args.ptr_rel_bias,
+        args.rel_bias_token_stride,
+        args.rel_bias_head_stride,
+        args.rel_bias_extent};
     return params;
   }
 
@@ -776,6 +769,7 @@ struct FMHAFwdMainloop<
       FragS& scores,
       int K,
       ElementS& score_scale,
+      TiledMMAQK const& mma_qk,
       int seq_len,
       int q_head,
       int q_token_offset,
@@ -784,20 +778,19 @@ struct FMHAFwdMainloop<
     if constexpr (HasRelBias) {
       constexpr ElementS kLog2e = ElementS(1.4426950408889634074);
       constexpr int k_tile = get<1>(TileShapeQK{});
-      auto bias_shape = make_shape(seq_len, params.relative_bias.head_stride);
-      auto bias_layout = make_layout(bias_shape, make_stride(params.relative_bias.token_stride, Int<1>{}));
+      auto bias_shape = make_shape(seq_len, params.rel_bias_head_stride);
+      auto bias_layout = make_layout(bias_shape, make_stride(params.rel_bias_token_stride, Int<1>{}));
       auto bias_head_ptr =
-          params.relative_bias.ptr + int64_t(q_token_offset) * params.relative_bias.token_stride +
-          int64_t(q_head) * params.relative_bias.head_stride;
+          params.ptr_rel_bias + int64_t(q_token_offset) * params.rel_bias_token_stride +
+          int64_t(q_head) * params.rel_bias_head_stride;
       Tensor Bias = make_tensor(make_gmem_ptr(bias_head_ptr), bias_layout);
       Tensor cBias = make_identity_tensor(bias_shape);
       Tensor gBias = local_tile(cBias, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), _));
-      TiledMMAQK mma_qk{};
       auto copy_bias_load = make_block_2d_copy_C(mma_qk, Bias);
       auto thr_copy_bias_load = copy_bias_load.get_slice(thr_id);
       auto tBiasLoadG = thr_copy_bias_load.partition_S(gBias);
       int const bias_col = K * k_tile;
-      if (bias_col + k_tile <= params.relative_bias.head_stride) {
+      if (bias_col + k_tile <= params.rel_bias_head_stride) {
         auto tBiasLoadR = thr_copy_bias_load.partition_sg_fragment_D(gBias(_, _, 0));
         auto bias =
             make_subgroup_tensor(make_fragment_like<cutlass::bfloat16_t>(scores.layout()), scores.tv_layout());
@@ -805,7 +798,8 @@ struct FMHAFwdMainloop<
         reorder(tBiasLoadR, bias);
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < scores.size(); ++i) {
-          scores(i) = score_scale * scores(i) + kLog2e * static_cast<ElementS>(bias(i));
+          ElementS const scaled_bias = kLog2e * static_cast<ElementS>(bias(i));
+          scores(i) = sycl::mad(score_scale, scores(i), scaled_bias);
         }
         score_scale = ElementS(1);
       }
@@ -1465,7 +1459,7 @@ struct FMHAFwdMainloop<
               cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
             }
           } else {
-            apply_relative_bias(tSrS, K, softmax_scale, seq_len, q_head, q_token_offset, blk_qv, thr_id);
+            apply_relative_bias(tSrS, K, softmax_scale, mma_qk, seq_len, q_head, q_token_offset, blk_qv, thr_id);
             auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum, softmax_scale);
             reorder(tSrS, tArP);
 
