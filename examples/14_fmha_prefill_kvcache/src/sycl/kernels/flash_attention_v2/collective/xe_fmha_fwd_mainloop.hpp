@@ -774,10 +774,24 @@ struct FMHAFwdMainloop<
       int q_head,
       int q_token_offset,
       QVCoord const& blk_qv,
-      int thr_id) const {
+      int thr_id,
+      int full_tile_offset) const {
     if constexpr (HasRelBias) {
       constexpr ElementS kLog2e = ElementS(1.4426950408889634074);
       constexpr int k_tile = get<1>(TileShapeQK{});
+      constexpr int q_tile = get<0>(TileShapeQK{});
+      int const bias_col = K * k_tile;
+      // The relative bias b(i,j) = R[i, i-j] is exactly zero unless the distance
+      // rel = row_kv - col falls in [0, extent). The host zero-fills the rest, so a
+      // K block whose whole [bias_col, bias_col+k_tile) column span lies outside the
+      // band for every row_kv in this Q tile contributes only zeros -- skip its load
+      // and add entirely. row_kv for this tile spans [R0, R1]; a straight-through walk
+      // (the current code) reads the full padded_k row, which at seq >> extent is
+      // mostly zeros. This prune is exact: no accuracy change, only traffic removed.
+      int const R0 = get<0>(blk_qv) * q_tile + full_tile_offset;  // min row_kv in tile
+      int const R1 = R0 + q_tile - 1;                             // max row_kv in tile
+      bool const in_band =
+          (bias_col <= R1) && (bias_col + k_tile - 1 > R0 - params.rel_bias_extent);
       auto bias_shape = make_shape(seq_len, params.rel_bias_head_stride);
       auto bias_layout = make_layout(bias_shape, make_stride(params.rel_bias_token_stride, Int<1>{}));
       auto bias_head_ptr =
@@ -789,8 +803,7 @@ struct FMHAFwdMainloop<
       auto copy_bias_load = make_block_2d_copy_C(mma_qk, Bias);
       auto thr_copy_bias_load = copy_bias_load.get_slice(thr_id);
       auto tBiasLoadG = thr_copy_bias_load.partition_S(gBias);
-      int const bias_col = K * k_tile;
-      if (bias_col + k_tile <= params.rel_bias_head_stride) {
+      if (in_band && bias_col + k_tile <= params.rel_bias_head_stride) {
         auto tBiasLoadR = thr_copy_bias_load.partition_sg_fragment_D(gBias(_, _, 0));
         auto bias =
             make_subgroup_tensor(make_fragment_like<cutlass::bfloat16_t>(scores.layout()), scores.tv_layout());
@@ -1459,7 +1472,8 @@ struct FMHAFwdMainloop<
               cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
             }
           } else {
-            apply_relative_bias(tSrS, K, softmax_scale, mma_qk, seq_len, q_head, q_token_offset, blk_qv, thr_id);
+            apply_relative_bias(
+                tSrS, K, softmax_scale, mma_qk, seq_len, q_head, q_token_offset, blk_qv, thr_id, full_tile_offset);
             auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum, softmax_scale);
             reorder(tSrS, tArP);
 
