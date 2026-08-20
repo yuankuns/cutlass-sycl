@@ -102,7 +102,9 @@ struct Arguments {
 
   // Optional dense relative logits: [total_q, h, seqlen_k], unpadded in both dimensions
   // (rel_bias_head_stride is the column count, not a rounded-up pitch). Strides are in
-  // elements.
+  // elements. Any shape is accepted; rel_bias_can_block_2d decides whether it can be read
+  // with the block 2D atom or has to go element by element, so a caller free to choose its
+  // layout still wants a 64B-aligned base and a token stride that is a multiple of 8.
   void* __restrict__ rel_bias_ptr = nullptr;
   int64_t rel_bias_token_stride = 0;
   int64_t rel_bias_head_stride = 0;

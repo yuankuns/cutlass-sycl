@@ -467,20 +467,41 @@ struct KSlmStorage<Traits, true> {
 
 // The relative-bias surface is the caller's tensor as-is -- dense [q, h, k], no padding on
 // either axis -- so the block 2D atom is only legal when that shape happens to satisfy the
-// hardware rules (see cute/atom/copy_traits_xe_2d.hpp): 64B-aligned base, width and pitch a
-// multiple of 4B and at least 64B, and an x offset that is a multiple of 4 elements. The
-// batch and head offsets are carried in the surface coordinates rather than the base pointer
-// (see FMHAFwdMainloop::add_rel_bias_tile), so only the strides matter, which makes this a
-// host-side question: the answer is baked into the kernel as RelBiasBlock2D and the other
-// load never gets compiled. head_stride is both the surface width of head 0 (so >= 64B, i.e.
-// >= 32 elements) and the x-offset granularity of the later heads (so a multiple of 4
-// elements). An odd seqlen_k fails the pitch rule; those runs read the bias element by
-// element instead.
+// hardware's surface rules. The batch and head offsets are carried in the surface
+// coordinates rather than the base pointer (see FMHAFwdMainloop::add_rel_bias_tile), so only
+// the strides matter, which makes this a host-side question: the answer is baked into the
+// kernel as RelBiasBlock2D and the other load never gets compiled.
+//
+// Taking the rules one at a time, with head_stride = seqlen_k the column count:
+//   - base: the allocation itself, never rebased, so one 64B check.
+//   - width (>= 64B, a multiple of 4B). Head h's surface is (h+1)*head_stride elements wide,
+//     so an even head_stride makes every head's width a multiple of 4B. The narrowest is
+//     head 0's, which is where the 64B minimum bites: head_stride >= 32 elements.
+//   - x offset (a multiple of 4B, i.e. 2 elements). The tile's column origin is
+//     q_head*head_stride plus a multiple of the 32-wide K tile, so an even head_stride covers
+//     this too -- it is the same condition as the width.
+//   - pitch (>= 64B, a multiple of 16B). The full row stride, so token_stride must be a
+//     multiple of 8 elements and >= 32. This is the one the caller cannot dodge by
+//     reshaping, because rows are rows: viewing the tensor as [q*h, k] instead would only
+//     move the requirement onto head_stride, and its rows are no longer contiguous.
+//
+// The pitch rule is worth spelling out because it is the one cute does not catch: the
+// assert in copy_traits_xe_2d.hpp only checks the 4B that the descriptor encoding needs, so
+// a 4B-but-not-16B pitch is accepted there and then silently reads the wrong columns. An
+// earlier version of this predicate asked for 4B and produced wrong results for, e.g.,
+// seqlen_k = 1004 with one head; relative.unaligned_pitch covers that shape now.
+//
+// Whatever is left over reads the bias element by element instead. That is correct but
+// slower -- on the 4k production shape the bias costs 0.145 ms through the block 2D load and
+// 0.437 ms element by element -- so callers who can choose their layout still want
+// heads_q * seqlen_k to be a multiple of 8.
 CUTLASS_HOST_DEVICE inline bool rel_bias_can_block_2d(
     void const* ptr_rel_bias, int64_t rel_bias_token_stride, int64_t rel_bias_head_stride) {
   constexpr int64_t kElemsPer64B = 64 / int64_t(sizeof(cutlass::bfloat16_t));
-  return (rel_bias_head_stride % 4 == 0) && (rel_bias_head_stride >= kElemsPer64B) &&
-      (rel_bias_token_stride % 2 == 0) && (rel_bias_token_stride >= kElemsPer64B) &&
+  constexpr int64_t kElemsPer16B = 16 / int64_t(sizeof(cutlass::bfloat16_t));
+  constexpr int64_t kElemsPer4B = 4 / int64_t(sizeof(cutlass::bfloat16_t));
+  return (rel_bias_head_stride % kElemsPer4B == 0) && (rel_bias_head_stride >= kElemsPer64B) &&
+      (rel_bias_token_stride % kElemsPer16B == 0) && (rel_bias_token_stride >= kElemsPer64B) &&
       (reinterpret_cast<uintptr_t>(ptr_rel_bias) % 64 == 0);
 }
 

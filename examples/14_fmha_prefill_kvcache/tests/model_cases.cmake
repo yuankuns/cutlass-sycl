@@ -328,6 +328,26 @@ fmha_prefill_add_case(relative.small_k_scalar
   HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 64 REL_EXTENT 16
   ATOL 5e-3 RTOL 5e-3)
 
+# One head, so the row pitch is seqlen_k itself: 1004 elements is 2008B, a multiple of 4B
+# but not of the 16B the surface pitch has to be.  cute's assert does not catch that, so
+# before rel_bias_can_block_2d tested for 16B this shape took the block 2D load and read
+# shifted columns -- every output element was wrong.  It now takes the scalar load.
+fmha_prefill_add_case(relative.unaligned_pitch
+  COVERAGE BOUNDARY RELATIVE_BIAS PAGED CAUSAL
+  BATCH 2 SEQLEN_Q 300 SEQLEN_K 1004 HEADS_Q 1 HEADS_KV 1
+  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 128 REL_EXTENT 128
+  ATOL 5e-3 RTOL 5e-3)
+
+# The mirror image: seqlen_k = 1002 is only 2-element aligned, but four heads make the
+# pitch 4008 elements = 8016B, a multiple of 16B, so the block 2D load applies.  The head
+# column offsets (1002, 2004, 3006 elements) are then 4B- but not 8B-aligned, which is all
+# the x offset needs.
+fmha_prefill_add_case(relative.unaligned_head_stride
+  COVERAGE BOUNDARY RELATIVE_BIAS PAGED CAUSAL
+  BATCH 2 SEQLEN_Q 300 SEQLEN_K 1002 HEADS_Q 4 HEADS_KV 2
+  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 128 REL_EXTENT 128
+  ATOL 5e-3 RTOL 5e-3)
+
 fmha_prefill_add_case(relative.production_4k
   COVERAGE RELATIVE_BIAS PAGED CAUSAL
   BATCH 1 SEQLEN_Q 4096 SEQLEN_K 4096 HEADS_Q 1 HEADS_KV 1
