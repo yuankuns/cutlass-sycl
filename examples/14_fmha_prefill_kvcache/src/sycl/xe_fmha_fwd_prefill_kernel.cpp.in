@@ -117,9 +117,19 @@ void FmhaPrefillRunner<@HEAD_DIM@>::operator()(const Arguments& params) const {
   if (params.rel_bias_ptr != nullptr) {
     TORCH_CHECK(params.dv == 128, "relative attention requires head_dim_v == 128");
     TORCH_CHECK(!use_sink, "relative attention does not support sink logits");
-    using RelTileShapeQK = cute::Shape<cute::Int<256>, cute::Int<32>, cute::_32>;
-    using RelTileShapePV = cute::Shape<cute::Int<256>, cute::_32, cute::Int<32>>;
-    using RelTileShapeOutput = cute::Shape<cute::Int<256>, cute::Int<128>>;
+    // The bias is sheared against this tile geometry by whichever kernel produced it, so a
+    // mismatch is a layout error, not a shape the kernel can adapt to.
+    TORCH_CHECK(
+        params.rel_bias_head_stride == prefill::rel_bias_padded_cols(params.rel_bias_extent),
+        "relative attention expects a sheared bias with ",
+        prefill::rel_bias_padded_cols(params.rel_bias_extent),
+        " columns for rel_extent ",
+        params.rel_bias_extent,
+        ", got ",
+        params.rel_bias_head_stride);
+    using RelTileShapeQK = cute::Shape<cute::Int<prefill::kRelBiasQTile>, cute::Int<prefill::kRelBiasKTile>, cute::_32>;
+    using RelTileShapePV = cute::Shape<cute::Int<prefill::kRelBiasQTile>, cute::_32, cute::Int<32>>;
+    using RelTileShapeOutput = cute::Shape<cute::Int<prefill::kRelBiasQTile>, cute::Int<128>>;
     using RelSubgroupLayoutQK =
         cute::Layout<cute::Shape<cute::Int<16>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {

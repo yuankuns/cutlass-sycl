@@ -309,43 +309,44 @@ fmha_prefill_add_case(relative.noncausal_k_tail
   HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 64 REL_EXTENT 33
   ATOL 5e-3 RTOL 5e-3)
 
-# seqlen_k = 1000 is 4-element aligned, so the bias keeps the block 2D fast path, but is
-# not a multiple of the 32-wide K tile: the last block hangs over the end of the head's
-# columns, which the surface's width bound turns into zeros.  Two batches and four heads
-# also exercise the row/column offsets folded into the surface coordinates -- head 1
-# starts 2000B into the row, so it is not a 64B-aligned base of its own.
+# The bias columns are sheared, so seqlen_k no longer sets the surface geometry.  What
+# seqlen_k = 1000 still exercises is the sequence tail: it is not a multiple of the 32-wide
+# K tile, so the last block hangs over the end of the sequence.  Two batches and four heads
+# also exercise the row/column offsets folded into the surface coordinates.
 fmha_prefill_add_case(relative.block2d_k_tail
   COVERAGE BOUNDARY RELATIVE_BIAS PAGED CAUSAL
   BATCH 2 SEQLEN_Q 300 SEQLEN_K 1000 HEADS_Q 4 HEADS_KV 2
   HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 128 REL_EXTENT 128
   ATOL 5e-3 RTOL 5e-3)
 
-# seqlen_k = 24 makes the bias rows narrower than the 64B minimum surface width, so the
-# block 2D atom cannot describe them at all and the whole launch takes the scalar load.
-fmha_prefill_add_case(relative.small_k_scalar
+# The three cases below pin rel_bias_can_block_2d.  The column count is rel_extent + 288,
+# so rel_extent is what moves the strides now; Inkling's rel_extent % 128 == 0 always lands
+# on the fast path, and these are the shapes that do not.
+#
+# 33 + 288 = 321 columns, an odd width and an odd pitch: no surface can describe it, so the
+# whole launch takes the scalar load.
+fmha_prefill_add_case(relative.odd_extent_scalar
   COVERAGE BOUNDARY RELATIVE_BIAS PAGED CAUSAL
-  BATCH 2 SEQLEN_Q 24 SEQLEN_K 24 HEADS_Q 4 HEADS_KV 2
-  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 64 REL_EXTENT 16
+  BATCH 2 SEQLEN_Q 300 SEQLEN_K 512 HEADS_Q 1 HEADS_KV 1
+  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 128 REL_EXTENT 33
   ATOL 5e-3 RTOL 5e-3)
 
-# One head, so the row pitch is seqlen_k itself: 1004 elements is 2008B, a multiple of 4B
-# but not of the 16B the surface pitch has to be.  cute's assert does not catch that, so
-# before rel_bias_can_block_2d tested for 16B this shape took the block 2D load and read
-# shifted columns -- every output element was wrong.  It now takes the scalar load.
+# 132 + 288 = 420 columns with one head, so the pitch is 420 elements = 840B: a multiple of
+# 4B but not of the 16B a surface pitch needs.  cute's assert does not catch that, so before
+# rel_bias_can_block_2d tested for 16B this took the block 2D load and read shifted columns.
 fmha_prefill_add_case(relative.unaligned_pitch
   COVERAGE BOUNDARY RELATIVE_BIAS PAGED CAUSAL
-  BATCH 2 SEQLEN_Q 300 SEQLEN_K 1004 HEADS_Q 1 HEADS_KV 1
-  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 128 REL_EXTENT 128
+  BATCH 2 SEQLEN_Q 300 SEQLEN_K 512 HEADS_Q 1 HEADS_KV 1
+  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 128 REL_EXTENT 132
   ATOL 5e-3 RTOL 5e-3)
 
-# The mirror image: seqlen_k = 1002 is only 2-element aligned, but four heads make the
-# pitch 4008 elements = 8016B, a multiple of 16B, so the block 2D load applies.  The head
-# column offsets (1002, 2004, 3006 elements) are then 4B- but not 8B-aligned, which is all
-# the x offset needs.
+# The mirror image: 130 + 288 = 418 columns is only 2-element aligned, but four heads make
+# the pitch 1672 elements = 3344B, a multiple of 16B, so the block 2D load applies.  The
+# head column offsets are then 4B- but not 8B-aligned, which is all the x offset needs.
 fmha_prefill_add_case(relative.unaligned_head_stride
   COVERAGE BOUNDARY RELATIVE_BIAS PAGED CAUSAL
-  BATCH 2 SEQLEN_Q 300 SEQLEN_K 1002 HEADS_Q 4 HEADS_KV 2
-  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 128 REL_EXTENT 128
+  BATCH 2 SEQLEN_Q 300 SEQLEN_K 512 HEADS_Q 4 HEADS_KV 2
+  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 128 REL_EXTENT 130
   ATOL 5e-3 RTOL 5e-3)
 
 fmha_prefill_add_case(relative.production_4k

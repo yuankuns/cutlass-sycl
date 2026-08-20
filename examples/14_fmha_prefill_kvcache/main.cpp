@@ -334,10 +334,10 @@ void run_prefill(
   params.o_ptr = out;
   params.softmax_sink_ptr = cfg.sink ? sinks : nullptr;
   params.rel_bias_ptr = cfg.relative_bias ? rel_bias : nullptr;
-  // Dense [total_q, h, seqlen_k] logits: no padding in either dimension, the kernel
-  // handles the K tail (and any surface the block 2D atom cannot address) itself.
-  params.rel_bias_token_stride = static_cast<int64_t>(cfg.heads_q) * cfg.seqlen_k;
-  params.rel_bias_head_stride = cfg.seqlen_k;
+  // Sheared [total_q, h, rel_bias_padded_cols(rel_extent)] bias.
+  const int64_t rel_bias_cols = prefill::rel_bias_padded_cols(cfg.rel_extent);
+  params.rel_bias_token_stride = static_cast<int64_t>(cfg.heads_q) * rel_bias_cols;
+  params.rel_bias_head_stride = rel_bias_cols;
   params.rel_bias_extent = cfg.relative_bias ? cfg.rel_extent : 0;
   params.skip_batch_mask_ptr = nullptr;
   params.cu_seqlens_q = reinterpret_cast<int*>(cu_q);
@@ -558,25 +558,33 @@ int main(int argc, char** argv) {
         cfg.relative_bias
             ? make_random_bf16(static_cast<std::size_t>(total_q) * cfg.heads_q * cfg.rel_extent, rng)
             : std::vector<bf16_t>{};
-    std::vector<bf16_t> dense_rel_bias_host;
+    std::vector<bf16_t> sheared_rel_bias_host;
     if (cfg.relative_bias) {
-      // Expand the [q, h, rel] band into the dense [q, h, k] logits the kernel reads.
-      // Exactly total_q rows and seqlen_k columns: no tile padding on either axis.
-      dense_rel_bias_host.resize(
-          static_cast<std::size_t>(total_q) * cfg.heads_q * cfg.seqlen_k, bf16_t(0.0f));
+      // Stand-in for the shearing kernel: right-align each Q tile's band into a
+      // k_tile-aligned column window, so the kernel reads a rectangle where the band is a
+      // diagonal.  Out-of-band columns are zero; the masks drive those scores to -inf
+      // independently, so the value only has to be finite.
+      const int bias_cols = prefill::rel_bias_padded_cols(cfg.rel_extent);
+      sheared_rel_bias_host.resize(
+          static_cast<std::size_t>(total_q) * cfg.heads_q * bias_cols, bf16_t(0.0f));
       for (int b = 0; b < cfg.batch; ++b) {
         for (int q_local = 0; q_local < cfg.seqlen_q; ++q_local) {
           const int q_global = b * cfg.seqlen_q + q_local;
           const int row_kv = cfg.seqlen_k - cfg.seqlen_q + q_local;
+          const int row_kv_first = row_kv - (q_local % prefill::kRelBiasQTile);
+          const int col_origin = cutlass::fmha::collective::rel_bias_col_origin(
+              row_kv_first, cfg.rel_extent, prefill::kRelBiasKTile);
           for (int h = 0; h < cfg.heads_q; ++h) {
             const auto src_base =
                 (static_cast<std::size_t>(q_global) * cfg.heads_q + h) * cfg.rel_extent;
             const auto dst_base =
-                (static_cast<std::size_t>(q_global) * cfg.heads_q + h) * cfg.seqlen_k;
-            for (int col = 0; col < cfg.seqlen_k; ++col) {
+                (static_cast<std::size_t>(q_global) * cfg.heads_q + h) * bias_cols;
+            for (int c = 0; c < bias_cols; ++c) {
+              const int col = c + col_origin;
+              if (col < 0 || col >= cfg.seqlen_k) continue;
               const int rel = row_kv - col;
               if (rel >= 0 && rel < cfg.rel_extent) {
-                dense_rel_bias_host[dst_base + col] = rel_bias_host[src_base + rel];
+                sheared_rel_bias_host[dst_base + c] = rel_bias_host[src_base + rel];
               }
             }
           }
@@ -608,8 +616,8 @@ int main(int argc, char** argv) {
       sinks_dev.copy_from_host(sinks_host);
     }
     if (cfg.relative_bias) {
-      rel_bias_dev = DeviceBuffer<bf16_t>(q, dense_rel_bias_host.size());
-      rel_bias_dev.copy_from_host(dense_rel_bias_host);
+      rel_bias_dev = DeviceBuffer<bf16_t>(q, sheared_rel_bias_host.size());
+      rel_bias_dev.copy_from_host(sheared_rel_bias_host);
     }
 
     std::cout << "device: " << q.get_device().get_info<sycl::info::device::name>() << "\n";

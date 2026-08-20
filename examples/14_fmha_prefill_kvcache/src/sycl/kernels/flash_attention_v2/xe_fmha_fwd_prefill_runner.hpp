@@ -74,6 +74,18 @@ std::string torch_check_message(Args&&... args) {
 #endif
 #endif
 
+// Tile geometry of the relative-attention kernel. RelTileShapeQK in
+// xe_fmha_fwd_prefill_kernel.cpp.in is built from these, and the kernel that shears the bias
+// has to use the same values -- retuning the tiles changes the layout the kernel expects.
+inline constexpr int kRelBiasQTile = 256;
+inline constexpr int kRelBiasKTile = 32;
+
+// Column count of the sheared bias. Padding covers the band's drift across a Q tile plus the
+// alignment slack of the K tile.
+inline constexpr int rel_bias_padded_cols(int rel_extent) {
+  return cutlass::fmha::collective::rel_bias_padded_cols(rel_extent, kRelBiasQTile, kRelBiasKTile);
+}
+
 struct Arguments {
   // The QKV matrices.
   void* __restrict__ q_ptr;
@@ -100,11 +112,10 @@ struct Arguments {
   void* __restrict__ o_ptr;
   void* __restrict__ oaccum_ptr;
 
-  // Optional dense relative logits: [total_q, h, seqlen_k], unpadded in both dimensions
-  // (rel_bias_head_stride is the column count, not a rounded-up pitch). Strides are in
-  // elements. Any shape is accepted; rel_bias_can_block_2d decides whether it can be read
-  // with the block 2D atom or has to go element by element, so a caller free to choose its
-  // layout still wants a 64B-aligned base and a token stride that is a multiple of 8.
+  // Sheared relative bias: [total_q, h, rel_bias_padded_cols(rel_extent)], bf16, produced by
+  // a prior kernel and consumed only here. The producer must use the same tile geometry --
+  // see prefill::rel_bias_padded_cols; the kernel entry checks the stride against it. Strides
+  // are in elements.
   void* __restrict__ rel_bias_ptr = nullptr;
   int64_t rel_bias_token_stride = 0;
   int64_t rel_bias_head_stride = 0;
