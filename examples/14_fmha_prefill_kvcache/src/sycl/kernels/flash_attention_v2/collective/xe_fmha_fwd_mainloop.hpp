@@ -465,6 +465,25 @@ struct KSlmStorage<Traits, true> {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+// The relative-bias surface is the caller's tensor as-is -- dense [q, h, k], no padding on
+// either axis -- so the block 2D atom is only legal when that shape happens to satisfy the
+// hardware rules (see cute/atom/copy_traits_xe_2d.hpp): 64B-aligned base, width and pitch a
+// multiple of 4B and at least 64B, and an x offset that is a multiple of 4 elements. The
+// batch and head offsets are carried in the surface coordinates rather than the base pointer
+// (see FMHAFwdMainloop::add_rel_bias_tile), so only the strides matter, which makes this a
+// host-side question: the answer is baked into the kernel as RelBiasBlock2D and the other
+// load never gets compiled. head_stride is both the surface width of head 0 (so >= 64B, i.e.
+// >= 32 elements) and the x-offset granularity of the later heads (so a multiple of 4
+// elements). An odd seqlen_k fails the pitch rule; those runs read the bias element by
+// element instead.
+CUTLASS_HOST_DEVICE inline bool rel_bias_can_block_2d(
+    void const* ptr_rel_bias, int64_t rel_bias_token_stride, int64_t rel_bias_head_stride) {
+  constexpr int64_t kElemsPer64B = 64 / int64_t(sizeof(cutlass::bfloat16_t));
+  return (rel_bias_head_stride % 4 == 0) && (rel_bias_head_stride >= kElemsPer64B) &&
+      (rel_bias_token_stride % 2 == 0) && (rel_bias_token_stride >= kElemsPer64B) &&
+      (reinterpret_cast<uintptr_t>(ptr_rel_bias) % 64 == 0);
+}
+
 template <
     class DispatchPolicy_,
     bool CausalMask_,
@@ -489,7 +508,12 @@ template <
     // KV position, so per-row masking must use a fixed decode row. Default
     // false keeps prefill (and non-packed decode) unaffected.
     bool PackGQA_ = false,
-    bool HasRelBias_ = false>
+    bool HasRelBias_ = false,
+    // Whether the relative-bias tensor can be read with the block 2D atom. Decided on
+    // the host from the caller's pointer and strides (rel_bias_can_block_2d) and baked
+    // in here, because the two loads are different enough that having both in one
+    // kernel costs the fast one register pressure it cannot afford.
+    bool RelBiasBlock2D_ = true>
 struct FMHAFwdMainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
@@ -516,7 +540,8 @@ template <
     class TiledCopyV_cache_,
     bool LocalMask_,
     bool PackGQA_,
-    bool HasRelBias_>
+    bool HasRelBias_,
+    bool RelBiasBlock2D_>
 struct FMHAFwdMainloop<
     XeDefault<Stages>,
     CausalMask_,
@@ -537,7 +562,8 @@ struct FMHAFwdMainloop<
     TiledCopyV_cache_,
     LocalMask_,
     PackGQA_,
-    HasRelBias_> {
+    HasRelBias_,
+    RelBiasBlock2D_> {
   //
   // Type Aliases
   //
@@ -613,6 +639,7 @@ struct FMHAFwdMainloop<
 
   static constexpr bool CausalMask = CausalMask_;
   static constexpr bool HasRelBias = HasRelBias_;
+  static constexpr bool RelBiasBlock2D = RelBiasBlock2D_;
   static constexpr bool CachedKV = CachedKV_;
   static constexpr bool PagedKV = PagedKV_;
   static constexpr bool LocalMask = LocalMask_;
@@ -764,28 +791,12 @@ struct FMHAFwdMainloop<
     return true;
   }
 
-  // The bias surface is the caller's tensor as-is -- dense [q, h, k], no padding on either
-  // axis -- so the block 2D atom is only legal when that shape happens to satisfy the
-  // hardware rules (see cute/atom/copy_traits_xe_2d.hpp): 64B-aligned base, width and
-  // pitch a multiple of 4B and at least 64B, and an x offset that is a multiple of 4
-  // elements. The batch/head offsets are carried in the surface coordinates rather than
-  // the base pointer (see add_rel_bias_tile), so only the strides matter here and the
-  // answer is uniform across the grid. An odd seqlen_k fails it; those runs load the bias
-  // element by element instead.
-  CUTLASS_DEVICE bool rel_bias_can_block_2d() const {
-    constexpr int64_t kElemsPer64B = 64 / int64_t(sizeof(cutlass::bfloat16_t));
-    return (params.rel_bias_head_stride % 4 == 0) && (params.rel_bias_token_stride % 2 == 0) &&
-        (params.rel_bias_token_stride >= kElemsPer64B) &&
-        (reinterpret_cast<uintptr_t>(params.ptr_rel_bias) % 64 == 0);
-  }
-
   // Adds one K block of the relative bias into the scores, folding the still-pending
-  // softmax scale into the same multiply-add. Block2D picks the fast path: one 2D block
-  // load covers the whole tile. The other instantiation loads element by element and is
-  // used for the K tail (the last block is partial whenever seqlen_k is not a multiple of
-  // k_tile) and for surfaces the block 2D atom cannot address at all. Templated rather
-  // than branched so the fast path keeps its straight-line, fully unrolled form.
-  template <bool Block2D, typename QVCoord>
+  // softmax scale into the same multiply-add. RelBiasBlock2D picks the fast path: one 2D
+  // block load covers the whole tile. The other instantiation loads element by element and
+  // serves the surfaces the block 2D atom cannot address at all. The choice is made on the
+  // host, so only one of the two is ever compiled into a given kernel.
+  template <typename QVCoord>
   CUTLASS_DEVICE void add_rel_bias_tile(
       FragS& scores,
       ElementS& score_scale,
@@ -799,14 +810,22 @@ struct FMHAFwdMainloop<
     constexpr ElementS kLog2e = ElementS(1.4426950408889634074);
     constexpr int k_tile = get<1>(TileShapeQK{});
     int const bias_cols = static_cast<int>(params.rel_bias_head_stride);
-    if constexpr (Block2D) {
-      // The surface is the whole [q, h*k] tensor, based at the (64B-aligned) allocation:
-      // the row offset of this batch and the column offset of this head go into the tile
-      // coordinates instead, where they carry no alignment requirement beyond the x
-      // offset checked in rel_bias_can_block_2d. Height stops at the end of this batch's
-      // rows, so a Q tile overhanging the sequence reads zeros there rather than the next
-      // batch (or past the tensor).
-      auto surface_shape = make_shape(q_token_offset + bias_rows, params.rel_bias_token_stride);
+    if constexpr (RelBiasBlock2D) {
+      // The surface is the [q, h*k] tensor based at the (64B-aligned) allocation: the row
+      // offset of this batch and the column offset of this head go into the tile
+      // coordinates instead, where they carry no alignment requirement beyond the x offset
+      // checked in rel_bias_can_block_2d. Height stops at the end of this batch's rows and
+      // width at the end of this head's columns, so both a Q tile overhanging the sequence
+      // and a K tile overhanging seqlen_k read zeros there -- rather than the next batch,
+      // the next head, or past the tensor. That is what lets the K tail go through the same
+      // load as every other block; the k-remainder mask has already put -inf in those
+      // scores, so the bound is what keeps the value that is added to it well defined
+      // rather than another head's logits.
+      //
+      // Width is a whole number of heads, so it inherits head_stride's alignment, and the
+      // pitch stays the full row stride. Both extents fit an int -- the width is at most
+      // one row -- while the strides stay 64-bit, which is what addresses the whole tensor.
+      auto surface_shape = make_shape(q_token_offset + bias_rows, (q_head + 1) * bias_cols);
       auto surface_layout = make_layout(surface_shape, make_stride(params.rel_bias_token_stride, Int<1>{}));
       Tensor Bias = make_tensor(make_gmem_ptr(params.ptr_rel_bias), surface_layout);
       Tensor cBias = domain_offset(
@@ -894,13 +913,7 @@ struct FMHAFwdMainloop<
       // belong to the next batch (or to nothing at all, at the end of the tensor) and read
       // as zero, which is what a Q tile overhanging the sequence needs.
       int const bias_rows = seq_len_kv_cache - full_tile_offset;
-      if (bias_col + k_tile <= params.rel_bias_head_stride && rel_bias_can_block_2d()) {
-        add_rel_bias_tile<true>(
-            scores, score_scale, mma_qk, bias_col, bias_rows, q_head, q_token_offset, blk_qv, thr_id);
-      } else {
-        add_rel_bias_tile<false>(
-            scores, score_scale, mma_qk, bias_col, bias_rows, q_head, q_token_offset, blk_qv, thr_id);
-      }
+      add_rel_bias_tile(scores, score_scale, mma_qk, bias_col, bias_rows, q_head, q_token_offset, blk_qv, thr_id);
     }
   }
 

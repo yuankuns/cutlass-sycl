@@ -309,14 +309,23 @@ fmha_prefill_add_case(relative.noncausal_k_tail
   HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 64 REL_EXTENT 33
   ATOL 5e-3 RTOL 5e-3)
 
-# seqlen_k = 1000 is 4-element aligned, so the bias keeps the block 2D fast path,
-# but is not a multiple of the 32-wide K tile: the last block goes through the
-# scalar tail path while the other 31 use the block load.  Two batches and four
-# heads also exercise the row/column offsets folded into the surface coordinates.
+# seqlen_k = 1000 is 4-element aligned, so the bias keeps the block 2D fast path, but is
+# not a multiple of the 32-wide K tile: the last block hangs over the end of the head's
+# columns, which the surface's width bound turns into zeros.  Two batches and four heads
+# also exercise the row/column offsets folded into the surface coordinates -- head 1
+# starts 2000B into the row, so it is not a 64B-aligned base of its own.
 fmha_prefill_add_case(relative.block2d_k_tail
   COVERAGE BOUNDARY RELATIVE_BIAS PAGED CAUSAL
   BATCH 2 SEQLEN_Q 300 SEQLEN_K 1000 HEADS_Q 4 HEADS_KV 2
   HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 128 REL_EXTENT 128
+  ATOL 5e-3 RTOL 5e-3)
+
+# seqlen_k = 24 makes the bias rows narrower than the 64B minimum surface width, so the
+# block 2D atom cannot describe them at all and the whole launch takes the scalar load.
+fmha_prefill_add_case(relative.small_k_scalar
+  COVERAGE BOUNDARY RELATIVE_BIAS PAGED CAUSAL
+  BATCH 2 SEQLEN_Q 24 SEQLEN_K 24 HEADS_Q 4 HEADS_KV 2
+  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 64 REL_EXTENT 16
   ATOL 5e-3 RTOL 5e-3)
 
 fmha_prefill_add_case(relative.production_4k
