@@ -334,9 +334,10 @@ void run_prefill(
   params.o_ptr = out;
   params.softmax_sink_ptr = cfg.sink ? sinks : nullptr;
   params.rel_bias_ptr = cfg.relative_bias ? rel_bias : nullptr;
-  const int rel_bias_padded = ((cfg.seqlen_k + 31) / 32) * 32;
-  params.rel_bias_token_stride = static_cast<int64_t>(cfg.heads_q) * rel_bias_padded;
-  params.rel_bias_head_stride = rel_bias_padded;
+  // Dense [total_q, h, seqlen_k] logits: no padding in either dimension, the kernel
+  // handles the K tail (and any surface the block 2D atom cannot address) itself.
+  params.rel_bias_token_stride = static_cast<int64_t>(cfg.heads_q) * cfg.seqlen_k;
+  params.rel_bias_head_stride = cfg.seqlen_k;
   params.rel_bias_extent = cfg.relative_bias ? cfg.rel_extent : 0;
   params.skip_batch_mask_ptr = nullptr;
   params.cu_seqlens_q = reinterpret_cast<int*>(cu_q);
@@ -557,11 +558,12 @@ int main(int argc, char** argv) {
         cfg.relative_bias
             ? make_random_bf16(static_cast<std::size_t>(total_q) * cfg.heads_q * cfg.rel_extent, rng)
             : std::vector<bf16_t>{};
-    std::vector<bf16_t> aligned_rel_bias_host;
+    std::vector<bf16_t> dense_rel_bias_host;
     if (cfg.relative_bias) {
-      const int padded = ((cfg.seqlen_k + 31) / 32) * 32;
-      aligned_rel_bias_host.resize(
-          static_cast<std::size_t>(total_q + 255) * cfg.heads_q * padded, bf16_t(0.0f));
+      // Expand the [q, h, rel] band into the dense [q, h, k] logits the kernel reads.
+      // Exactly total_q rows and seqlen_k columns: no tile padding on either axis.
+      dense_rel_bias_host.resize(
+          static_cast<std::size_t>(total_q) * cfg.heads_q * cfg.seqlen_k, bf16_t(0.0f));
       for (int b = 0; b < cfg.batch; ++b) {
         for (int q_local = 0; q_local < cfg.seqlen_q; ++q_local) {
           const int q_global = b * cfg.seqlen_q + q_local;
@@ -570,11 +572,11 @@ int main(int argc, char** argv) {
             const auto src_base =
                 (static_cast<std::size_t>(q_global) * cfg.heads_q + h) * cfg.rel_extent;
             const auto dst_base =
-                (static_cast<std::size_t>(q_global) * cfg.heads_q + h) * padded;
+                (static_cast<std::size_t>(q_global) * cfg.heads_q + h) * cfg.seqlen_k;
             for (int col = 0; col < cfg.seqlen_k; ++col) {
               const int rel = row_kv - col;
               if (rel >= 0 && rel < cfg.rel_extent) {
-                aligned_rel_bias_host[dst_base + col] = rel_bias_host[src_base + rel];
+                dense_rel_bias_host[dst_base + col] = rel_bias_host[src_base + rel];
               }
             }
           }
@@ -606,8 +608,8 @@ int main(int argc, char** argv) {
       sinks_dev.copy_from_host(sinks_host);
     }
     if (cfg.relative_bias) {
-      rel_bias_dev = DeviceBuffer<bf16_t>(q, aligned_rel_bias_host.size());
-      rel_bias_dev.copy_from_host(aligned_rel_bias_host);
+      rel_bias_dev = DeviceBuffer<bf16_t>(q, dense_rel_bias_host.size());
+      rel_bias_dev.copy_from_host(dense_rel_bias_host);
     }
 
     std::cout << "device: " << q.get_device().get_info<sycl::info::device::name>() << "\n";

@@ -764,57 +764,142 @@ struct FMHAFwdMainloop<
     return true;
   }
 
+  // The bias surface is the caller's tensor as-is -- dense [q, h, k], no padding on either
+  // axis -- so the block 2D atom is only legal when that shape happens to satisfy the
+  // hardware rules (see cute/atom/copy_traits_xe_2d.hpp): 64B-aligned base, width and
+  // pitch a multiple of 4B and at least 64B, and an x offset that is a multiple of 4
+  // elements. The batch/head offsets are carried in the surface coordinates rather than
+  // the base pointer (see add_rel_bias_tile), so only the strides matter here and the
+  // answer is uniform across the grid. An odd seqlen_k fails it; those runs load the bias
+  // element by element instead.
+  CUTLASS_DEVICE bool rel_bias_can_block_2d() const {
+    constexpr int64_t kElemsPer64B = 64 / int64_t(sizeof(cutlass::bfloat16_t));
+    return (params.rel_bias_head_stride % 4 == 0) && (params.rel_bias_token_stride % 2 == 0) &&
+        (params.rel_bias_token_stride >= kElemsPer64B) &&
+        (reinterpret_cast<uintptr_t>(params.ptr_rel_bias) % 64 == 0);
+  }
+
+  // Adds one K block of the relative bias into the scores, folding the still-pending
+  // softmax scale into the same multiply-add. Block2D picks the fast path: one 2D block
+  // load covers the whole tile. The other instantiation loads element by element and is
+  // used for the K tail (the last block is partial whenever seqlen_k is not a multiple of
+  // k_tile) and for surfaces the block 2D atom cannot address at all. Templated rather
+  // than branched so the fast path keeps its straight-line, fully unrolled form.
+  template <bool Block2D, typename QVCoord>
+  CUTLASS_DEVICE void add_rel_bias_tile(
+      FragS& scores,
+      ElementS& score_scale,
+      TiledMMAQK const& mma_qk,
+      int bias_col,
+      int bias_rows,
+      int q_head,
+      int q_token_offset,
+      QVCoord const& blk_qv,
+      int thr_id) const {
+    constexpr ElementS kLog2e = ElementS(1.4426950408889634074);
+    constexpr int k_tile = get<1>(TileShapeQK{});
+    int const bias_cols = static_cast<int>(params.rel_bias_head_stride);
+    if constexpr (Block2D) {
+      // The surface is the whole [q, h*k] tensor, based at the (64B-aligned) allocation:
+      // the row offset of this batch and the column offset of this head go into the tile
+      // coordinates instead, where they carry no alignment requirement beyond the x
+      // offset checked in rel_bias_can_block_2d. Height stops at the end of this batch's
+      // rows, so a Q tile overhanging the sequence reads zeros there rather than the next
+      // batch (or past the tensor).
+      auto surface_shape = make_shape(q_token_offset + bias_rows, params.rel_bias_token_stride);
+      auto surface_layout = make_layout(surface_shape, make_stride(params.rel_bias_token_stride, Int<1>{}));
+      Tensor Bias = make_tensor(make_gmem_ptr(params.ptr_rel_bias), surface_layout);
+      Tensor cBias = domain_offset(
+          make_coord(q_token_offset, q_head * bias_cols), make_identity_tensor(make_shape(bias_rows, bias_cols)));
+      Tensor gBias = local_tile(cBias, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), _));
+      auto copy_bias_load = make_block_2d_copy_C(mma_qk, Bias);
+      auto thr_copy_bias_load = copy_bias_load.get_slice(thr_id);
+      auto tBiasLoadG = thr_copy_bias_load.partition_S(gBias);
+      auto tBiasLoadR = thr_copy_bias_load.partition_sg_fragment_D(gBias(_, _, 0));
+      auto bias = make_subgroup_tensor(make_fragment_like<cutlass::bfloat16_t>(scores.layout()), scores.tv_layout());
+      copy(copy_bias_load, tBiasLoadG(_, _, _, bias_col / k_tile), tBiasLoadR);
+      reorder(tBiasLoadR, bias);
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < scores.size(); ++i) {
+        ElementS const scaled_bias = kLog2e * static_cast<ElementS>(bias(i));
+        scores(i) = sycl::mad(score_scale, scores(i), scaled_bias);
+      }
+    } else {
+      // The block 2D load bounds-checks against the surface and substitutes zero outside
+      // it; the scalar path has to do that itself, which is what the guards below are for.
+      // Row/column come from the same lane arithmetic the causal mask uses -- fragment
+      // element n*elems_per_n + j is row j of the subgroup's rows and column n*sg_size +
+      // lane -- rather than a partitioned coordinate tensor, which costs registers in a
+      // loop this hot. Lane l therefore reads column l of a 16-wide run, so each element
+      // is still one contiguous 32B gather across the subgroup.
+      auto const bias_head_ptr = params.ptr_rel_bias +
+          int64_t(q_token_offset) * params.rel_bias_token_stride + int64_t(q_head) * params.rel_bias_head_stride;
+      constexpr int sg_tile_q = get<0>(TileShapeQK{}) / SGPerWG::value;
+      constexpr int n_reps = k_tile / intel::sg_size;
+      constexpr int elems_per_n = FragS{}.size() / n_reps;
+      int const lane_id = thr_id % intel::sg_size;
+      int const row_base = get<0>(blk_qv) * get<0>(TileShapeQK{}) + (thr_id / intel::sg_size) * sg_tile_q;
+      int const rows = cute::min(elems_per_n, cute::max(0, bias_rows - row_base));
+      auto const row_ptr = bias_head_ptr + int64_t(row_base) * params.rel_bias_token_stride;
+      CUTLASS_PRAGMA_UNROLL
+      for (int n = 0; n < n_reps; ++n) {
+        int const col = bias_col + n * intel::sg_size + lane_id;
+        auto const col_ptr = row_ptr + col;
+        bool const col_ok = col < bias_cols;
+        CUTLASS_PRAGMA_UNROLL
+        for (int j = 0; j < elems_per_n; ++j) {
+          ElementS bias = ElementS(0);
+          if (col_ok && j < rows) {
+            bias = static_cast<ElementS>(col_ptr[int64_t(j) * params.rel_bias_token_stride]);
+          }
+          scores(n * elems_per_n + j) = sycl::mad(score_scale, scores(n * elems_per_n + j), kLog2e * bias);
+        }
+      }
+    }
+    score_scale = ElementS(1);
+  }
+
   template <typename QVCoord>
   CUTLASS_DEVICE void apply_relative_bias(
       FragS& scores,
       int K,
       ElementS& score_scale,
       TiledMMAQK const& mma_qk,
-      int seq_len,
+      int seq_len_kv_cache,
       int q_head,
       int q_token_offset,
       QVCoord const& blk_qv,
       int thr_id,
       int full_tile_offset) const {
     if constexpr (HasRelBias) {
-      constexpr ElementS kLog2e = ElementS(1.4426950408889634074);
       constexpr int k_tile = get<1>(TileShapeQK{});
       constexpr int q_tile = get<0>(TileShapeQK{});
       int const bias_col = K * k_tile;
+      // Columns past seqlen_k carry no bias at all (and no memory): the k-remainder mask
+      // has already driven those scores to -inf.
+      if (bias_col >= params.rel_bias_head_stride) return;
       // The relative bias b(i,j) = R[i, i-j] is exactly zero unless the distance
       // rel = row_kv - col falls in [0, extent). The host zero-fills the rest, so a
       // K block whose whole [bias_col, bias_col+k_tile) column span lies outside the
       // band for every row_kv in this Q tile contributes only zeros -- skip its load
       // and add entirely. row_kv for this tile spans [R0, R1]; a straight-through walk
-      // (the current code) reads the full padded_k row, which at seq >> extent is
-      // mostly zeros. This prune is exact: no accuracy change, only traffic removed.
+      // reads the full row, which at seq >> extent is mostly zeros. This prune is exact:
+      // no accuracy change, only traffic removed.
       int const R0 = get<0>(blk_qv) * q_tile + full_tile_offset;  // min row_kv in tile
       int const R1 = R0 + q_tile - 1;                             // max row_kv in tile
-      bool const in_band =
-          (bias_col <= R1) && (bias_col + k_tile - 1 > R0 - params.rel_bias_extent);
-      auto bias_shape = make_shape(seq_len, params.rel_bias_head_stride);
-      auto bias_layout = make_layout(bias_shape, make_stride(params.rel_bias_token_stride, Int<1>{}));
-      auto bias_head_ptr =
-          params.ptr_rel_bias + int64_t(q_token_offset) * params.rel_bias_token_stride +
-          int64_t(q_head) * params.rel_bias_head_stride;
-      Tensor Bias = make_tensor(make_gmem_ptr(bias_head_ptr), bias_layout);
-      Tensor cBias = make_identity_tensor(bias_shape);
-      Tensor gBias = local_tile(cBias, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), _));
-      auto copy_bias_load = make_block_2d_copy_C(mma_qk, Bias);
-      auto thr_copy_bias_load = copy_bias_load.get_slice(thr_id);
-      auto tBiasLoadG = thr_copy_bias_load.partition_S(gBias);
-      if (in_band && bias_col + k_tile <= params.rel_bias_head_stride) {
-        auto tBiasLoadR = thr_copy_bias_load.partition_sg_fragment_D(gBias(_, _, 0));
-        auto bias =
-            make_subgroup_tensor(make_fragment_like<cutlass::bfloat16_t>(scores.layout()), scores.tv_layout());
-        copy(copy_bias_load, tBiasLoadG(_, _, _, bias_col / k_tile), tBiasLoadR);
-        reorder(tBiasLoadR, bias);
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < scores.size(); ++i) {
-          ElementS const scaled_bias = kLog2e * static_cast<ElementS>(bias(i));
-          scores(i) = sycl::mad(score_scale, scores(i), scaled_bias);
-        }
-        score_scale = ElementS(1);
+      bool const in_band = (bias_col <= R1) && (bias_col + k_tile - 1 > R0 - params.rel_bias_extent);
+      if (!in_band) return;
+      // Rows index the query, so the surface is exactly this batch's query length tall --
+      // the kernel builds full_tile_offset as seq_len_kv_cache - seq_len_qo. Rows past it
+      // belong to the next batch (or to nothing at all, at the end of the tensor) and read
+      // as zero, which is what a Q tile overhanging the sequence needs.
+      int const bias_rows = seq_len_kv_cache - full_tile_offset;
+      if (bias_col + k_tile <= params.rel_bias_head_stride && rel_bias_can_block_2d()) {
+        add_rel_bias_tile<true>(
+            scores, score_scale, mma_qk, bias_col, bias_rows, q_head, q_token_offset, blk_qv, thr_id);
+      } else {
+        add_rel_bias_tile<false>(
+            scores, score_scale, mma_qk, bias_col, bias_rows, q_head, q_token_offset, blk_qv, thr_id);
       }
     }
   }
@@ -1473,7 +1558,16 @@ struct FMHAFwdMainloop<
             }
           } else {
             apply_relative_bias(
-                tSrS, K, softmax_scale, mma_qk, seq_len, q_head, q_token_offset, blk_qv, thr_id, full_tile_offset);
+                tSrS,
+                K,
+                softmax_scale,
+                mma_qk,
+                seq_len_kv_cache,
+                q_head,
+                q_token_offset,
+                blk_qv,
+                thr_id,
+                full_tile_offset);
             auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum, softmax_scale);
             reorder(tSrS, tArP);
 

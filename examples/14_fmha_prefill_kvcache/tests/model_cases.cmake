@@ -270,43 +270,61 @@ fmha_prefill_add_case(coverage.local_window_paged
 fmha_prefill_add_case(relative.single_q_tile_gqa
   COVERAGE RELATIVE_BIAS PAGED CAUSAL
   BATCH 1 SEQLEN_Q 256 SEQLEN_K 512 HEADS_Q 16 HEADS_KV 8
-  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 128 REL_EXTENT 128)
+  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 128 REL_EXTENT 128
+  ATOL 5e-3 RTOL 5e-3)
 
 fmha_prefill_add_case(relative.multi_q_tile_gqa
   COVERAGE RELATIVE_BIAS PAGED CAUSAL
   BATCH 1 SEQLEN_Q 512 SEQLEN_K 1024 HEADS_Q 16 HEADS_KV 8
-  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 128 REL_EXTENT 128)
+  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 128 REL_EXTENT 128
+  ATOL 5e-3 RTOL 5e-3)
 
 fmha_prefill_add_case(relative.qk_tail_mqa
   COVERAGE BOUNDARY RELATIVE_BIAS PAGED CAUSAL
   BATCH 1 SEQLEN_Q 300 SEQLEN_K 777 HEADS_Q 4 HEADS_KV 1
-  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 128 REL_EXTENT 127)
+  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 128 REL_EXTENT 127
+  ATOL 5e-3 RTOL 5e-3)
 
 fmha_prefill_add_case(relative.multi_batch_gqa
   COVERAGE BOUNDARY RELATIVE_BIAS PAGED CAUSAL
   BATCH 2 SEQLEN_Q 300 SEQLEN_K 777 HEADS_Q 4 HEADS_KV 2
-  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 128 REL_EXTENT 128)
+  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 128 REL_EXTENT 128
+  ATOL 5e-3 RTOL 5e-3)
 
 fmha_prefill_add_case(relative.extent_one
   COVERAGE BOUNDARY RELATIVE_BIAS PAGED CAUSAL
   BATCH 1 SEQLEN_Q 257 SEQLEN_K 513 HEADS_Q 4 HEADS_KV 1
-  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 64 REL_EXTENT 1)
+  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 64 REL_EXTENT 1
+  ATOL 5e-3 RTOL 5e-3)
 
 fmha_prefill_add_case(relative.extent_larger_than_k
   COVERAGE BOUNDARY RELATIVE_BIAS PAGED CAUSAL
   BATCH 1 SEQLEN_Q 256 SEQLEN_K 257 HEADS_Q 4 HEADS_KV 2
-  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 64 REL_EXTENT 1024)
+  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 64 REL_EXTENT 1024
+  ATOL 5e-3 RTOL 5e-3)
 
 fmha_prefill_add_case(relative.noncausal_k_tail
   COVERAGE BOUNDARY RELATIVE_BIAS PAGED
   BATCH 1 SEQLEN_Q 256 SEQLEN_K 257 HEADS_Q 4 HEADS_KV 2
-  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 64 REL_EXTENT 33)
+  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 64 REL_EXTENT 33
+  ATOL 5e-3 RTOL 5e-3)
+
+# seqlen_k = 1000 is 4-element aligned, so the bias keeps the block 2D fast path,
+# but is not a multiple of the 32-wide K tile: the last block goes through the
+# scalar tail path while the other 31 use the block load.  Two batches and four
+# heads also exercise the row/column offsets folded into the surface coordinates.
+fmha_prefill_add_case(relative.block2d_k_tail
+  COVERAGE BOUNDARY RELATIVE_BIAS PAGED CAUSAL
+  BATCH 2 SEQLEN_Q 300 SEQLEN_K 1000 HEADS_Q 4 HEADS_KV 2
+  HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 128 REL_EXTENT 128
+  ATOL 5e-3 RTOL 5e-3)
 
 fmha_prefill_add_case(relative.production_4k
   COVERAGE RELATIVE_BIAS PAGED CAUSAL
   BATCH 1 SEQLEN_Q 4096 SEQLEN_K 4096 HEADS_Q 1 HEADS_KV 1
   HEAD_DIM 128 HEAD_DIM_V 128 PAGE_SIZE 128 REL_EXTENT 1024
-  WARMUP 1 ITERS 1)
+  WARMUP 1 ITERS 1
+  ATOL 5e-3 RTOL 5e-3)
 
 # Tile-boundary scenarios.  These keep head counts small so the CPU reference
 # remains practical, but they cover exact tile multiples, non-multiples, +/-1,

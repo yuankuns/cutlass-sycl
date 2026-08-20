@@ -100,8 +100,9 @@ struct Arguments {
   void* __restrict__ o_ptr;
   void* __restrict__ oaccum_ptr;
 
-  // Optional K-aligned relative logits:
-  // [total_q_padded, h, rel_bias_head_stride]. Strides are in elements.
+  // Optional dense relative logits: [total_q, h, seqlen_k], unpadded in both dimensions
+  // (rel_bias_head_stride is the column count, not a rounded-up pitch). Strides are in
+  // elements.
   void* __restrict__ rel_bias_ptr = nullptr;
   int64_t rel_bias_token_stride = 0;
   int64_t rel_bias_head_stride = 0;
