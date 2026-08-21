@@ -465,47 +465,34 @@ struct KSlmStorage<Traits, true> {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Relative bias, sheared layout: [total_q, h, rel_bias_padded_cols(rel_extent)].
+// Relative bias, sheared layout: [total_q, h, rel_bias_padded_cols(rel_extent)], bf16.
 //
 // The producing kernel right-aligns each Q tile's band into a k_tile-aligned column window
-// (see rel_bias_col_origin), so this kernel reads a rectangular tile where the band is a
-// diagonal. Padding covers the band's drift across a Q tile plus the alignment slack.
-CUTLASS_HOST_DEVICE constexpr int rel_bias_padded_cols(int rel_extent, int q_tile, int k_tile) {
-  return rel_extent + q_tile + k_tile;
+// (rel_bias_col_origin), so this kernel reads a rectangle where the band is a diagonal.
+//
+// The band is widened to a whole number of K tiles. That costs at most one all-zero column
+// block -- and nothing at all for Inkling, whose rel_extent is a multiple of 128 -- and in
+// exchange the column count is a multiple of k_tile, which is what makes the surface
+// unconditionally legal for the block 2D atom: 64B-aligned base from the allocator, width
+// and pitch a multiple of 16B and at least 64B, x offset a multiple of 4B. Note the 16B on
+// the pitch; cute only asserts the 4B its descriptor encoding needs, so a pitch in between
+// is accepted and then silently reads shifted columns.
+CUTLASS_HOST_DEVICE constexpr int rel_bias_band_cols(int rel_extent, int k_tile) {
+  return (rel_extent + k_tile - 1) / k_tile * k_tile;
 }
 
-// Column of the sheared bias that holds kv column `k_tile * n` for a Q tile whose first row
-// sits at KV position `row_kv_first`. Floor division: the window starts at or left of the
-// band, so every in-band column lands in [0, rel_bias_padded_cols).
+// Padding covers the band's drift across a Q tile plus the alignment slack of the K tile.
+CUTLASS_HOST_DEVICE constexpr int rel_bias_padded_cols(int rel_extent, int q_tile, int k_tile) {
+  return rel_bias_band_cols(rel_extent, k_tile) + q_tile + k_tile;
+}
+
+// Column of the sheared bias that holds kv column 0 for a Q tile whose first row sits at KV
+// position `row_kv_first`. Floor division: the window starts at or left of the band, so
+// every in-band column lands in [0, rel_bias_padded_cols).
 CUTLASS_HOST_DEVICE constexpr int rel_bias_col_origin(int row_kv_first, int rel_extent, int k_tile) {
-  int const left = row_kv_first - rel_extent + 1;
+  int const left = row_kv_first - rel_bias_band_cols(rel_extent, k_tile) + 1;
   int const q = left / k_tile;
   return ((left % k_tile != 0 && left < 0) ? q - 1 : q) * k_tile;
-}
-
-// Whether the bias can be read with the block 2D atom. The batch and head offsets ride in
-// the surface coordinates rather than the base pointer (see add_rel_bias_tile), so only the
-// strides matter and the answer is uniform across the grid; it is decided on the host and
-// baked in as RelBiasBlock2D so the other load is never compiled.
-//
-// Surface rules, with head_stride the padded column count: base 64B-aligned; width >= 64B
-// and a multiple of 4B (head h is (h+1)*head_stride wide, so an even head_stride covers
-// every head, and head 0 sets the 32-element floor); x offset a multiple of 4B, which the
-// same evenness gives; pitch >= 64B and a multiple of **16B**, so token_stride must be a
-// multiple of 8. The pitch rule is the one cute does not assert -- it only checks the 4B the
-// descriptor encoding needs -- and a 4B-but-not-16B pitch silently reads shifted columns.
-//
-// The sheared layout satisfies all of this whenever rel_extent is a multiple of 32, which
-// Inkling's rel_extent % 128 == 0 gives. Anything else falls back to the scalar load, which
-// is correct but roughly 3x the bias cost.
-CUTLASS_HOST_DEVICE inline bool rel_bias_can_block_2d(
-    void const* ptr_rel_bias, int64_t rel_bias_token_stride, int64_t rel_bias_head_stride) {
-  constexpr int64_t kElemsPer64B = 64 / int64_t(sizeof(cutlass::bfloat16_t));
-  constexpr int64_t kElemsPer16B = 16 / int64_t(sizeof(cutlass::bfloat16_t));
-  constexpr int64_t kElemsPer4B = 4 / int64_t(sizeof(cutlass::bfloat16_t));
-  return (rel_bias_head_stride % kElemsPer4B == 0) && (rel_bias_head_stride >= kElemsPer64B) &&
-      (rel_bias_token_stride % kElemsPer16B == 0) && (rel_bias_token_stride >= kElemsPer64B) &&
-      (reinterpret_cast<uintptr_t>(ptr_rel_bias) % 64 == 0);
 }
 
 template <
@@ -532,12 +519,7 @@ template <
     // KV position, so per-row masking must use a fixed decode row. Default
     // false keeps prefill (and non-packed decode) unaffected.
     bool PackGQA_ = false,
-    bool HasRelBias_ = false,
-    // Whether the relative-bias tensor can be read with the block 2D atom. Decided on
-    // the host from the caller's pointer and strides (rel_bias_can_block_2d) and baked
-    // in here, because the two loads are different enough that having both in one
-    // kernel costs the fast one register pressure it cannot afford.
-    bool RelBiasBlock2D_ = true>
+    bool HasRelBias_ = false>
 struct FMHAFwdMainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
@@ -564,8 +546,7 @@ template <
     class TiledCopyV_cache_,
     bool LocalMask_,
     bool PackGQA_,
-    bool HasRelBias_,
-    bool RelBiasBlock2D_>
+    bool HasRelBias_>
 struct FMHAFwdMainloop<
     XeDefault<Stages>,
     CausalMask_,
@@ -586,8 +567,7 @@ struct FMHAFwdMainloop<
     TiledCopyV_cache_,
     LocalMask_,
     PackGQA_,
-    HasRelBias_,
-    RelBiasBlock2D_> {
+    HasRelBias_> {
   //
   // Type Aliases
   //
@@ -663,7 +643,16 @@ struct FMHAFwdMainloop<
 
   static constexpr bool CausalMask = CausalMask_;
   static constexpr bool HasRelBias = HasRelBias_;
-  static constexpr bool RelBiasBlock2D = RelBiasBlock2D_;
+  // rel_bias_padded_cols is a whole number of K tiles, which is what makes the bias surface
+  // legal for the block 2D atom whatever rel_extent and heads_q are -- but only while the
+  // tile itself clears the hardware's minimums. Retuning it past these needs the alignment
+  // rethought, not just the constants changed.
+  static_assert(
+      !HasRelBias || get<1>(TileShapeQK{}) % 8 == 0,
+      "relative bias: the K tile must be a multiple of 8 elements for the 16B surface pitch");
+  static_assert(
+      !HasRelBias || get<0>(TileShapeQK{}) + get<1>(TileShapeQK{}) >= 32,
+      "relative bias: the padded column count must reach the 64B minimum surface width");
   static constexpr bool CachedKV = CachedKV_;
   static constexpr bool PagedKV = PagedKV_;
   static constexpr bool LocalMask = LocalMask_;
@@ -815,31 +804,40 @@ struct FMHAFwdMainloop<
     return true;
   }
 
-  // Adds one K block of the relative bias into the scores, folding the still-pending
-  // softmax scale into the same multiply-add. RelBiasBlock2D picks the fast path: one 2D
-  // block load covers the whole tile. The other instantiation loads element by element and
-  // serves the surfaces the block 2D atom cannot address at all. The choice is made on the
-  // host, so only one of the two is ever compiled into a given kernel.
+  // Adds one K block of the relative bias into the scores, folding the still-pending softmax
+  // scale into the same multiply-add.
   template <typename QVCoord>
-  CUTLASS_DEVICE void add_rel_bias_tile(
+  CUTLASS_DEVICE void apply_relative_bias(
       FragS& scores,
+      int K,
       ElementS& score_scale,
       TiledMMAQK const& mma_qk,
-      int bias_col,
-      int bias_rows,
+      int seq_len_kv_cache,
       int q_head,
       int q_token_offset,
       QVCoord const& blk_qv,
-      int thr_id) const {
-    constexpr ElementS kLog2e = ElementS(1.4426950408889634074);
-    constexpr int k_tile = get<1>(TileShapeQK{});
-    int const bias_cols = static_cast<int>(params.rel_bias_head_stride);
-    if constexpr (RelBiasBlock2D) {
-      // Surface based at the allocation, with this batch's row offset and this head's
-      // column offset in the tile coordinates instead -- rebasing would need a 64B-aligned
-      // base per head, the coordinates only need the x offset. Height and width stop at the
-      // end of this batch's rows and this head's columns, so a Q tile overhanging the
-      // sequence reads zeros rather than the next batch or the next head.
+      int thr_id,
+      int full_tile_offset) const {
+    if constexpr (HasRelBias) {
+      constexpr ElementS kLog2e = ElementS(1.4426950408889634074);
+      constexpr int k_tile = get<1>(TileShapeQK{});
+      constexpr int q_tile = get<0>(TileShapeQK{});
+      // row_kv of this Q tile's first row. The producer sheared the band against the same
+      // value, so subtracting the window origin turns the absolute kv column into the
+      // sheared one. Blocks outside the window are entirely out of band -- skip the load.
+      int const row_kv_first = get<0>(blk_qv) * q_tile + full_tile_offset;
+      int const bias_col = K * k_tile - rel_bias_col_origin(row_kv_first, params.rel_bias_extent, k_tile);
+      int const bias_cols = static_cast<int>(params.rel_bias_head_stride);
+      if (bias_col < 0 || bias_col >= bias_cols) return;
+
+      // Surface based at the allocation, with this batch's row offset and this head's column
+      // offset in the tile coordinates instead -- rebasing would need a 64B-aligned base per
+      // head, the coordinates only need the x offset. Rows index the query, so height stops
+      // at this batch's query length (the kernel builds full_tile_offset as
+      // seq_len_kv_cache - seq_len_qo) and width at this head's last column: a Q tile
+      // overhanging the sequence then reads zeros rather than the next batch or the next
+      // head.
+      int const bias_rows = seq_len_kv_cache - full_tile_offset;
       auto surface_shape = make_shape(q_token_offset + bias_rows, (q_head + 1) * bias_cols);
       auto surface_layout = make_layout(surface_shape, make_stride(params.rel_bias_token_stride, Int<1>{}));
       Tensor Bias = make_tensor(make_gmem_ptr(params.ptr_rel_bias), surface_layout);
@@ -858,67 +856,7 @@ struct FMHAFwdMainloop<
         ElementS const scaled_bias = kLog2e * static_cast<ElementS>(bias(i));
         scores(i) = sycl::mad(score_scale, scores(i), scaled_bias);
       }
-    } else {
-      // Block 2D bounds-checks against the surface and substitutes zero; the scalar path
-      // needs the guards below to do the same. Row/column come from the same lane
-      // arithmetic the causal mask uses -- fragment element n*elems_per_n + j is row j of
-      // the subgroup's rows and column n*sg_size + lane -- rather than a partitioned
-      // coordinate tensor, which costs registers in a loop this hot.
-      auto const bias_head_ptr = params.ptr_rel_bias +
-          int64_t(q_token_offset) * params.rel_bias_token_stride + int64_t(q_head) * params.rel_bias_head_stride;
-      constexpr int sg_tile_q = get<0>(TileShapeQK{}) / SGPerWG::value;
-      constexpr int n_reps = k_tile / intel::sg_size;
-      constexpr int elems_per_n = FragS{}.size() / n_reps;
-      int const lane_id = thr_id % intel::sg_size;
-      int const row_base = get<0>(blk_qv) * get<0>(TileShapeQK{}) + (thr_id / intel::sg_size) * sg_tile_q;
-      int const rows = cute::min(elems_per_n, cute::max(0, bias_rows - row_base));
-      auto const row_ptr = bias_head_ptr + int64_t(row_base) * params.rel_bias_token_stride;
-      CUTLASS_PRAGMA_UNROLL
-      for (int n = 0; n < n_reps; ++n) {
-        int const col = bias_col + n * intel::sg_size + lane_id;
-        auto const col_ptr = row_ptr + col;
-        bool const col_ok = col < bias_cols;
-        CUTLASS_PRAGMA_UNROLL
-        for (int j = 0; j < elems_per_n; ++j) {
-          ElementS bias = ElementS(0);
-          if (col_ok && j < rows) {
-            bias = static_cast<ElementS>(col_ptr[int64_t(j) * params.rel_bias_token_stride]);
-          }
-          scores(n * elems_per_n + j) = sycl::mad(score_scale, scores(n * elems_per_n + j), kLog2e * bias);
-        }
-      }
-    }
-    score_scale = ElementS(1);
-  }
-
-  template <typename QVCoord>
-  CUTLASS_DEVICE void apply_relative_bias(
-      FragS& scores,
-      int K,
-      ElementS& score_scale,
-      TiledMMAQK const& mma_qk,
-      int seq_len_kv_cache,
-      int q_head,
-      int q_token_offset,
-      QVCoord const& blk_qv,
-      int thr_id,
-      int full_tile_offset) const {
-    if constexpr (HasRelBias) {
-      constexpr int k_tile = get<1>(TileShapeQK{});
-      constexpr int q_tile = get<0>(TileShapeQK{});
-      // row_kv of this Q tile's first row. The producer sheared the band against the same
-      // value, so subtracting the window origin turns the absolute kv column into the
-      // sheared one. Blocks outside the window are entirely out of band -- skip the load.
-      int const row_kv_first = get<0>(blk_qv) * q_tile + full_tile_offset;
-      int const bias_col =
-          K * k_tile - rel_bias_col_origin(row_kv_first, params.rel_bias_extent, k_tile);
-      if (bias_col < 0 || bias_col >= params.rel_bias_head_stride) return;
-      // Rows index the query, so the surface is exactly this batch's query length tall --
-      // the kernel builds full_tile_offset as seq_len_kv_cache - seq_len_qo. Rows past it
-      // belong to the next batch and read as zero, which is what a Q tile overhanging the
-      // sequence needs.
-      int const bias_rows = seq_len_kv_cache - full_tile_offset;
-      add_rel_bias_tile(scores, score_scale, mma_qk, bias_col, bias_rows, q_head, q_token_offset, blk_qv, thr_id);
+      score_scale = ElementS(1);
     }
   }
 

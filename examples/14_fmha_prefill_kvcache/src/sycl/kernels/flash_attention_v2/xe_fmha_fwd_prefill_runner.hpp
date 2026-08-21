@@ -469,13 +469,8 @@ struct FMHAConfig {
       decltype(cutlass::fmha::collective::get_sg_layout_pv(SubgroupLayoutQK{})),
       SubgroupLayoutPV_>;
 
-  // The relative bias is read either with the block 2D atom or element by element,
-  // depending on whether the caller's (unpadded) tensor happens to satisfy the atom's
-  // surface rules. That question is answered here, on the host, and baked into the
-  // kernel: keeping both loads in one kernel costs the block 2D path enough register
-  // pressure to show up as a ~35% regression on the 4k production shape.
-  template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler, bool RelBiasBlock2D>
-  static int run_impl(const Arguments& params) {
+  template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
+  static int run(const Arguments& params) {
     // The KernelHardwareInfo struct holds the number of EUs on the GPU with a given device ID. This
     // information is used by the underlying kernel.
     cutlass::KernelHardwareInfo hw_info;
@@ -526,8 +521,7 @@ struct FMHAConfig {
         GmemTiledCopyV_cache,
         LocalMask,
         false,
-        HasRelBias,
-        RelBiasBlock2D>;
+        HasRelBias>;
 
     // Epilogue
     using CollectiveEpilogue =
@@ -555,19 +549,6 @@ struct FMHAConfig {
 
     kernel.run(params, hw_info);
     return 0;
-  }
-
-  template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
-  static int run(const Arguments& params) {
-    if constexpr (HasRelBias) {
-      if (cutlass::fmha::collective::rel_bias_can_block_2d(
-              params.rel_bias_ptr, params.rel_bias_token_stride, params.rel_bias_head_stride)) {
-        return run_impl<isVarLen, CachedKV, PagedKV, Scheduler, true>(params);
-      }
-      return run_impl<isVarLen, CachedKV, PagedKV, Scheduler, false>(params);
-    } else {
-      return run_impl<isVarLen, CachedKV, PagedKV, Scheduler, true>(params);
-    }
   }
 
   // Paged KV cache: the page table encodes absolute KV positions.
