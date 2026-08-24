@@ -33,6 +33,7 @@
 #include "cutlass/util/packed_stride.hpp"
 
 #include "sycl/kernels/flash_attention_v2/collective/fmha_fusion.hpp"
+#include "sycl/kernels/flash_attention_v2/collective/fmha_relative_bias.hpp"
 #include "sycl/kernels/flash_attention_v2/collective/xe_fmha_fwd_epilogue.hpp"
 #include "sycl/kernels/flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp"
 #include "sycl/kernels/flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp"
@@ -91,6 +92,16 @@ struct Options {
   int min_blocks_for_split = 2;
   // K blocks prefetched ahead in the mainloop; 1 is the original behavior.
   int prefetch_depth = 1;
+  // Relative-attention band width. 0 disables relative attention entirely,
+  // which selects the kernel instantiation that carries no bias load at all.
+  int rel_extent = 0;
+  // Half-width of the uniform distribution the bias is drawn from. O(1) is what
+  // a learned projection produces, but at O(1) the bias barely moves the output:
+  // O is an average over thousands of random V rows, so its magnitude is ~1e-2
+  // and a reweighting of the softmax stays inside the verification tolerance.
+  // Raise this (with --softmax_scale=0, so the bias alone shapes the softmax) to
+  // make the reference check actually sensitive to the bias being applied.
+  float rel_bias_range = 0.5f;
 
   void parse(int argc, char const** argv) {
     cutlass::CommandLine cmd(argc, argv);
@@ -104,7 +115,9 @@ struct Options {
     cmd.get_cmd_line_argument(
         "min_blocks_for_split", min_blocks_for_split, min_blocks_for_split);
     cmd.get_cmd_line_argument("prefetch_depth", prefetch_depth, prefetch_depth);
-    if (prefetch_depth < 1) {
+    cmd.get_cmd_line_argument("rel_extent", rel_extent, rel_extent);
+    cmd.get_cmd_line_argument("rel_bias_range", rel_bias_range, rel_bias_range);
+    if (prefetch_depth < 1 || rel_extent < 0 || rel_bias_range < 0.0f) {
       error = true;
     }
     if (seq_len_kv <= 0 || iterations < 0 || warmup < 0 || num_kv_splits < 0) {
@@ -121,6 +134,10 @@ struct Options {
         << "  --min_blocks_for_split=<int> K blocks below which Split-K "
            "collapses to one work-group, default 2\n"
         << "  --prefetch_depth=<int> K blocks prefetched ahead, default 1\n"
+        << "  --rel_extent=<int>     relative-attention band width; 0 (default) "
+           "disables relative attention\n"
+        << "  --rel_bias_range=<float> half-width of the random bias, default 0.5; "
+           "raise it with --softmax_scale=0 to make --verify sensitive\n"
         << "  --warmup=<int> --iterations=<int> --verify=<0|1>\n";
   }
 };
@@ -183,25 +200,50 @@ using TensorV = TensorFor<Element, StrideV>;
 using TensorO = TensorFor<Element, StrideO>;
 using TensorLSE = TensorFor<float, StrideO>;
 
-using Mainloop = cutlass::fmha::collective::DecodeFwdMainloop<
-    cutlass::fmha::XeDefault<1>,
-    true,
-    false,
-    TiledMMAQK,
-    TiledMMAPV,
-    kVTileO / 32,
-    TensorQ,
-    TensorK,
-    TensorV>;
-using Epilogue = cutlass::fmha::collective::DecodeFwdEpilogue<
-    Mainloop, TileShapeO, TensorO, TensorLSE>;
 using ProblemShape = cutlass::fmha::kernel::FMHAProblemShape<true>;
-using FMHAKernel = cutlass::fmha::kernel::XeFMHAFwdSplitKVKernel<
-    ProblemShape, Mainloop, Epilogue,
-    cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>;
-using ReduceKernel = cutlass::reduction::kernel::ReduceSplitK<
-    ProblemShape, cutlass::fmha::kernel::XeReduceSplitKTileScheduler,
-    FMHAKernel>;
+
+// Relative attention is a compile-time variant, not a runtime flag: the mainloop's bias load
+// would otherwise cost the plain path registers it cannot spare (see HasRelBias in
+// xe_fmha_fwd_mainloop.hpp), so both kernels are instantiated and one is picked in run().
+template <bool HasRelBias>
+struct Pipeline {
+  using Mainloop = cutlass::fmha::collective::DecodeFwdMainloop<
+      cutlass::fmha::XeDefault<1>,
+      /*PagedKV=*/true,
+      /*CausalMask=*/false,
+      TiledMMAQK,
+      TiledMMAPV,
+      kVTileO / 32,
+      TensorQ,
+      TensorK,
+      TensorV,
+      /*TiledCopyQ=*/void,
+      /*TiledCopyK=*/void,
+      /*TiledCopyV=*/void,
+      /*LocalMask=*/false,
+      HasRelBias>;
+  using Epilogue = cutlass::fmha::collective::DecodeFwdEpilogue<
+      Mainloop, TileShapeO, TensorO, TensorLSE>;
+  using FMHAKernel = cutlass::fmha::kernel::XeFMHAFwdSplitKVKernel<
+      ProblemShape, Mainloop, Epilogue,
+      cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>;
+  using ReduceKernel = cutlass::reduction::kernel::ReduceSplitK<
+      ProblemShape, cutlass::fmha::kernel::XeReduceSplitKTileScheduler,
+      FMHAKernel>;
+};
+
+// Split-K capacity is a function of the work-group shape only, so it is the same for both
+// instantiations and the split count can be chosen before the variant is.
+constexpr int kMaxNumKVSplits = Pipeline<false>::FMHAKernel::max_num_kv_splits;
+
+// Sheared relative-bias geometry. The K tile is the page size, and a decode M tile is the query
+// heads of one token, so the band does not drift across it -- hence m_drift = 0. Both values
+// belong to the producer (the r x proj kernel); they are here because this example stands in
+// for it.
+constexpr int kRelBiasKTile = kPageSize;
+inline int rel_bias_cols(int rel_extent) {
+  return cutlass::fmha::collective::rel_bias_padded_cols(rel_extent, /*m_drift=*/0, kRelBiasKTile);
+}
 
 int select_num_kv_splits(int requested, int seq_len_kv) {
   if (requested != 0) {
@@ -231,7 +273,7 @@ int select_num_kv_splits(int requested, int seq_len_kv) {
   // reaches the fastest iteration count at the production contexts (see below).
   int const target_wgs = 3 * xe_cores;
   int const target_splits = (target_wgs + current_parallelism - 1) / current_parallelism;
-  int const max_splits = std::min(total_blocks, FMHAKernel::max_num_kv_splits);
+  int const max_splits = std::min(total_blocks, kMaxNumKVSplits);
 
   // Every split runs ceil(blocks/splits) iterations, so the kernel's duration is
   // set by that ceiling and any split holding fewer blocks than the ceiling just
@@ -266,6 +308,52 @@ struct Buffers {
   cutlass::DeviceAllocation<int> page_table;
   cutlass::DeviceAllocation<int> cu_q;
   cutlass::DeviceAllocation<int> cu_k;
+  cutlass::DeviceAllocation<Element> rel_bias;
+};
+
+// The relative bias in both of its forms. The band is what the model defines and what the
+// reference reads; the sheared surface is what the kernel reads. Building the second from the
+// first is the r x proj kernel's job in production -- this example stands in for it, which is
+// also why the padding arithmetic lives in fmha_relative_bias.hpp rather than in the mainloop.
+struct RelBias {
+  int extent = 0;   // Band width; 0 means relative attention is off
+  int cols = 0;     // Sheared column count, also the surface's row stride
+  int col_origin = 0;
+  std::vector<Element> band;     // [kQHeads, extent]
+  std::vector<Element> sheared;  // [kQHeads, cols], zero outside the band
+
+  // `row_kv` is the KV position of the decode token, shared by every query head of the group.
+  RelBias(int rel_extent, float range, int row_kv, int seq_len_kv, std::mt19937& generator) {
+    if (rel_extent <= 0) return;
+    extent = rel_extent;
+    cols = rel_bias_cols(extent);
+    col_origin =
+        cutlass::fmha::collective::rel_bias_col_origin(row_kv, extent, kRelBiasKTile);
+
+    std::uniform_real_distribution<float> distribution(-range, range);
+    band.resize(static_cast<size_t>(kQHeads) * extent);
+    for (auto& value : band) {
+      value = Element(distribution(generator));
+    }
+
+    sheared.assign(static_cast<size_t>(kQHeads) * cols, Element(0.0f));
+    for (int head = 0; head < kQHeads; ++head) {
+      for (int col = 0; col < cols; ++col) {
+        int const kv = col + col_origin;
+        if (kv < 0 || kv >= seq_len_kv) continue;
+        int const rel = row_kv - kv;
+        if (rel < 0 || rel >= extent) continue;
+        sheared[static_cast<size_t>(head) * cols + col] =
+            band[static_cast<size_t>(head) * extent + rel];
+      }
+    }
+  }
+
+  // Bias for one (query head, KV token) pair, in the band's own coordinates.
+  float at(int head, int rel) const {
+    if (extent == 0 || rel < 0 || rel >= extent) return 0.0f;
+    return static_cast<float>(band[static_cast<size_t>(head) * extent + rel]);
+  }
 };
 
 template <class T>
@@ -279,6 +367,7 @@ bool verify_output(
     std::vector<Element> const& h_v,
     std::vector<int> const& h_page_table,
     std::vector<Element> const& h_out,
+    RelBias const& rel_bias,
     Options const& options) {
   double max_abs_error = 0.0;
   double max_rel_error = 0.0;
@@ -287,6 +376,9 @@ bool verify_output(
   int failing_elements = 0;
   constexpr double kAbsoluteTolerance = 0.03;
   constexpr double kRelativeTolerance = 0.10;
+  // KV position of the single decode token, shared by every query head. `row_kv - token` is
+  // therefore the band coordinate for every score in the row.
+  int const row_kv = options.seq_len_kv - 1;
 
   for (int head = 0; head < kQHeads; ++head) {
     float max_logit = -std::numeric_limits<float>::infinity();
@@ -302,7 +394,11 @@ bool verify_output(
         logit += static_cast<float>(h_q[head * kHeadDim + dim]) *
                  static_cast<float>(h_k[kv_offset]);
       }
-      max_logit = std::max(max_logit, logit * options.softmax_scale);
+      // The bias is added *after* the softmax scale, matching the mainloop, which folds it
+      // into the same multiply-add that applies that scale.
+      max_logit = std::max(
+          max_logit,
+          logit * options.softmax_scale + rel_bias.at(head, row_kv - token));
     }
 
     std::vector<float> weights(options.seq_len_kv);
@@ -319,7 +415,8 @@ bool verify_output(
         logit += static_cast<float>(h_q[head * kHeadDim + dim]) *
                  static_cast<float>(h_k[kv_offset]);
       }
-      weights[token] = std::exp(logit * options.softmax_scale - max_logit);
+      weights[token] = std::exp(
+          logit * options.softmax_scale + rel_bias.at(head, row_kv - token) - max_logit);
       denominator += weights[token];
     }
 
@@ -359,7 +456,11 @@ bool verify_output(
   return failing_elements == 0;
 }
 
-int run(Options const& options) {
+template <bool HasRelBias>
+int run_impl(Options const& options) {
+  using FMHAKernel = typename Pipeline<HasRelBias>::FMHAKernel;
+  using ReduceKernel = typename Pipeline<HasRelBias>::ReduceKernel;
+
   int const pages = (options.seq_len_kv + kPageSize - 1) / kPageSize;
   int const splits = select_num_kv_splits(options.num_kv_splits, options.seq_len_kv);
   if (splits > FMHAKernel::max_num_kv_splits) {
@@ -398,6 +499,15 @@ int run(Options const& options) {
     }
   }
 
+  // Stand in for the r x proj kernel: build the band, then shear it. Drawn after the KV cache
+  // so that `--rel_extent=0` and a nonzero one see the same Q/K/V.
+  RelBias rel_bias(
+      HasRelBias ? options.rel_extent : 0,
+      options.rel_bias_range,
+      options.seq_len_kv - 1,
+      options.seq_len_kv,
+      generator);
+
   Buffers buffers;
   buffers.q.reset(h_q.size());
   buffers.k.reset(h_k.size());
@@ -415,6 +525,10 @@ int run(Options const& options) {
   copy_to_device(buffers.page_table, h_page_table);
   copy_to_device(buffers.cu_q, h_cu_q);
   copy_to_device(buffers.cu_k, h_cu_k);
+  if constexpr (HasRelBias) {
+    buffers.rel_bias.reset(rel_bias.sheared.size());
+    copy_to_device(buffers.rel_bias, rel_bias.sheared);
+  }
   compat::wait();
 
   auto stride_q = cutlass::make_cute_packed_stride(
@@ -454,7 +568,8 @@ int run(Options const& options) {
        stride_stats, nullptr, nullptr, nullptr, nullptr,
        options.min_blocks_for_split},
       {options.softmax_scale, buffers.page_table.get(), kPageSize, pages,
-       options.seq_len_kv, -1, -1, options.prefetch_depth},
+       options.seq_len_kv, -1, -1, options.prefetch_depth,
+       buffers.rel_bias.get(), rel_bias.cols, rel_bias.extent},
       {},
       hardware,
       splits};
@@ -528,7 +643,14 @@ int run(Options const& options) {
             << "ctx=" << options.seq_len_kv << " page=64 splits=" << splits
             << " min_blocks_for_split=" << options.min_blocks_for_split
             << " prefetch_depth=" << options.prefetch_depth
-            << " scale=" << options.softmax_scale << '\n';
+            << " scale=" << options.softmax_scale;
+  if constexpr (HasRelBias) {
+    std::cout << " rel_extent=" << rel_bias.extent
+              << " rel_bias_cols=" << rel_bias.cols
+              << " rel_bias_col_origin=" << rel_bias.col_origin
+              << " rel_bias_range=" << options.rel_bias_range;
+  }
+  std::cout << '\n';
   if (elapsed > 0.0) {
     std::cout << "Performance: " << elapsed * 1e3 << " ms, "
               << flops / elapsed / 1e12 << " TFLOP/s, "
@@ -543,12 +665,16 @@ int run(Options const& options) {
     compat::memcpy(
         h_out.data(), buffers.out.get(), h_out.size() * sizeof(Element));
     compat::wait();
-    if (!verify_output(h_q, h_k, h_v, h_page_table, h_out, options)) {
+    if (!verify_output(h_q, h_k, h_v, h_page_table, h_out, rel_bias, options)) {
       std::cerr << "Verification failed.\n";
       return 1;
     }
   }
   return 0;
+}
+
+int run(Options const& options) {
+  return options.rel_extent > 0 ? run_impl<true>(options) : run_impl<false>(options);
 }
 
 }  // namespace

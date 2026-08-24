@@ -38,6 +38,7 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "fmha_fusion.hpp"
+#include "fmha_relative_bias.hpp"
 
 namespace cutlass::fmha {
 
@@ -51,6 +52,10 @@ namespace cutlass::fmha::collective {
 using namespace cute;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
+
+// The sheared relative-bias surface (rel_bias_band_cols / rel_bias_padded_cols /
+// rel_bias_col_origin) and its producer contract live in fmha_relative_bias.hpp, shared with the
+// prefill mainloop.
 
 template <
     class DispatchPolicy_,
@@ -578,7 +583,12 @@ template <
     class TiledCopyQ_ = void,  // Optional TiledCopy for loading Q
     class TiledCopyK_ = void,  // Optional TiledCopy for loading K
     class TiledCopyV_ = void,  // Optional TiledCopy for loading V
-    bool LocalMask_ = false>
+    bool LocalMask_ = false,
+    // Relative attention: add a sheared per-(token, head, rel) bias to the scores.
+    // Compile-time rather than a null-pointer runtime check, because IGC allocates registers
+    // across every inlined branch of this loop -- a bias load that is present but disabled
+    // still costs the plain decode path, which runs within a few percent of the DRAM roof.
+    bool HasRelBias_ = false>
 struct DecodeFwdMainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
@@ -596,7 +606,8 @@ template <
     class TiledCopyQ_,
     class TiledCopyK_,
     class TiledCopyV_,
-    bool LocalMask_>
+    bool LocalMask_,
+    bool HasRelBias_>
 struct DecodeFwdMainloop<
     XeDefault<Stages>,
     PagedKV_,
@@ -610,7 +621,8 @@ struct DecodeFwdMainloop<
     TiledCopyQ_,
     TiledCopyK_,
     TiledCopyV_,
-    LocalMask_> {
+    LocalMask_,
+    HasRelBias_> {
   //
   // Type Aliases
   //
@@ -672,6 +684,18 @@ struct DecodeFwdMainloop<
   static constexpr bool CausalMask = CausalMask_;
   static constexpr bool Fp8KV = is_any_of_v<ElementK, float_e5m2_t, float_e4m3_t>;
   static constexpr bool LocalMask = LocalMask_;
+  static constexpr bool HasRelBias = HasRelBias_;
+
+  // The sheared bias surface is only unconditionally legal for the block 2D atom while the
+  // tile clears the hardware's minimums; see the alignment note on rel_bias_band_cols.
+  // The column count is band + k_tile here (no drift term: the M tile's rows are heads of one
+  // token, not consecutive tokens), so it is a multiple of the K tile either way.
+  static_assert(
+      !HasRelBias || get<1>(TileShapeQK{}) % 8 == 0,
+      "relative bias: the K tile must be a multiple of 8 elements for the 16B surface pitch");
+  static_assert(
+      !HasRelBias || 2 * get<1>(TileShapeQK{}) >= 32,
+      "relative bias: the padded column count must reach the 64B minimum surface width");
 
   // User-facing arguments
   struct Arguments {
@@ -692,6 +716,15 @@ struct DecodeFwdMainloop<
     // loop sits within a few percent of the DRAM roof and is not prefetch-bound.
     // The parameter is kept only so that conclusion stays reproducible.
     int prefetch_depth = 1;
+    // Sheared relative-attention bias, [total_q, heads_q, padded_cols] bf16 as described in
+    // fmha_relative_bias.hpp, produced by the r x proj kernel. Only read when HasRelBias.
+    cutlass::bfloat16_t const* ptr_rel_bias = nullptr;
+    // Element stride between surface rows. Decode reads rows along the query head, and the
+    // head stride of that surface is exactly padded_cols, so this single stride also steps
+    // from a token's last head to the next token's first: the rows are (token, head)
+    // flattened. Prefill needs a token stride and a head stride because its rows are tokens.
+    int64_t rel_bias_row_stride = 0;
+    int rel_bias_extent = 0;
   };
 
   // Kernel-facing parameters
@@ -719,10 +752,21 @@ struct DecodeFwdMainloop<
         args.total_seqlen_kv,
         args.window_size_left,
         args.window_size_right,
-        args.prefetch_depth};
+        args.prefetch_depth,
+        args.ptr_rel_bias,
+        args.rel_bias_row_stride,
+        args.rel_bias_extent};
   }
 
-  CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
+  CUTLASS_HOST_DEVICE static bool can_implement(Arguments const& args) {
+    if constexpr (HasRelBias) {
+      // The surface's column count is fixed by the producer and passed down as the row
+      // stride; the kernel derives the window from it, so a stride that disagrees with
+      // rel_extent would silently read shifted columns rather than fail.
+      constexpr int k_tile = get<1>(TileShapeQK{});
+      if (args.ptr_rel_bias == nullptr || args.rel_bias_extent <= 0) return false;
+      if (args.rel_bias_row_stride != rel_bias_padded_cols(args.rel_bias_extent, 0, k_tile)) return false;
+    }
     return true;
   }
 
@@ -744,6 +788,60 @@ struct DecodeFwdMainloop<
     }
   }
 
+  // Adds one K block of the relative bias into the scores, folding the still-pending softmax
+  // scale into the same multiply-add.
+  //
+  // Unlike prefill this needs no per-row KV position: a decode M tile is the query heads of one
+  // token, so every row shares `row_kv` and the band is a single column window for the whole
+  // tile. What differs per row is only which head's bias to read, and that is the row index --
+  // hence the (token, head) flattened rows described in fmha_relative_bias.hpp.
+  template <typename QVCoord>
+  CUTLASS_DEVICE void apply_relative_bias(
+      FragS& scores,
+      int K,  // Logical K block index, i.e. before the page table remaps it
+      ElementS& score_scale,
+      TiledMMAQK const& mma_qk,
+      int row_kv,         // KV position of the decode token
+      int bias_row_base,  // Surface row of this token's first query head in the GQA group
+      QVCoord const& blk_qv,
+      int thr_id) const {
+    if constexpr (HasRelBias) {
+      constexpr ElementS kLog2e = ElementS(1.4426950408889634074);
+      constexpr int k_tile = get<1>(TileShapeQK{});
+      constexpr int m_tile = get<0>(TileShapeQK{});
+      // The producer sheared the band against the same row_kv, so subtracting the window
+      // origin turns this block's absolute kv column into the sheared one. A block entirely
+      // outside the window contributes no bias at all -- skip the load.
+      int const bias_cols = static_cast<int>(params.rel_bias_row_stride);
+      int const bias_col = K * k_tile - rel_bias_col_origin(row_kv, params.rel_bias_extent, k_tile);
+      if (bias_col < 0 || bias_col >= bias_cols) return;
+
+      // Surface based at the allocation, with this tile's rows reached through the tile
+      // coordinates rather than by rebasing the pointer -- rebasing would need a 64B-aligned
+      // base per row, the coordinates only need the y offset. Height stops at this tile's last
+      // row so a load can never reach the next GQA group's or the next token's bias.
+      int const row_base = bias_row_base + get<0>(blk_qv) * m_tile;
+      auto surface_shape = make_shape(row_base + m_tile, bias_cols);
+      auto surface_layout = make_layout(surface_shape, make_stride(params.rel_bias_row_stride, Int<1>{}));
+      Tensor Bias = make_tensor(make_gmem_ptr(params.ptr_rel_bias), surface_layout);
+      Tensor cBias = domain_offset(make_coord(row_base, 0), make_identity_tensor(make_shape(m_tile, bias_cols)));
+      Tensor gBias = local_tile(cBias, take<0, 2>(TileShapeQK{}), make_coord(0, _));
+      auto copy_bias_load = make_block_2d_copy_C(mma_qk, Bias);
+      auto thr_copy_bias_load = copy_bias_load.get_slice(thr_id);
+      auto tBiasLoadG = thr_copy_bias_load.partition_S(gBias);
+      auto tBiasLoadR = thr_copy_bias_load.partition_sg_fragment_D(gBias(_, _, 0));
+      auto bias = make_subgroup_tensor(make_fragment_like<cutlass::bfloat16_t>(scores.layout()), scores.tv_layout());
+      copy(copy_bias_load, tBiasLoadG(_, _, _, bias_col / k_tile), tBiasLoadR);
+      reorder(tBiasLoadR, bias);
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < scores.size(); ++i) {
+        ElementS const scaled_bias = kLog2e * static_cast<ElementS>(bias(i));
+        scores(i) = sycl::mad(score_scale, scores(i), scaled_bias);
+      }
+      score_scale = ElementS(1);
+    }
+  }
+
   template <typename QVCoord>
   CUTLASS_DEVICE void operator()(
       TensorQ2D const& Q_2D,  // (q,d)
@@ -761,7 +859,8 @@ struct DecodeFwdMainloop<
       int seq_len,
       int full_tile_offset,
       int discard_seq_coord,
-      float scale_k = 1.0f) {  // FP8 K per-tensor dequant scale (applied in GEMM1)
+      float scale_k = 1.0f,     // FP8 K per-tensor dequant scale (applied in GEMM1)
+      int bias_row_base = 0) {  // Relative bias surface row, only read when HasRelBias
     using namespace sycl::ext::oneapi::this_work_item;
 
     // Short dimension names:
@@ -954,8 +1053,19 @@ struct DecodeFwdMainloop<
         }
       }
 
-      /* Apply softmax and scaling */
-      softmax(K == 0, tSrS, tA_max, tA_sum, tArA, qk_scale);
+      /* Apply softmax and scaling. The relative bias rides along in the multiply-add that
+         applies the still-pending Q*K scale, so it adds no extra pass over the scores. Kept
+         behind `if constexpr` rather than always computing a block scale, so the plain decode
+         path stays textually what it was -- see HasRelBias on the register-allocation cost. */
+      if constexpr (HasRelBias) {
+        // row_kv: decode's single query token sits at the last KV position, which is also
+        // what the LocalMask branch above uses as its decode row.
+        ElementS block_scale = qk_scale;
+        apply_relative_bias(tSrS, K, block_scale, mma_qk, seq_len - 1, bias_row_base, blk_qv, thr_id);
+        softmax(K == 0, tSrS, tA_max, tA_sum, tArA, block_scale);
+      } else {
+        softmax(K == 0, tSrS, tA_max, tA_sum, tArA, qk_scale);
+      }
       reorder(tSrS, tArP);
 
       /* GEMM 2: A += P * V, split in v dimension */

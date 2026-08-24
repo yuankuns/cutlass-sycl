@@ -1241,6 +1241,18 @@ class XeFMHAFwdSplitKVKernel {
       }
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
 
+      // Relative bias: the surface's rows are (query token, query head) flattened, so this
+      // tile's first row is the decode token's row for the GQA group's first query head. The
+      // mainloop adds blk_q's own offset within the group. Every Split-K split reads the same
+      // rows -- the band is a property of the token, not of the K range -- and adds the bias
+      // before its own softmax, so the partial max/sum it hands the reduction already
+      // include it.
+      int bias_row_base = 0;
+      if constexpr (CollectiveMainloop::HasRelBias) {
+        int const q_token = is_var_len ? s.seq_len_qo.cumulative_length[idx_b] : idx_b * seq_len_qo;
+        bias_row_base = q_token * s.num_heads_q + head_q_start;
+      }
+
       mainloop(
           Q(_, _, head, l_coord),
           K(_, _, head, l_coord),
@@ -1257,7 +1269,8 @@ class XeFMHAFwdSplitKVKernel {
           seq_len,
           full_tile_offset,
           discard_seq_coord,
-          scale_k);
+          scale_k,
+          bias_row_base);
 
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
         sycl::group_barrier(get_work_group<3>());

@@ -158,6 +158,100 @@ too large to sit in L2 -- and it shows the memory path itself is essentially
 saturated. The production contexts fall short of it because of fixed launch
 overhead, quantified below, not because of the memory path.
 
+## Relative attention
+
+`--rel_extent N` adds Inkling's relative-attention bias to the scores.  The bias
+is logically `bias[token, head, rel]` with `rel = row_kv - col_kv`, defined for
+`rel` in `[0, rel_extent)` and zero outside -- a band, not a rectangle.  The
+producing kernel (the `r x proj` einsum) writes it **sheared**: for each query
+token it right-aligns that token's band into a `page_size`-aligned column window,
+so the mainloop reads a plain rectangle and needs no gather.  The contract for
+that surface -- its column count, its window origin, and why the widening to a
+whole K tile is what keeps it legal for the block 2D copy atom -- lives in
+`sycl/kernels/flash_attention_v2/collective/fmha_relative_bias.hpp`, which is
+byte-identical to example 14's copy, so both mainloops consume one definition of
+the arithmetic instead of two.
+
+Two things differ from the prefill consumer, and both follow from the tile shape:
+
+- A prefill M tile holds consecutive query tokens, so `row_kv` drifts across the
+  tile and the surface has to be padded by a whole Q tile to cover that drift.
+  A decode M tile holds the *query heads of one token*, so every row shares
+  `row_kv`: the drift term is zero, the band is a single column window for the
+  whole tile, and no per-row KV position is needed.
+- Because the rows are heads rather than tokens, decode walks the same
+  `[total_q, heads_q, padded_cols]` buffer as `[total_q * heads_q, padded_cols]`.
+  One `rel_bias_row_stride` therefore steps both from head to head and from a
+  token's last head to the next token's first, where prefill needs a separate
+  token stride and head stride.
+
+The bias rides along in the multiply-add that applies the still-pending `Q*K`
+scale, so it costs no extra pass over the scores.  Every Split-K split reads the
+same surface rows -- the band is a property of the token, not of the K range --
+and adds the bias before its own softmax, so the partial max and sum handed to
+the reduction already include it.
+
+`HasRelBias` is a template parameter, not a runtime null check: IGC allocates
+registers across every inlined branch of the mainloop, so a bias load that is
+present but disabled would still cost the plain decode path, which runs within a
+few percent of the DRAM roof.  The example instantiates both kernels and picks
+one from `--rel_extent`, so the `--rel_extent=0` instantiation contains no bias
+load at all and its mainloop body is textually what it was before this feature.
+
+The bias itself is too cheap to measure at these shapes.  Medians of 5
+interleaved runs (200 warmup, 2000 timed iterations), per-layer latency:
+
+| Context | `--rel_extent=0` | `128` | `1024` |
+| ---: | ---: | ---: | ---: |
+| 4097 | 0.0266 ms | 0.0253 ms | 0.0253 ms |
+| 5120 | 0.0262 ms | 0.0284 ms | 0.0268 ms |
+
+Individual runs spanned 0.0245-0.0339 ms, so every column here is inside the
+noise floor of the others; this is a "no measurable cost", not a speedup.  Read
+the note above about this dispatch's timer noise before drawing a finer
+conclusion.
+
+Padding and shearing stay the producer's job.  The consumer is given only the
+window origin and the surface's row stride and never recomputes the column
+count, so a stride that disagrees with `rel_extent` is rejected by
+`can_implement` rather than silently reading shifted columns.  This example
+stands in for the `r x proj` kernel: it draws the band, shears it on the host,
+and uploads the result.
+
+`ctest -R 15_fmha_decode_kvcache` covers one shape from each half of this
+(`ctest_examples_15_fmha_decode_kvcache_relative` is the decisive one).  Full
+validation on 2026-08-24, all passing the BF16 reference:
+
+```bash
+BIN=.../examples/15_fmha_decode_kvcache/15_fmha_decode_kvcache
+
+# Realistic magnitudes.
+for spec in "1 1" "63 64" "64 64" "65 64" "4097 128" "4097 4097" "5120 192"; do
+  set -- $spec
+  $BIN --seq_len_kv=$1 --rel_extent=$2 --warmup=1 --iterations=2 --verify=1
+done
+
+# Decisive: the bias alone shapes the softmax.
+for spec in "64 64" "65 64" "4097 128" "4097 4097" "4097 1" "5120 192" "1 1"; do
+  set -- $spec
+  $BIN --seq_len_kv=$1 --rel_extent=$2 --softmax_scale=0 --rel_bias_range=8 \
+       --warmup=1 --iterations=2 --verify=1
+done
+```
+
+The second sweep is the one that proves the bias is applied, and it exists
+because the first does not.  `O` is an average over thousands of random `V`
+rows, so its magnitude is ~1e-2; at an O(1) bias the reweighting of the softmax
+moves the output by less than the verification tolerance, and a kernel that
+dropped the bias entirely would still pass.  Setting `--softmax_scale=0` makes
+the bias the only thing shaping the softmax and `--rel_bias_range=8` makes it
+concentrate, so the reference output becomes the single highest-bias token's `V`
+-- roughly 0.5 in magnitude against 1e-2 for a uniform average.  Those runs
+report `max_abs=0.000000` at most shapes, which a bias-dropping kernel could not
+do.  Between them the sweeps cover `col_origin` of 0, 3968, 4032, 4928 and -64
+(both signs, aligned and not), extents 1/64/128/192/4097, contexts
+1/63/64/65/4097/5120, and 1, 22 and 27 splits.
+
 This port exposes the runtime-varying context length and split count.  It
 implements the production BF16 specialization only.  FP16 is deliberately
 out of scope because the observed Gemma4 XPU dispatch instantiates BF16; an

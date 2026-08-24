@@ -38,6 +38,7 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "fmha_fusion.hpp"
+#include "fmha_relative_bias.hpp"
 
 #ifndef FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
 #define FMHA_PREFILL_ENABLE_SCORE_BLOCK2D 0
@@ -465,35 +466,9 @@ struct KSlmStorage<Traits, true> {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Relative bias, sheared layout: [total_q, h, rel_bias_padded_cols(rel_extent)], bf16.
-//
-// The producing kernel right-aligns each Q tile's band into a k_tile-aligned column window
-// (rel_bias_col_origin), so this kernel reads a rectangle where the band is a diagonal.
-//
-// The band is widened to a whole number of K tiles. That costs at most one all-zero column
-// block -- and nothing at all for Inkling, whose rel_extent is a multiple of 128 -- and in
-// exchange the column count is a multiple of k_tile, which is what makes the surface
-// unconditionally legal for the block 2D atom: 64B-aligned base from the allocator, width
-// and pitch a multiple of 16B and at least 64B, x offset a multiple of 4B. Note the 16B on
-// the pitch; cute only asserts the 4B its descriptor encoding needs, so a pitch in between
-// is accepted and then silently reads shifted columns.
-CUTLASS_HOST_DEVICE constexpr int rel_bias_band_cols(int rel_extent, int k_tile) {
-  return (rel_extent + k_tile - 1) / k_tile * k_tile;
-}
-
-// Padding covers the band's drift across a Q tile plus the alignment slack of the K tile.
-CUTLASS_HOST_DEVICE constexpr int rel_bias_padded_cols(int rel_extent, int q_tile, int k_tile) {
-  return rel_bias_band_cols(rel_extent, k_tile) + q_tile + k_tile;
-}
-
-// Column of the sheared bias that holds kv column 0 for a Q tile whose first row sits at KV
-// position `row_kv_first`. Floor division: the window starts at or left of the band, so
-// every in-band column lands in [0, rel_bias_padded_cols).
-CUTLASS_HOST_DEVICE constexpr int rel_bias_col_origin(int row_kv_first, int rel_extent, int k_tile) {
-  int const left = row_kv_first - rel_bias_band_cols(rel_extent, k_tile) + 1;
-  int const q = left / k_tile;
-  return ((left % k_tile != 0 && left < 0) ? q - 1 : q) * k_tile;
-}
+// The sheared relative-bias surface (rel_bias_band_cols / rel_bias_padded_cols /
+// rel_bias_col_origin) and its producer contract live in fmha_relative_bias.hpp, so the decode
+// mainloop consumes the same definition rather than a second copy of the arithmetic.
 
 template <
     class DispatchPolicy_,
