@@ -2,7 +2,7 @@
 
 The test library is CTest-based and stays C++/SYCL-only.  It registers
 model-named scenarios plus supplemental kernel-coverage cases against the
-`fmha_prefill_kvcache` executable.
+`14_fmha_prefill_kvcache` executable.
 
 The model cases use scaled-down sequence lengths and head counts where needed;
 they are regression shapes that preserve attention traits rather than full model
@@ -14,7 +14,7 @@ you need accuracy and kernel time in normal output:
 
 ```bash
 examples/14_fmha_prefill_kvcache/scripts/run_model_shapes.sh \
-  /tmp/fmha_prefill_kvcache_build/examples/14_fmha_prefill_kvcache/fmha_prefill_kvcache
+  /tmp/fmha_prefill_kvcache_build/examples/14_fmha_prefill_kvcache/14_fmha_prefill_kvcache
 ```
 
 The script defaults to the 59-case tile-boundary accuracy baseline plus
@@ -25,7 +25,7 @@ Use `--perf-only` to run only performance cases:
 
 ```bash
 examples/14_fmha_prefill_kvcache/scripts/run_model_shapes.sh --perf-only \
-  /tmp/fmha_prefill_kvcache_build/examples/14_fmha_prefill_kvcache/fmha_prefill_kvcache
+  /tmp/fmha_prefill_kvcache_build/examples/14_fmha_prefill_kvcache/14_fmha_prefill_kvcache
 ```
 
 ## Run

@@ -123,6 +123,7 @@ if(CUTLASS_ENABLE_SYCL)
       13_bmg_gemm_bias
       14_fmha_prefill_kvcache
       15_fmha_decode_kvcache
+      16_bmg_moe_gemm
       )
       add_subdirectory(${EXAMPLE})
     endforeach()

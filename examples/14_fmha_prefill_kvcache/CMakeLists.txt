@@ -139,24 +139,24 @@ target_link_libraries(fmha_prefill_kvcache_kernels PUBLIC
 
 add_sycl_to_target(TARGET fmha_prefill_kvcache_kernels)
 
-add_executable(fmha_prefill_kvcache main.cpp)
-target_compile_features(fmha_prefill_kvcache PUBLIC cxx_std_20)
-target_compile_definitions(fmha_prefill_kvcache PRIVATE ${FMHA_STANDALONE_HEAD_DIM_DEFS})
-target_include_directories(fmha_prefill_kvcache PRIVATE
+add_executable(14_fmha_prefill_kvcache 14_fmha_prefill_kvcache.cpp)
+target_compile_features(14_fmha_prefill_kvcache PUBLIC cxx_std_20)
+target_compile_definitions(14_fmha_prefill_kvcache PRIVATE ${FMHA_STANDALONE_HEAD_DIM_DEFS})
+target_include_directories(14_fmha_prefill_kvcache PRIVATE
   "${FMHA_PREFILL_EXAMPLE_ROOT}"
   "${FMHA_PREFILL_SRC_DIR}"
   "${CUTLASS_EXAMPLES_COMMON_SOURCE_DIR}"
   "${CUTLASS_EXAMPLES_UTILS_DIR}"
   "${CUTLASS_APPLICATIONS_DIR}"
 )
-target_link_libraries(fmha_prefill_kvcache PRIVATE fmha_prefill_kvcache_kernels)
+target_link_libraries(14_fmha_prefill_kvcache PRIVATE fmha_prefill_kvcache_kernels)
 
-add_sycl_to_target(TARGET fmha_prefill_kvcache)
+add_sycl_to_target(TARGET 14_fmha_prefill_kvcache)
 
-add_dependencies(cutlass_examples fmha_prefill_kvcache)
+add_dependencies(cutlass_examples 14_fmha_prefill_kvcache)
 
 install(
-  TARGETS fmha_prefill_kvcache
+  TARGETS 14_fmha_prefill_kvcache
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 

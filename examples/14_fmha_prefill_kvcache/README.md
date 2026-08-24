@@ -16,7 +16,7 @@ cmake -S . -B build/fmha_prefill_kvcache \
   -DCUTLASS_ENABLE_SYCL=ON \
   -DCMAKE_BUILD_TYPE=Release \
   -DDPCPP_SYCL_TARGET=bmg
-cmake --build build/fmha_prefill_kvcache --target fmha_prefill_kvcache -j
+cmake --build build/fmha_prefill_kvcache --target 14_fmha_prefill_kvcache -j
 ```
 
 To build only selected head dimensions while iterating:
@@ -27,7 +27,7 @@ cmake -S . -B build/fmha_prefill_kvcache \
   -DCMAKE_BUILD_TYPE=Release \
   -DDPCPP_SYCL_TARGET=bmg \
   -DFMHA_STANDALONE_HEAD_DIMS=64
-cmake --build build/fmha_prefill_kvcache --target fmha_prefill_kvcache -j
+cmake --build build/fmha_prefill_kvcache --target 14_fmha_prefill_kvcache -j
 ```
 
 Tests are enabled by default.  They are registered through CTest and remain
@@ -49,7 +49,7 @@ shape sweep script instead of CTest:
 
 ```bash
 examples/14_fmha_prefill_kvcache/scripts/run_model_shapes.sh \
-  build/fmha_prefill_kvcache/examples/14_fmha_prefill_kvcache/fmha_prefill_kvcache
+  build/fmha_prefill_kvcache/examples/14_fmha_prefill_kvcache/14_fmha_prefill_kvcache
 ```
 
 The script prints `verify:` and `profile:` for every shape.  `profile:` includes
@@ -60,7 +60,7 @@ case:
 
 ```bash
 examples/14_fmha_prefill_kvcache/scripts/run_model_shapes.sh \
-  build/fmha_prefill_kvcache/examples/14_fmha_prefill_kvcache/fmha_prefill_kvcache
+  build/fmha_prefill_kvcache/examples/14_fmha_prefill_kvcache/14_fmha_prefill_kvcache
 ```
 
 The `tile` suite sweeps query and KV lengths around the kernel tile boundaries:
@@ -75,7 +75,7 @@ To run only the performance cases:
 
 ```bash
 examples/14_fmha_prefill_kvcache/scripts/run_model_shapes.sh --perf-only \
-  build/fmha_prefill_kvcache/examples/14_fmha_prefill_kvcache/fmha_prefill_kvcache
+  build/fmha_prefill_kvcache/examples/14_fmha_prefill_kvcache/14_fmha_prefill_kvcache
 ```
 
 `--suite` and `FMHA_PREFILL_SUITE` remain available as filters when needed;
@@ -84,7 +84,7 @@ accepted values include `tile`, `perf`, `model`, and `all`.
 ## Run
 
 ```bash
-./build/fmha_prefill_kvcache/examples/14_fmha_prefill_kvcache/fmha_prefill_kvcache \
+./build/fmha_prefill_kvcache/examples/14_fmha_prefill_kvcache/14_fmha_prefill_kvcache \
   --batch 4 --seqlen-q 128 --seqlen-k 1024 \
   --heads-q 16 --heads-kv 4 --head-dim 64 --head-dim-v 64 \
   --paged 1 --page-size 64 --causal 1 \

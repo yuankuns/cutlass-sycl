@@ -92,7 +92,7 @@ Config parse_args(int argc, char** argv) {
     std::string arg(argv[i]);
     if (arg == "--help" || arg == "-h") {
       std::cout
-          << "Usage: fmha_prefill_kvcache [options]\n"
+          << "Usage: 14_fmha_prefill_kvcache [options]\n"
           << "  --batch N --seqlen-q N --seqlen-k N --heads-q N --heads-kv N\n"
           << "  --head-dim N --head-dim-v N --paged 0|1 --page-size N\n"
           << "  --causal 0|1 --window-left N --window-right N --sink 0|1\n"

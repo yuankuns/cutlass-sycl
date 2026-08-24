@@ -2,7 +2,7 @@
 set -u
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_BIN="/tmp/fmha_prefill_kvcache_full_build/fmha_prefill_kvcache"
+DEFAULT_BIN="/tmp/fmha_prefill_kvcache_full_build/14_fmha_prefill_kvcache"
 
 BIN="${FMHA_PREFILL_BIN:-$DEFAULT_BIN}"
 WARMUP="${FMHA_PREFILL_WARMUP:-5}"
@@ -14,12 +14,12 @@ SUITE="${FMHA_PREFILL_SUITE:-tile,perf}"
 
 usage() {
   cat <<EOF
-Usage: $0 [--perf-only] [--suite NAME[,NAME...]] [fmha_prefill_kvcache_binary]
+Usage: $0 [--perf-only] [--suite NAME[,NAME...]] [14_fmha_prefill_kvcache_binary]
 
 Default suite: tile,perf
 Common examples:
-  $0 /path/to/fmha_prefill_kvcache
-  $0 --perf-only /path/to/fmha_prefill_kvcache
+  $0 /path/to/14_fmha_prefill_kvcache
+  $0 --perf-only /path/to/14_fmha_prefill_kvcache
 EOF
 }
 
@@ -55,7 +55,7 @@ done
 
 if [[ ! -x "$BIN" ]]; then
   echo "error: executable not found or not executable: $BIN" >&2
-  echo "build first, or set FMHA_PREFILL_BIN=/path/to/fmha_prefill_kvcache" >&2
+  echo "build first, or set FMHA_PREFILL_BIN=/path/to/14_fmha_prefill_kvcache" >&2
   exit 2
 fi
 

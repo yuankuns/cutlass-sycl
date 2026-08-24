@@ -117,7 +117,7 @@ function(fmha_prefill_add_case NAME)
   add_test(
     NAME ${_test_name}
     COMMAND
-      $<TARGET_FILE:fmha_prefill_kvcache>
+      $<TARGET_FILE:14_fmha_prefill_kvcache>
       --batch ${CASE_BATCH}
       --seqlen-q ${CASE_SEQLEN_Q}
       --seqlen-k ${CASE_SEQLEN_K}
