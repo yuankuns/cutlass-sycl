@@ -39,6 +39,7 @@
 
 #include "../common/block_2d_copy_d.hpp"
 #include "cutlass/kernel_hardware_info.h"
+#include "mxfp4_dequant.hpp"
 #include "cutlass/platform/platform.h"
 #include "cutlass/tensor_ref.h"
 
@@ -223,6 +224,20 @@ CUTE_DEVICE void xe_gemm(
   copy(copy_c, tCrC_out, tCgC);
 }
 
+// A view of `Blocks` M-blocks of a (V, M, ...) register fragment, starting at
+// M-block `First`. The M mode of an A or C fragment is the dpas atom's 8-row
+// block, so a view is what lets one gemm() cover a row range that is a whole
+// number of blocks -- there is no way to give dpas a partial block.
+// Non-const on purpose: a view built from a `Tensor const&` carries a const
+// element type, and dpas writes its accumulator.
+template <int First, int Blocks, class Engine, class Layout>
+CUTE_DEVICE auto m_block_view(Tensor<Engine, Layout>& t) {
+  static_assert(rank(Layout{}) == 3, "an A/C subgroup fragment is (V, M, K|N)");
+  auto layout =
+      make_layout(get<0>(t.layout()), make_layout(Int<Blocks>{}, stride<1>(t.layout())), get<2>(t.layout()));
+  return make_tensor(t.data() + First * stride<1>(t.layout()), layout);
+}
+
 template <
     class GmemTiledCopyA,
     class GmemTiledCopyB,
@@ -296,7 +311,11 @@ CUTE_DEVICE void xe_gemm_4bits(
   auto pAgA = thr_prefetch_A.partition_S(gA);
   auto pBgB = thr_prefetch_B.partition_S(gB);
 
-  const int prefetch_dist = 6;
+  // How many k-tiles ahead the A and B prefetches run. Upstream asks for 6; 2 is
+  // what measures fastest on this part. The host makes this a template parameter
+  // once it has a tile registry to tune per shape; until then it is one constant
+  // for the whole policy menu.
+  constexpr int prefetch_dist = 2;
 
   constexpr SPIRVScope barrier_scope = ScopeWorkgroup;
 
@@ -329,18 +348,144 @@ CUTE_DEVICE void xe_gemm_4bits(
   scaleStoreType scales[thr_N * channel_num];
   conditional_t<HasZero, TA, uint8_t> zeros[thr_N * channel_num];
 
+  // Where each (n, channel) slot gathers its group scales from, i.e. the start of
+  // its B column inside this expert's scale matrix. The N direction is tiled to a
+  // BLK_N multiple, so the last tile of an expert whose N is not a multiple can
+  // hold columns that do not exist; their scales are clamped to the last real
+  // column, because past the last expert they would be past the whole array.
+  // (The clamped columns are not stored: the D copy is bounds-checked.)
+  // Carried as pointers, not as (base, index) pairs: consecutive gathers always
+  // advance by one group, so the loop pays one 64-bit add per slot instead of the
+  // int add + widen + 64-bit add IGC needs to rebuild `Scales[offset + group_idx]`
+  // from scratch every k-tile.
+  const int scale_col_bound = size<0>(B.shape()) - 1;
+  const ElementS* scale_ptr[thr_N * channel_num];
+  const ElementS* zero_ptr[HasZero ? thr_N * channel_num : 1];
+  CUTLASS_PRAGMA_UNROLL
+  for (int n = 0; n < thr_N; ++n) {
+    CUTLASS_PRAGMA_UNROLL
+    for (int c = 0; c < channel_num; ++c) {
+      const int col = n_tile_start + n_sg_start + n * sg_local_range + x_idx + c * (sg_local_range / channel_num);
+      const int offset = cute::min(col, scale_col_bound) * group_num;
+      scale_ptr[n * channel_num + c] = Scales + offset;
+      if constexpr (HasZero) {
+        zero_ptr[n * channel_num + c] = Zeros + offset;
+      }
+    }
+  }
+
+  // MXFP4 without zero points is dequantized inside the E2M1 -> BF16 reorder,
+  // which ends in a multiply anyway; see mxfp4_dequant.hpp. Everything else needs
+  // the separate pass over the B fragment further down.
+  static constexpr bool kFuseDequant =
+      std::is_same_v<TB, float_e2m1_t> && std::is_same_v<TA, bfloat16_t> && !HasZero;
+
+  // The multipliers a reorder chunk needs, from the chunk's first value index:
+  // the fragment's innermost mode alternates between the two columns a work-item
+  // covers (channels), and so between their two group scales, while a whole
+  // 8-value chunk stays inside one n-block.
+  using BFragLayout = decltype(tCrB.layout());
+  static constexpr int frag_mode0 = size<0>(tCrB.shape());
+  intel::vector_t<float, 2> mul_pairs[kFuseDequant ? thr_N : 1];
+  auto mul_of = [&](auto dv) -> intel::vector_t<float, 2> const& {
+    constexpr int n = (decltype(dv)::value / frag_mode0) % thr_N;
+    return mul_pairs[n];
+  };
+  if constexpr (kFuseDequant) {
+    static_assert(channel_num == 2, "the folded multiply covers exactly two channels");
+    static_assert(std::is_same_v<scaleStoreType, float>, "the folded multiply takes f32 multipliers");
+    // ((channel, x), n, k):((1, channel), mode0, ...) -- the n mode carries a zero
+    // stride when it is degenerate, which the index above handles.
+    static_assert(
+        stride<0, 0>(BFragLayout{}) == 1 && stride<0, 1>(BFragLayout{}) == channel_num &&
+            (thr_N == 1 || stride<1>(BFragLayout{}) == frag_mode0),
+        "the folded dequant needs a channel-innermost B fragment with n above mode 0");
+    static_assert(frag_mode0 % 8 == 0, "an 8-value reorder chunk must stay inside one n-block");
+  }
+
+  // How many of this subgroup's 8-row dpas blocks hold rows that exist.
+  //
+  // A tile spans tile_m rows of the expert's A/D slice, but an expert's last tile
+  // is partial, and that is where nearly all of this kernel's lost throughput
+  // lives: on the gpt-oss-120b l0 histogram (128 experts, 16384 rows) 23% of the
+  // dpas work at BLK_M = 64 is on rows past the end of an expert.
+  //
+  // Skipping the padded blocks costs nothing else: the tile keeps its shape, so B
+  // is loaded and dequantized exactly once per k-tile as it is for a full tile
+  // (which is why a narrower tile loses instead -- see the tile registry), and the
+  // D store was already bounds-checked and never wrote those rows.
+  //
+  // Only for a tile whose work-group is one M subgroup wide (ATOM_M == 1, which is
+  // every tile the production dispatch selects). There the subgroup owning row 0
+  // always has at least one live block, so no subgroup can end up with nothing to
+  // do -- which is what keeps the split barrier below legal. A multi-M-subgroup
+  // tile would need a dead subgroup to skip its whole k-loop, and then the
+  // barrier's arrive would never come.
+  static constexpr int kMBlocks = size<1>(tCrA.shape());
+  static constexpr int kMBlockRows = SG_M / kMBlocks;
+  static_assert(kMBlocks * kMBlockRows == SG_M, "the M mode of the A fragment must tile SG_M");
+  // And only for a subgroup tile that holds more than one dpas M block: at SG_M = 8
+  // (the decode tile) a live tile always has its one block live, so the predicate
+  // can never fire and all that is left of it is a branch the compiler cannot fold
+  // -- worth 8.6% on the tp8 decode GEMM1, against the 3.7-4.4% the skip wins on
+  // the prefill shapes.
+  static constexpr bool kSkipPaddedM = ATOM_M == 1 && kMBlocks > 1;
+  const int sg_m_row0 = (cutlass::get_sub_group_id() / ATOM_N) * SG_M;
+  const int sg_m_blocks = cute::max(
+      0,
+      cute::min(kMBlocks, ceil_div(int(size<0>(C.shape())) - int(wg_m) * int(tile_m) - sg_m_row0, kMBlockRows)));
+
+  // The other side of the padding -- a work-group tile is a whole BLK_N wide, so an
+  // expert whose N is not a multiple of it ends with subgroups whose columns are all
+  // past the end of D -- is not skipped here, and cannot be while the split barrier
+  // below is unconditional: a subgroup with no columns would run no k-loop, and the
+  // ones that do would wait on an arrive that never comes. Whether that skip pays is
+  // a property of the shape rather than of the tile, so it needs a host-side rule to
+  // turn it on; until then this stays false and `sg_alive` carries the M term only.
+  static constexpr bool kSkipPaddedN = false;
+  const bool sg_alive = (!kSkipPaddedM || sg_m_blocks > 0) &&
+      (!kSkipPaddedN || n_tile_start + n_sg_start < int(size<1>(C.shape())));
+
+  // The per-k-tile split barrier, as upstream writes it. Nothing in this mainloop is
+  // shared through SLM, so it is purely a scheduling device: it holds the subgroups
+  // in lockstep so their A/B prefetches stay timely. It is legal only because no
+  // subgroup can find `sg_alive` false -- the M skip cannot leave one dead (see
+  // kSkipPaddedM above) and the N skip is off.
+  static constexpr bool kMainloopBarrier = !kSkipPaddedN;
+
   clear(tCrC);
 
   using ElementB = typename BTensor::element_type;
   static constexpr bool is_B_fp8_type =
       std::is_same_v<ElementB, cutlass::float_e5m2_t> || std::is_same_v<ElementB, cutlass::float_e4m3_t>;
 
+  // Prefetching the next k-tile's group scales through a 2D-block message. A
+  // block load has a minimum width and height (the hardware wants at least a
+  // cache line of both, 64-byte aligned), and in practice it moves a whole cache
+  // line per row. At the end of the scale array -- which is the end of the
+  // allocation for the last expert -- that reads unmapped memory and the kernel
+  // dies with DEVICE_LOST. It only shows up when the array ends on an
+  // allocation-granule boundary, so that the allocator left no rounding slack
+  // behind it: e.g. E=128, N=768, K=2880 (production gpt-oss-120b tp8 GEMM1)
+  // dies while N=1472 survives. The scales are a few hundred bytes per subgroup
+  // and stay in L1 across the k-loop, so the prefetch is off; the bound below is
+  // what it would need to be safe. Measured worth: turning it off pays ~3%.
+  static constexpr bool kScalePrefetch = false;
+  static constexpr int kScalePrefetchSlop = 64;
+  const int scale_prefetch_bound = (scale_col_bound + 1) * group_num - kScalePrefetchSlop;
+
   auto prefetch_scale_group = [&](int scale_k_tile) {
+    if constexpr (!kScalePrefetch) {
+      return;
+    }
     if (scale_k_tile >= k_tile_count || scale_k_tile * tile_k % group_size != 0) {
       return;
     }
 
     int scale_group_idx = scale_k_tile * tile_k / group_size;
+    if ((n_tile_start + n_sg_start + SG_N - 1) * group_num + scale_group_idx > scale_prefetch_bound) {
+      return;
+    }
     auto next_scales_tensor = make_tensor(
         make_gmem_ptr(
             reinterpret_cast<const ElementS*>(Scales + (n_tile_start + n_sg_start) * group_num + scale_group_idx)),
@@ -352,42 +497,56 @@ CUTE_DEVICE void xe_gemm_4bits(
   };
 
   CUTE_UNROLL
-  for (; k_tile_prefetch < prefetch_dist; k_tile_prefetch++) {
+  for (; sg_alive && k_tile_prefetch < prefetch_dist; k_tile_prefetch++) {
     prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
     prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
     prefetch_scale_group(k_tile_prefetch);
   }
 
-  for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
-    barrier_arrive(barrier_scope);
-
+  // Everything a k-tile does before its dpas: the A and B loads, the group-scale
+  // gather at a group boundary, the next tile's prefetches, and the two reorders.
+  // None of it depends on how many M-blocks the dpas will cover.
+  auto k_tile_body = [&](int k_tile, int k_tile_prefetch) {
     copy(copy_a, tAgA(_, _, _, k_tile), tArA);
     copy(copy_b, tBgB(_, _, _, k_tile), tBrB);
 
     if (k_tile * tile_k % group_size == 0) {
-      int group_idx = (k_tile * tile_k) / group_size;
-
       CUTLASS_PRAGMA_UNROLL
       for (int n = 0; n < thr_N; ++n) {
         CUTLASS_PRAGMA_UNROLL
         for (int c = 0; c < channel_num; ++c) {
-          int real_idx = x_idx + c * (sg_local_range / channel_num);
-          int sg_local_n = n * sg_local_range + real_idx;
+          const int slot = n * channel_num + c;
+          const ElementS* sp = scale_ptr[slot];
+          scale_ptr[slot] = sp + 1;
+          const ElementS* zp = nullptr;
+          if constexpr (HasZero) {
+            zp = zero_ptr[slot];
+            zero_ptr[slot] = zp + 1;
+          }
           scaleStoreType scale;
           if constexpr (std::is_same_v<TB, int4_t>) {
-            scale = Scales[(n_tile_start + n_sg_start + sg_local_n) * group_num + group_idx];
+            scale = sp[0];
           } else if constexpr (std::is_same_v<TB, uint4_t>) {
-            int idx = (n_tile_start + n_sg_start + sg_local_n) * group_num + group_idx;
-            scale = static_cast<scaleStoreType>(Scales[idx]);
+            scale = static_cast<scaleStoreType>(sp[0]);
             if constexpr (HasZero) {
-              zeros[n * channel_num + c] = static_cast<TA>(Zeros[idx]);
+              zeros[slot] = static_cast<TA>(zp[0]);
             }
           } else if constexpr (std::is_same_v<TB, float_e2m1_t>) {
-            uint32_t scale_u32 = Scales[(n_tile_start + n_sg_start + sg_local_n) * group_num + group_idx] << 23;
-            scale = static_cast<scaleStoreType>(reinterpret_cast<float&>(scale_u32));
+            const uint32_t e8m0 = static_cast<uint32_t>(sp[0]);
+            if constexpr (kFuseDequant) {
+              // Folded into the reorder's own multiply, so it carries the
+              // conversion constant and the 2^-kFoldShift bias with it.
+              scale = mxfp4_fold_multiplier(e8m0);
+            } else {
+              uint32_t scale_u32 = e8m0 << 23;
+              scale = static_cast<scaleStoreType>(reinterpret_cast<float&>(scale_u32));
+            }
           }
 
-          scales[n * channel_num + c] = scale;
+          scales[slot] = scale;
+          if constexpr (kFuseDequant) {
+            mul_pairs[n][c] = scale;
+          }
         }
       }
     }
@@ -399,10 +558,14 @@ CUTE_DEVICE void xe_gemm_4bits(
     prefetch_scale_group(k_tile_prefetch);
 
     reorder(tArA, tCrA);
-    reorder(tBrB, tCrB);
+    if constexpr (kFuseDequant) {
+      mxfp4_reorder_dequant(tBrB, tCrB, mul_of);
+    } else {
+      reorder(tBrB, tCrB);
+    }
 
     CUTLASS_PRAGMA_UNROLL
-    for (int n = 0; n < thr_N; ++n) {
+    for (int n = 0; n < thr_N && !kFuseDequant; ++n) {
       CUTLASS_PRAGMA_UNROLL
       for (int c = 0; c < channel_num; ++c) {
         CUTLASS_PRAGMA_UNROLL
@@ -425,10 +588,64 @@ CUTE_DEVICE void xe_gemm_4bits(
         }
       }
     }
+  };
 
-    cute::gemm(mma, tCrA, tCrB, tCrC);
+  // No rows or no columns: no mainloop at all -- not even the prefetch, see the
+  // notes on kSkipPaddedM and kSkipPaddedN -- and no epilogue either. Hoisted out
+  // of the k-loop rather than tested in it, so the loop the compiler schedules is
+  // the one a live subgroup runs.
+  if (!sg_alive) {
+    return;
+  }
 
-    barrier_wait(barrier_scope);
+  for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
+    if constexpr (kMainloopBarrier) {
+      barrier_arrive(barrier_scope);
+    }
+
+    k_tile_body(k_tile, k_tile_prefetch);
+
+    if constexpr (kSkipPaddedM) {
+      if (sg_m_blocks == kMBlocks) {
+        cute::gemm(mma, tCrA, tCrB, tCrC);
+      } else {
+        // One gemm over the whole valid block range, picked by an equality test on
+        // a subgroup-uniform, loop-invariant count. Predicating each block
+        // separately instead costs far more than the dpas it saves: the branch
+        // between two blocks is a basic-block boundary, so what should be one run
+        // of independent dpas becomes a chain of dependent pairs, and the penalty
+        // grows with the block count. Measured cost of one partial tile, in units
+        // of a full tile of the same shape (l0 GEMM1, 90 k-tiles, three full tiles
+        // alongside it so the launch is not bandwidth-bound):
+        //
+        //   valid blocks   1     2     4     6     7     8
+        //   per block    0.803 0.830 0.915 1.220 1.292 1.000
+        //   one range    0.79 (a single range at 6 blocks measures 0.808)
+        //
+        // A 6-of-8 tile was *slower* than computing all eight. The floor near 0.79
+        // is the per-k-tile stream that does not depend on the block count (the A
+        // and B loads, the scale gather, the prefetches, the two reorders); no
+        // predication can go below it, which is why the histogram of tail blocks --
+        // 59 of 128 l0 experts land on 5, 6 or 7 -- decides whether the skip pays.
+        for_each(make_int_sequence<kMBlocks - 1>{}, [&](auto mb) {
+          constexpr int blocks = decltype(mb)::value + 1;
+          if (sg_m_blocks == blocks) {
+            cute::gemm(mma, m_block_view<0, blocks>(tCrA), tCrB, m_block_view<0, blocks>(tCrC));
+          }
+        });
+      }
+    } else {
+      cute::gemm(mma, tCrA, tCrB, tCrC);
+    }
+
+    if constexpr (kMainloopBarrier) {
+      barrier_wait(barrier_scope);
+    }
+  }
+
+  // Every product carried a 2^-kFoldShift from the folded multiplier.
+  if constexpr (kFuseDequant) {
+    mxfp4_unfold(tCrC);
   }
 
   if (Bias != nullptr) {

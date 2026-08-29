@@ -86,6 +86,9 @@ CUTE_DEVICE void MoEGEMM(
     int32_t* atomic_buffer,
     const sycl::local_accessor<int32_t, 1>& slm_mem_const) {
   constexpr char actual_layout_of_B = LayoutKindB ^ ('R' ^ 'C');
+  // The surface extension below only keeps the addressing intact for row-major
+  // slices, whose stride does not carry the row count.
+  static_assert(LayoutKindA == 'R' && actual_layout_of_B == 'R', "surface extension needs row-major A and B");
   static constexpr bool is_B_int4 = (std::is_same_v<ElementB, uint8_t>) && (!std::is_same_v<ElementS, uint8_t>);
   static constexpr bool is_B_mxfp4 = (std::is_same_v<ElementB, uint8_t>) && (std::is_same_v<ElementS, uint8_t>);
   static constexpr bool is_B_4bits = std::is_same_v<ElementB, uint8_t>;
@@ -112,6 +115,16 @@ CUTE_DEVICE void MoEGEMM(
 
   int pre_rows = 0;
   int pre_tiles = 0;
+
+  // Activations and Outputs are one contiguous [total_rows, K] / [total_rows, N]
+  // buffer that every expert slices (ptr_A = Activations + pre_rows * gemm_k), so
+  // the rows past an expert's own slice are the next expert's rows -- real memory.
+  // The bound is the sum of the per-expert row counts; the kernel adds it up rather
+  // than taking it as an argument so that nothing on the host has to change.
+  int total_rows = 0;
+  for (int i = 0; i < num_experts; ++i) {
+    total_rows += rows_per_expert[i];
+  }
 
   int32_t* slm_mem = static_cast<int32_t*>(slm_mem_const.template get_multi_ptr<sycl::access::decorated::no>().get());
 
@@ -147,21 +160,35 @@ CUTE_DEVICE void MoEGEMM(
       ptr_Bias_curr_batch = const_cast<ElementBI*>(Bias) + expert_id * gemm_n;
     }
 
-    auto A_tensor = make_moe_tensor<ElementA, LayoutKindA>(ptr_A_curr_batch, gemm_m, gemm_k);
+    // A 2D-block load whose block crosses the surface's last row costs far more
+    // than the rows it discards, so a tile whose block is not filled by the
+    // surface pays that on every k-tile. Both surfaces are slices of a larger
+    // buffer -- the rows past an expert's A are the next expert's rows, the rows
+    // past its B are the next expert's weights -- so the rows are real memory:
+    // give each surface a tile-aligned height and let the edge tiles read them.
+    // Nothing extra is computed (the tile spans those rows either way) and no
+    // extra result is written, because D keeps the true row and column counts.
+    // The last expert has nothing after it, so it keeps its true height.
+    const int padded_m = (gemm_m + wg_tile_m - 1) / wg_tile_m * wg_tile_m;
+    const int a_rows = cute::max(gemm_m, cute::min(padded_m, total_rows - pre_rows));
+    const int b_rows =
+        expert_id + 1 < num_experts ? (gemm_n + wg_tile_n - 1) / wg_tile_n * wg_tile_n : gemm_n;
+
+    auto A_tensor = make_moe_tensor<ElementA, LayoutKindA>(ptr_A_curr_batch, a_rows, gemm_k);
     auto B_tensor = [&]() {
       if constexpr (is_B_int4) {
         if constexpr (HasZero) {
           return make_moe_tensor<uint4_t, actual_layout_of_B>(
-              reinterpret_cast<uint4_t*>(ptr_B_curr_batch), gemm_n, gemm_k);
+              reinterpret_cast<uint4_t*>(ptr_B_curr_batch), b_rows, gemm_k);
         } else {
           return make_moe_tensor<int4_t, actual_layout_of_B>(
-              reinterpret_cast<int4_t*>(ptr_B_curr_batch), gemm_n, gemm_k);
+              reinterpret_cast<int4_t*>(ptr_B_curr_batch), b_rows, gemm_k);
         }
       } else if constexpr (is_B_mxfp4) {
         return make_moe_tensor<float_e2m1_t, actual_layout_of_B>(
-            reinterpret_cast<float_e2m1_t*>(ptr_B_curr_batch), gemm_n, gemm_k);
+            reinterpret_cast<float_e2m1_t*>(ptr_B_curr_batch), b_rows, gemm_k);
       } else {
-        return make_moe_tensor<ElementB, actual_layout_of_B>(ptr_B_curr_batch, gemm_n, gemm_k);
+        return make_moe_tensor<ElementB, actual_layout_of_B>(ptr_B_curr_batch, b_rows, gemm_k);
       }
     }();
     auto D_tensor = make_moe_tensor<ElementD, LayoutKindD>(ptr_D_curr_batch, gemm_m, gemm_n);
