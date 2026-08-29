@@ -244,6 +244,9 @@ template <
     class GmemTiledCopyC,
     int GroupSize,
     bool HasZero,
+    int PrefetchDist,
+    bool MainloopBarrier,
+    bool SkipPaddedN,
     class ATensor,
     class BTensor,
     class DTensor,
@@ -311,11 +314,8 @@ CUTE_DEVICE void xe_gemm_4bits(
   auto pAgA = thr_prefetch_A.partition_S(gA);
   auto pBgB = thr_prefetch_B.partition_S(gB);
 
-  // How many k-tiles ahead the A and B prefetches run. Upstream asks for 6; 2 is
-  // what measures fastest on this part. The host makes this a template parameter
-  // once it has a tile registry to tune per shape; until then it is one constant
-  // for the whole policy menu.
-  constexpr int prefetch_dist = 2;
+  static_assert(PrefetchDist > 0, "prefetch distance must be positive");
+  constexpr int prefetch_dist = PrefetchDist;
 
   constexpr SPIRVScope barrier_scope = ScopeWorkgroup;
 
@@ -435,23 +435,37 @@ CUTE_DEVICE void xe_gemm_4bits(
       0,
       cute::min(kMBlocks, ceil_div(int(size<0>(C.shape())) - int(wg_m) * int(tile_m) - sg_m_row0, kMBlockRows)));
 
-  // The other side of the padding -- a work-group tile is a whole BLK_N wide, so an
-  // expert whose N is not a multiple of it ends with subgroups whose columns are all
-  // past the end of D -- is not skipped here, and cannot be while the split barrier
-  // below is unconditional: a subgroup with no columns would run no k-loop, and the
-  // ones that do would wait on an arrive that never comes. Whether that skip pays is
-  // a property of the shape rather than of the tile, so it needs a host-side rule to
-  // turn it on; until then this stays false and `sg_alive` carries the M term only.
-  static constexpr bool kSkipPaddedN = false;
+  // The other side of the padding: a work-group tile is a whole BLK_N wide, so an
+  // expert whose N is not a multiple of it -- gpt-oss GEMM2 is N = 2880 against
+  // BLK_N = 128 -- ends with subgroups whose columns are all past the end of D.
+  // Those subgroups have nothing to store (the D copy is bounds-checked and never
+  // wrote those columns), so they skip the mainloop's loads, dequant, dpas and
+  // epilogue, and leave their issue slots, their share of the L1 and their share of
+  // the XMX array to the subgroups that do have work. The work-stealing barrier is
+  // outside this function and every subgroup still reaches it, so this cannot
+  // deadlock.
+  //
+  // The skip is not free, and whether it pays is a property of the shape: a skipped
+  // subgroup drops its share of the prefetch with it (make_block_2d_prefetch is
+  // sliced by the work-item id, so the WG's A and B tile prefetches are partitioned
+  // across all of its subgroups and the live ones then miss on the lines the dead
+  // one would have fetched), and the `sg_alive` branch itself costs codegen even
+  // where nothing is ever skipped. Hence the shape rule in want_nskip(): on the
+  // GEMM1 shapes, where 4 of 16 subgroups die in 1 of 6 N tiles, the skip measures
+  // 2.7-5.4% *slower*; on the GEMM2 shapes, where half the work-group dies, it is
+  // up to 1.7% faster.
+  static constexpr bool kSkipPaddedN = SkipPaddedN;
   const bool sg_alive = (!kSkipPaddedM || sg_m_blocks > 0) &&
       (!kSkipPaddedN || n_tile_start + n_sg_start < int(size<1>(C.shape())));
 
-  // The per-k-tile split barrier, as upstream writes it. Nothing in this mainloop is
-  // shared through SLM, so it is purely a scheduling device: it holds the subgroups
-  // in lockstep so their A/B prefetches stay timely. It is legal only because no
-  // subgroup can find `sg_alive` false -- the M skip cannot leave one dead (see
-  // kSkipPaddedM above) and the N skip is off.
-  static constexpr bool kMainloopBarrier = !kSkipPaddedN;
+  // Whether the policy's per-k-tile split barrier request (MainloopBarrier, see
+  // gemm_xe2_policy.hpp) can actually be honoured. A split barrier is only legal if
+  // *every* subgroup of the work-group reaches it, and a subgroup that finds
+  // `sg_alive` false runs no k-loop, so the ones that do would wait on an arrive
+  // that never comes and the work-group hangs. Whether the N skip fires is a
+  // run-time property, so the compile-time test has to be the template bit itself.
+  // (The M skip cannot leave a subgroup dead: see kSkipPaddedM above.)
+  static constexpr bool kMainloopBarrier = MainloopBarrier && !kSkipPaddedN;
 
   clear(tCrC);
 

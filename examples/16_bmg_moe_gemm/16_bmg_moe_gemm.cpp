@@ -13,6 +13,7 @@
 #include <iostream>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -29,7 +30,10 @@
 #include "kernel/moe/xe20/w4a16/grouped_gemm_xe2.hpp"
 
 namespace moe_w4a16 {
-template <typename, typename, typename, typename, bool, char, char, class>
+// The schedule and the N-tail skip are part of the kernel name: two launches of
+// the same tile at different (work-stealing chunk, prefetch distance) pairs, or
+// with and without the skip, are different kernels.
+template <typename, typename, typename, typename, bool, char, char, class, int, int, bool>
 class GemmCuteName;
 }
 
@@ -85,6 +89,9 @@ template <
     char LayoutB,
     bool HasZero,
     class Policy,
+    int StealChunk,
+    int PrefetchDist,
+    bool SkipPaddedN,
     typename ElementA,
     typename ElementB,
     typename ElementS,
@@ -100,7 +107,10 @@ sycl::event launch_w4a16_kernel(
     ElementD* output,
     int n,
     int k,
+    int total_rows,
     const int32_t* rows,
+    const int32_t* row_offsets,
+    int m_tile_group,
     int experts,
     int group_size,
     int32_t* counter) {
@@ -125,16 +135,29 @@ sycl::event launch_w4a16_kernel(
   return stream.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<int32_t, 1> local_mem(sycl::range<1>(1), cgh);
     cgh.parallel_for<moe_w4a16::GemmCuteName<
-        ElementA, ElementB, ElementS, ElementD, HasZero, LayoutA, LayoutB, Policy>>(
+        ElementA, ElementB, ElementS, ElementD, HasZero, LayoutA, LayoutB, Policy, StealChunk, PrefetchDist,
+        SkipPaddedN>>(
         sycl::nd_range<3>{global * local, local}, props, [=](auto) {
-          moe_w4a16::MoEGEMM<GmemTiledCopyA, GmemTiledCopyB, GmemTiledCopyD, LayoutA, LayoutB, 'R', HasZero>(
+          moe_w4a16::MoEGEMM<
+              GmemTiledCopyA, GmemTiledCopyB, GmemTiledCopyD, LayoutA, LayoutB, 'R', HasZero,
+              StealChunk, PrefetchDist, Policy::MainloopBarrier, SkipPaddedN>(
               activations, weights, scales, zeros, bias,
-              output, mma, rows, experts, group_size, n, k, counter, local_mem);
+              output, mma, rows, row_offsets, total_rows, experts, group_size, n, k, m_tile_group,
+              counter, local_mem);
         });
   });
 }
 
-template <class Policy, typename ElementS, typename ElementA, bool HasZero>
+// `total_rows` and `row_offsets` are the tile-aligned-surface arguments (0 and
+// nullptr disable them); `m_tile_group` is the tile order (1 = row-major).
+template <
+    class Policy,
+    typename ElementS,
+    typename ElementA,
+    bool HasZero,
+    int StealChunk = 1,
+    int PrefetchDist = 6,
+    bool SkipPaddedN = false>
 sycl::event launch_w4a16(
     sycl::queue& queue,
     const ElementA* activations,
@@ -144,13 +167,18 @@ sycl::event launch_w4a16(
     ElementA* output,
     int n,
     int k,
+    int total_rows,
     const int32_t* rows,
+    const int32_t* row_offsets,
+    int m_tile_group,
     int experts,
     int group_size,
     int32_t* counter) {
-  return launch_w4a16_kernel<'R', 'C', HasZero, Policy, ElementA, uint8_t, ElementS, float, ElementA>(
+  return launch_w4a16_kernel<
+      'R', 'C', HasZero, Policy, StealChunk, PrefetchDist, SkipPaddedN, ElementA, uint8_t, ElementS, float,
+      ElementA>(
       queue, activations, packed_weights, scales, zeros, static_cast<const float*>(nullptr), output,
-      n, k, rows, experts, group_size, counter);
+      n, k, total_rows, rows, row_offsets, m_tile_group, experts, group_size, counter);
 }
 
 // GEMM shape -> tile policy, copied from select_w4a16_tile_m() /
@@ -209,18 +237,294 @@ const char* policy_name(int policy_id) {
   }
 }
 
-// How the tile is chosen. `after` is PR 446's scored selector, `before` is the
-// avg_m threshold ladder it replaced; a bare policy id forces one tile.
+// ---------------------------------------------------------------------------
+// Tile registry: (BLK_M, BLK_N) with the subgroup layout that covers it.
+// ---------------------------------------------------------------------------
+// The subgroup tile is BLK_M/SG_M x BLK_N/SG_N. A tall subgroup tile amortizes
+// the 4-bit dequantization (which costs SG_N x BLK_K multiplies) over more DPAS
+// work (SG_M x SG_N x BLK_K), so a 64-row subgroup halves the relative dequant
+// cost. A work-group tile with more than one M-subgroup is also fragile on ragged
+// M: when an expert's tail leaves a whole subgroup's rows out of bounds that
+// subgroup still runs, and it costs far more than its DPAS work. Tiles with
+// BLK_M == SG_M keep every subgroup on the same rows, so a partial tile is
+// partial for all of them equally; occupancy then has to come from BLK_N.
+//
+// The rule the tiles below keep is SG_N = 16, i.e. exactly one DPAS N-block per
+// subgroup, which is also 16 DPAS per k-loop iteration and no GRF spill.
+//
+// The tiles a production launch can pick. Both are what the production workloads
+// select: 64x256_1x16 for the large-K GEMM1, 64x128_1x8 for GEMM2.
+#define MOE_SG1_TILE_LIST(X) \
+  X(64, 256, 1, 16, 32)      \
+  X(64, 128, 1, 8, 32)
+
+// The tiles a decode-sized launch can pick: a handful of rows spread over the
+// routed experts, so BLK_M = 64 would pad 4 rows up to 64 and the whole cost is
+// the B stream.
+#define MOE_SMALL_TILE_LIST(X) \
+  X(8, 64, 1, 4, 32)           \
+  X(16, 64, 1, 4, 32)          \
+  X(32, 64, 1, 4, 32)          \
+  X(16, 128, 1, 8, 32)
+
+// The (work-stealing chunk, prefetch distance) pairs that get kernels. They are
+// template arguments -- the prefetch distance unrolls a preamble and the chunk
+// decides whether an atomic is in the tile loop at all -- so only the pairs listed
+// here are reachable, and a tile that takes the swept set costs one kernel per
+// pair. The two pairs are the ones tuned_sched() can return, plus whatever --sched
+// asks for has to be one of them.
+#define MOE_SCHED_LIST(X) X(1, 2) X(4, 2)
+
+// The pair a shape gets when --sched is not given: a large-K launch wants no
+// work-stealing chunk, a small-K one (GEMM2) a chunk of four, and everything wants
+// a two-tile prefetch distance. Upstream's distance is 6, which holds 6 k-tiles of
+// A and B in flight per subgroup.
+std::pair<int, int> tuned_sched(int k, int n) {
+  (void)n;  // N does not select the schedule: the sweep is the same sign at N = 768
+  return k <= 1024 ? std::pair<int, int>{4, 2} : std::pair<int, int>{1, 2};
+}
+
+// --sched=<chunk>,<dist>, 0 for "use the tuned pair for this shape".
+int g_steal_chunk = 0;
+int g_prefetch_dist = 0;
+
+// Whether to skip the subgroups of the last N tile whose columns are all past the
+// end of D (see kSkipPaddedN in gemm_xe2.hpp). What the skip has to earn back is
+// codegen and its share of the work-group's prefetch, so it pays only when enough
+// of the last tile is dead: measured, it wins up to 1.7% at half the work-group
+// dead (N = 2880 against BLK_N = 128) and loses 2.7-5.4% at a quarter of one N
+// tile (N = 1472 against BLK_N = 256).
+bool want_nskip(int n, int blk_n) {
+  const int tail = n % blk_n;
+  return tail != 0 && tail <= blk_n / 2;
+}
+
+// --nskip: -1 leaves the rule above in charge, 0 and 1 force it off and on.
+int g_nskip = -1;
+
+// --row-extend=0 turns off the tile-aligned A/B surfaces (see the note in
+// grouped_gemm_xe2.hpp), which is how the extension is priced.
+int g_row_extend = 1;
+
+bool requested_nskip(int n, int blk_n) {
+  return g_nskip < 0 ? want_nskip(n, blk_n) : g_nskip != 0;
+}
+
+std::pair<int, int> requested_sched(int k, int n) {
+  auto pair = tuned_sched(k, n);
+  if (g_steal_chunk) pair.first = g_steal_chunk;
+  if (g_prefetch_dist) pair.second = g_prefetch_dist;
+  return pair;
+}
+
+struct TileSpec {
+  int blk_m = 64, blk_n = 256, sg_m = 1, sg_n = 16, blk_k = 32;
+  std::string name() const {
+    std::ostringstream os;
+    os << blk_m << 'x' << blk_n << '_' << sg_m << 'x' << sg_n;
+    if (blk_k != 32) os << 'k' << blk_k;
+    return os.str();
+  }
+};
+
+std::vector<TileSpec> all_tiles() {
+  std::vector<TileSpec> tiles;
+#define MOE_TILE_PUSH(M, N, SM, SN, K) tiles.push_back(TileSpec{M, N, SM, SN, K});
+  MOE_SG1_TILE_LIST(MOE_TILE_PUSH)
+  MOE_SMALL_TILE_LIST(MOE_TILE_PUSH)
+#undef MOE_TILE_PUSH
+  return tiles;
+}
+
+TileSpec parse_tile(const std::string& name) {
+  for (const auto& tile : all_tiles()) {
+    if (tile.name() == name) return tile;
+  }
+  throw std::invalid_argument("unknown --tile '" + name + "'; use --list-tiles");
+}
+
+// ---------------------------------------------------------------------------
+// Which tile a launch gets when --tile is not given.
+// ---------------------------------------------------------------------------
+// The host sees only the mean rows per expert -- rows_per_expert is a device
+// array by then -- so every band below is a decision made from (avg_m, N, K)
+// alone.
+//
+// The peaks are the two 64-row tiles' padding-free rates (82.9 and 75.6 TFLOP/s,
+// measured at --rows=960 on the l0 GEMM1 shape, which is a whole number of both
+// tiles' M); only their ratio matters, since it prices how much N tail the
+// 256-wide tile may waste before the 128-wide one wins.
+constexpr float kPeakN256 = 82.9f;
+constexpr float kPeakN128 = 75.6f;
+
+// A short K demotes the wide tile outright. An MoE layer's second GEMM contracts
+// over the sharded intermediate size (736 at TP=4, 384 at TP=8) instead of the
+// hidden size, so its k-loop is 4-8x shorter and the per-work-group-tile costs
+// the 256-wide tile pays -- its extra B load pass and its epilogue -- amortize
+// over that much less DPAS. On the real TP=4 layer-0 GEMM2 (N=2880, K=736) the
+// 128-wide tile measures 60.5 TFLOP/s against the 256-wide tile's 52.7, a 15%
+// gap the N-fill score below cannot see: at N=2880 it scores the wide tile 77.7
+// against 75.6 and would pick it, so this branch has to come first.
+constexpr int kShortK = 1024;
+
+// The short-M bands: take the smallest BLK_M that covers avg_m. Both crossovers
+// land where the padding argument puts them -- at avg_m = 17 a 16-row tile needs
+// two tiles and issues the same 32 rows a 32-row tile issues in one -- and the
+// same ladder is what PR 446's thresholds resolve to, at half its boundaries.
+int round_up_to(int value, int multiple) { return (value + multiple - 1) / multiple * multiple; }
+
+const char* select_workload_tile(int avg_m, int n, int k) {
+  if (avg_m <= 8) return "8x64_1x4";
+  if (avg_m <= 16) return "16x64_1x4";
+  if (avg_m <= 32) return "32x64_1x4";
+  if (k <= kShortK) return "64x128_1x8";
+
+  // Long K: the wider tile wins unless its N tail wastes more than it is worth. A
+  // tile computes ceil(N / BLK_N) * BLK_N columns, and ceil at 256 is never
+  // kinder than ceil at 128, so this only ever demotes the wide tile -- N=1152
+  // leaves it 0.9 filled against 1.0, which its 1.097x rate cannot pay for, while
+  // at N=2880 (0.9375 against 1.0) it still wins on long K.
+  const float fill_n256 = float(n) / float(round_up_to(n, 256));
+  const float fill_n128 = float(n) / float(round_up_to(n, 128));
+  return kPeakN256 * fill_n256 >= kPeakN128 * fill_n128 ? "64x256_1x16" : "64x128_1x8";
+}
+
+// How the tile is chosen. `tuned` is select_workload_tile() above; `after` is PR
+// 446's scored selector over the upstream policy menu and `before` is the avg_m
+// threshold ladder it replaced, so both rows of the PR's table stay measurable. A
+// bare policy id forces one tile of the upstream menu, --tile one of the registry.
 struct TileChoice {
-  bool pre_446 = false;
+  std::string selector = "tuned";
   int forced_policy_id = -1;
+  std::string forced_tile;
+
+  bool from_registry() const { return forced_policy_id < 0 && (!forced_tile.empty() || selector == "tuned"); }
 
   int policy_id(int total_m, int experts, int n) const {
     if (forced_policy_id >= 0) return forced_policy_id;
     const int avg_m = total_m / experts;
-    return pre_446 ? select_w4a16_policy_id_pre_446(avg_m) : select_w4a16_policy_id(avg_m, n);
+    return selector == "before" ? select_w4a16_policy_id_pre_446(avg_m)
+                                : select_w4a16_policy_id(avg_m, n);
+  }
+
+  TileSpec tile_spec(int total_m, int experts, int n, int k) const {
+    if (!forced_tile.empty()) return parse_tile(forced_tile);
+    return parse_tile(select_workload_tile(total_m / experts, n, k));
+  }
+
+  // What actually ran, for the report line.
+  std::string name(int total_m, int experts, int n, int k) const {
+    return from_registry() ? tile_spec(total_m, experts, n, k).name()
+                           : policy_name(policy_id(total_m, experts, n));
   }
 };
+
+// The upstream policy menu, at the schedule upstream ships (prefetch distance 6,
+// the work-group barrier on, no work-stealing chunk). Kept exactly as it was so
+// that the before/after rows of PR 446's table stay measurable.
+template <typename ElementS, typename ElementA, bool HasZero>
+sycl::event launch_w4a16_policy(
+    sycl::queue& queue,
+    const ElementA* activations,
+    const uint8_t* packed_weights,
+    const ElementS* scales,
+    const ElementS* zeros,
+    ElementA* output,
+    int policy_id,
+    int n,
+    int k,
+    const int32_t* rows,
+    int experts,
+    int group_size,
+    int32_t* counter) {
+#define LAUNCH_W4A16(Policy)                                                                       \
+  return launch_w4a16<Policy, ElementS, ElementA, HasZero>(                                        \
+      queue, activations, packed_weights, scales, zeros, output, n, k, /*total_rows=*/0, rows,      \
+      /*row_offsets=*/nullptr, /*m_tile_group=*/1, experts, group_size, counter)
+
+  switch (policy_id) {
+    case 0: LAUNCH_W4A16(moe_w4a16::w4a16_policy_m_8_n_64);
+    case 1: LAUNCH_W4A16(moe_w4a16::w4a16_policy_m_16_n_64);
+    case 2: LAUNCH_W4A16(moe_w4a16::w4a16_policy_m_32_n_64);
+    case 3: LAUNCH_W4A16(moe_w4a16::w4a16_policy_m_64_n_128);
+    case 4: LAUNCH_W4A16(moe_w4a16::w4a16_policy_m_128_n_128);
+    case kLegacyPolicyId: LAUNCH_W4A16(legacy_policy_m_128_n_256);
+    default: throw std::runtime_error("invalid W4A16 policy id");
+  }
+#undef LAUNCH_W4A16
+}
+
+// One tile at one of the schedules in MOE_SCHED_LIST, with or without the N-tail
+// skip, all picked at run time.
+template <class Policy, typename ElementS, typename ElementA, bool HasZero, class... Args>
+sycl::event launch_sched(std::pair<int, int> sched, bool nskip, Args&&... args) {
+#define MOE_SCHED_DISPATCH(S, P)                                             \
+  if (sched.first == S && sched.second == P) {                               \
+    if (nskip) {                                                             \
+      return launch_w4a16<Policy, ElementS, ElementA, HasZero, S, P, true>(  \
+          std::forward<Args>(args)...);                                      \
+    }                                                                        \
+    return launch_w4a16<Policy, ElementS, ElementA, HasZero, S, P, false>(   \
+        std::forward<Args>(args)...);                                        \
+  }
+  MOE_SCHED_LIST(MOE_SCHED_DISPATCH)
+#undef MOE_SCHED_DISPATCH
+  throw std::invalid_argument(
+      "--sched=" + std::to_string(sched.first) + "," + std::to_string(sched.second) +
+      " is not instantiated; see MOE_SCHED_LIST");
+}
+
+// The registry tiles.
+template <typename ElementS, typename ElementA, bool HasZero>
+sycl::event dispatch_tile(
+    const TileSpec& tile,
+    sycl::queue& queue,
+    const ElementA* activations,
+    const uint8_t* packed_weights,
+    const ElementS* scales,
+    const ElementS* zeros,
+    ElementA* output,
+    int n,
+    int k,
+    int total_rows,
+    const int32_t* rows,
+    int experts,
+    int group_size,
+    int32_t* counter) {
+  // The two tiles a prefill launch selects carry the whole schedule set, so
+  // --sched can sweep them.
+#define MOE_SG1_DISPATCH(M, N, SM, SN, BK)                                                         \
+  if (tile.blk_m == M && tile.blk_n == N && tile.sg_m == SM && tile.sg_n == SN &&                   \
+      tile.blk_k == BK) {                                                                          \
+    return launch_sched<moe_w4a16::w4a16_tile<M, N, SM, SN, BK>, ElementS, ElementA, HasZero>(       \
+        requested_sched(k, n), requested_nskip(n, N),                                              \
+        queue, activations, packed_weights, scales, zeros, output, n, k, total_rows, rows,          \
+        /*row_offsets=*/nullptr, /*m_tile_group=*/1, experts, group_size, counter);                 \
+  }
+  MOE_SG1_TILE_LIST(MOE_SG1_DISPATCH)
+#undef MOE_SG1_DISPATCH
+  // The decode-band tiles state one schedule instead: a launch this short is
+  // host-bound, so a sweep cannot resolve anything on it, and chunked stealing has
+  // nothing to balance when there are only a few tiles per expert. Distance 3 is
+  // ahead of 6 on all of the 64-wide tiles by 0.3-2.6% -- a deeper pipeline just
+  // holds more B in flight than a short-M tile can consume.
+#define MOE_SMALL_DISPATCH(M, N, SM, SN, BK)                                                       \
+  if (tile.blk_m == M && tile.blk_n == N && tile.sg_m == SM && tile.sg_n == SN &&                   \
+      tile.blk_k == BK) {                                                                          \
+    if (requested_nskip(n, N)) {                                                                   \
+      return launch_w4a16<                                                                         \
+          moe_w4a16::w4a16_tile<M, N, SM, SN, BK>, ElementS, ElementA, HasZero, 1, 3, true>(        \
+          queue, activations, packed_weights, scales, zeros, output, n, k, total_rows, rows,        \
+          /*row_offsets=*/nullptr, /*m_tile_group=*/1, experts, group_size, counter);               \
+    }                                                                                              \
+    return launch_w4a16<moe_w4a16::w4a16_tile<M, N, SM, SN, BK>, ElementS, ElementA, HasZero, 1, 3>( \
+        queue, activations, packed_weights, scales, zeros, output, n, k, total_rows, rows,          \
+        /*row_offsets=*/nullptr, /*m_tile_group=*/1, experts, group_size, counter);                 \
+  }
+  MOE_SMALL_TILE_LIST(MOE_SMALL_DISPATCH)
+#undef MOE_SMALL_DISPATCH
+  throw std::invalid_argument("tile " + tile.name() + " is not instantiated");
+}
 
 template <typename ElementS, typename ElementA, bool HasZero>
 sycl::event launch_w4a16_dispatched(
@@ -238,20 +542,14 @@ sycl::event launch_w4a16_dispatched(
     int group_size,
     int32_t* counter,
     TileChoice tile = {}) {
-#define LAUNCH_W4A16(Policy)                                                                                 \
-  return launch_w4a16<Policy, ElementS, ElementA, HasZero>(                                                  \
-      queue, activations, packed_weights, scales, zeros, output, n, k, rows, experts, group_size, counter)
-
-  switch (tile.policy_id(total_m, experts, n)) {
-    case 0: LAUNCH_W4A16(moe_w4a16::w4a16_policy_m_8_n_64);
-    case 1: LAUNCH_W4A16(moe_w4a16::w4a16_policy_m_16_n_64);
-    case 2: LAUNCH_W4A16(moe_w4a16::w4a16_policy_m_32_n_64);
-    case 3: LAUNCH_W4A16(moe_w4a16::w4a16_policy_m_64_n_128);
-    case 4: LAUNCH_W4A16(moe_w4a16::w4a16_policy_m_128_n_128);
-    case kLegacyPolicyId: LAUNCH_W4A16(legacy_policy_m_128_n_256);
-    default: throw std::runtime_error("invalid W4A16 policy id");
+  if (tile.from_registry()) {
+    return dispatch_tile<ElementS, ElementA, HasZero>(
+        tile.tile_spec(total_m, experts, n, k), queue, activations, packed_weights, scales, zeros,
+        output, n, k, g_row_extend ? total_m : 0, rows, experts, group_size, counter);
   }
-#undef LAUNCH_W4A16
+  return launch_w4a16_policy<ElementS, ElementA, HasZero>(
+      queue, activations, packed_weights, scales, zeros, output,
+      tile.policy_id(total_m, experts, n), n, k, rows, experts, group_size, counter);
 }
 
 struct Problem {
@@ -342,7 +640,7 @@ bool run_accuracy(sycl::queue& queue, const Problem& p, TileChoice tile) {
   sycl::free(dd, queue); sycl::free(dr, queue); sycl::free(counter, queue);
   std::cout << "W4A16 INT4 accuracy: E=" << p.experts << " M/expert=" << p.rows_per_expert
             << " N=" << p.n << " K=" << p.k
-            << " policy=" << policy_name(tile.policy_id(total_m, p.experts, p.n))
+            << " tile=" << tile.name(total_m, p.experts, p.n, p.k)
             << " max_abs=" << max_error << '\n';
   return max_error <= 0.15f;
 }
@@ -374,7 +672,7 @@ int run_perf(sycl::queue& queue, const Problem& p, int warmup, int iterations, T
     fill_random_bf16(queue, reinterpret_cast<bf16_t*>(s), s_count);
   }
   queue.memcpy(rows, host_rows.data(), host_rows.size() * sizeof(int32_t)).wait();
-  const int policy_id = tile.policy_id(total_m, p.experts, p.n);
+  const std::string launch_name = tile.name(total_m, p.experts, p.n, p.k);
   auto launch = [&] {
     queue.memset(counter, 0, sizeof(int32_t));
     return launch_w4a16_dispatched<ElementS, bf16_t, false>(
@@ -395,7 +693,7 @@ int run_perf(sycl::queue& queue, const Problem& p, int warmup, int iterations, T
   std::cout << std::fixed << std::setprecision(3) << "W4A16 " << (kMxfp4 ? "MXFP4" : "INT4")
             << " baseline: E=" << p.experts
             << " M/expert=" << p.rows_per_expert << " N=" << p.n << " K=" << p.k
-            << " policy=" << policy_name(policy_id)
+            << " tile=" << launch_name
             << " device_ms=" << ms << " TOPS=" << tops << '\n';
   sycl::free(a, queue); sycl::free(w, queue); sycl::free(s, queue);
   sycl::free(d, queue); sycl::free(rows, queue); sycl::free(counter, queue);
@@ -514,7 +812,7 @@ bool run_gpt_oss_accuracy(sycl::queue& queue, const gpt_oss_120b::Workload& work
   std::cout << "W4A16 MXFP4 GPT-OSS-120B accuracy workload=" << workload.name
             << " E=" << experts << " total_M=" << total_m
             << " N=" << workload.n << " K=" << workload.k
-            << " policy=" << policy_name(tile.policy_id(total_m, experts, workload.n))
+            << " tile=" << tile.name(total_m, experts, workload.n, workload.k)
             << " sampled_values=" << sampled_values
             << " max_abs=" << max_abs
             << " max_relative=" << max_relative
@@ -550,7 +848,10 @@ int run_gpt_oss_workload(
   fill_random_bytes(queue, w, w_count);
   queue.memset(scales, 127, s_count).wait();  // E8M0 exponent 0 (scale = 1).
   queue.memcpy(rows, workload.rows.data(), experts * sizeof(int32_t)).wait();
-  const int policy_id = tile.policy_id(total_m, experts, workload.n);
+  const std::string launch_name = tile.name(total_m, experts, workload.n, workload.k);
+  const bool launch_nskip =
+      tile.from_registry() &&
+      requested_nskip(workload.n, tile.tile_spec(total_m, experts, workload.n, workload.k).blk_n);
   auto launch = [&] {
     queue.memset(counter, 0, sizeof(int32_t));
     return launch_w4a16_dispatched<uint8_t, bf16_t, false>(
@@ -573,7 +874,7 @@ int run_gpt_oss_workload(
             << "W4A16 MXFP4 workload=" << workload.name
             << " E=" << experts << " active_E=" << active_experts
             << " total_M=" << total_m << " N=" << workload.n << " K=" << workload.k
-            << " policy=" << policy_name(policy_id)
+            << " tile=" << launch_name << " nskip=" << launch_nskip
             << " device_ms=" << ms << " TOPS=" << tops << '\n';
   sycl::free(a, queue); sycl::free(w, queue); sycl::free(scales, queue);
   sycl::free(d, queue); sycl::free(rows, queue); sycl::free(counter, queue);
@@ -586,8 +887,9 @@ int main(int argc, const char** argv) {
   cutlass::CommandLine cmd(argc, argv);
   std::string mode = "accuracy";
   std::string workload;
-  std::string selector = "after";
+  std::string selector = "tuned";
   std::string quant = "int4";
+  std::string tile_name;
   Problem p;
   int warmup = 5, iterations = 20, policy = -1;
   cmd.get_cmd_line_argument("mode", mode);
@@ -595,6 +897,13 @@ int main(int argc, const char** argv) {
   cmd.get_cmd_line_argument("selector", selector);
   cmd.get_cmd_line_argument("policy", policy);
   cmd.get_cmd_line_argument("quant", quant);
+  cmd.get_cmd_line_argument("tile", tile_name);
+  std::vector<int> sched;
+  cmd.get_cmd_line_arguments("sched", sched);
+  if (sched.size() > 0) g_steal_chunk = sched[0];
+  if (sched.size() > 1) g_prefetch_dist = sched[1];
+  cmd.get_cmd_line_argument("nskip", g_nskip);
+  cmd.get_cmd_line_argument("row-extend", g_row_extend);
   cmd.get_cmd_line_argument("experts", p.experts);
   cmd.get_cmd_line_argument("rows", p.rows_per_expert);
   cmd.get_cmd_line_argument("n", p.n);
@@ -606,8 +915,9 @@ int main(int argc, const char** argv) {
     std::cerr << "E/M/N/K must be positive; N must be divisible by 8 and K by 32.\n";
     return 1;
   }
-  if (selector != "after" && selector != "before") {
-    std::cerr << "--selector must be after (PR 446) or before (the thresholds it replaced)\n";
+  if (selector != "tuned" && selector != "after" && selector != "before") {
+    std::cerr << "--selector must be tuned (this example's tile registry), after (PR 446) or"
+                 " before (the thresholds PR 446 replaced)\n";
     return 1;
   }
   if (quant != "int4" && quant != "mxfp4") {
@@ -618,8 +928,13 @@ int main(int argc, const char** argv) {
     std::cerr << "--policy must be 0-" << kLegacyPolicyId << '\n';
     return 1;
   }
-  const TileChoice tile{selector == "before", policy};
+  if (cmd.check_cmd_line_flag("list-tiles")) {
+    for (const auto& item : all_tiles()) std::cout << item.name() << '\n';
+    return 0;
+  }
+  const TileChoice tile{selector, policy, tile_name};
   try {
+    if (!tile_name.empty()) parse_tile(tile_name);  // reject an unknown name before allocating
     sycl::queue queue{sycl::gpu_selector_v, sycl::property_list{
         sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{}}};
     const auto workloads = gpt_oss_120b::workloads();

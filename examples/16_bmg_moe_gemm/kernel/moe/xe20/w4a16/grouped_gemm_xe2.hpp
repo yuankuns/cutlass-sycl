@@ -64,6 +64,10 @@ template <
     char LayoutKindB,
     char LayoutKindD,
     bool HasZero,
+    int StealChunk,
+    int PrefetchDist,
+    bool MainloopBarrier,
+    bool SkipPaddedN,
     class TiledMMA,
     typename ElementA,
     typename ElementB,
@@ -79,14 +83,26 @@ CUTE_DEVICE void MoEGEMM(
     ElementD* Outputs,
     TiledMMA const& mma,
     const int* rows_per_expert,
+    // Optional prefix sum of the *unmasked* rows per expert. When null, the row
+    // offset of expert i is the running sum of rows_per_expert[0..i). Passing it
+    // lets a caller zero out rows_per_expert entries (to launch only a subset of
+    // the experts) without moving the remaining experts' A/D slices.
+    const int* row_offsets,
+    // Total rows in Activations/Outputs, i.e. the bound past which the A surface
+    // must not be extended. Pass 0 to disable the extension entirely.
+    const int32_t total_rows,
     const int32_t num_experts,
     const int32_t group_size,
     const int32_t gemm_n,
     const int32_t gemm_k,
+    // How many of an expert's M-tiles are grouped with all of their N-tiles
+    // before the next group of M-tiles starts. 1 is the plain row-major tile
+    // order (one M-tile, all its N-tiles, next M-tile).
+    const int32_t m_tile_group,
     int32_t* atomic_buffer,
     const sycl::local_accessor<int32_t, 1>& slm_mem_const) {
   constexpr char actual_layout_of_B = LayoutKindB ^ ('R' ^ 'C');
-  // The surface extension below only keeps the addressing intact for row-major
+  // The surface extensions below only keep the addressing intact for row-major
   // slices, whose stride does not carry the row count.
   static_assert(LayoutKindA == 'R' && actual_layout_of_B == 'R', "surface extension needs row-major A and B");
   static constexpr bool is_B_int4 = (std::is_same_v<ElementB, uint8_t>) && (!std::is_same_v<ElementS, uint8_t>);
@@ -100,40 +116,33 @@ CUTE_DEVICE void MoEGEMM(
 
   int group_id = item.get_group_linear_id();
   int gemm_n_pad = (gemm_n + wg_tile_n - 1) / wg_tile_n * wg_tile_n;
-  int group_m_id = (group_id * wg_tile_n) / gemm_n_pad;
+  const int n_tiles = gemm_n_pad / wg_tile_n;
+  const int m_group = cute::max(1, m_tile_group);
   int group_range = item.get_group_range(1);
   int local_id = item.get_local_linear_id();
 
-  if (group_id == 0 && local_id == 0) {
-    auto atm = sycl::atomic_ref<
-        int,
-        sycl::memory_order::relaxed,
-        sycl::memory_scope::device,
-        sycl::access::address_space::global_space>(atomic_buffer[0]);
-    atm.store(0);
-  }
-
+  // atomic_buffer[0] is zeroed by the host before the launch: an in-kernel reset
+  // would race with the work-stealing counter of a concurrent launch.
   int pre_rows = 0;
   int pre_tiles = 0;
-
-  // Activations and Outputs are one contiguous [total_rows, K] / [total_rows, N]
-  // buffer that every expert slices (ptr_A = Activations + pre_rows * gemm_k), so
-  // the rows past an expert's own slice are the next expert's rows -- real memory.
-  // The bound is the sum of the per-expert row counts; the kernel adds it up rather
-  // than taking it as an argument so that nothing on the host has to change.
-  int total_rows = 0;
-  for (int i = 0; i < num_experts; ++i) {
-    total_rows += rows_per_expert[i];
-  }
+  int steal_tiles_left = 0;
+  static_assert(StealChunk >= 1, "work-stealing chunk must be positive");
 
   int32_t* slm_mem = static_cast<int32_t*>(slm_mem_const.template get_multi_ptr<sycl::access::decorated::no>().get());
 
   for (int i = 0; i < num_experts; ++i) {
     int gemm_m = rows_per_expert[i];
+    if (row_offsets != nullptr) {
+      pre_rows = row_offsets[i];
+    }
     int cumsum_rows_for_experts = pre_rows + gemm_m;
-    int cumsum_tiles_for_experts = (gemm_m + wg_tile_m - 1) / wg_tile_m + pre_tiles;
+    // Counted in work-group tiles, not M-tiles: the order inside an expert is no
+    // longer "one M-tile, all its N-tiles", so an M-tile index is not enough to
+    // place a tile.
+    const int expert_m_tiles = (gemm_m + wg_tile_m - 1) / wg_tile_m;
+    int cumsum_tiles_for_experts = expert_m_tiles * n_tiles + pre_tiles;
 
-    if (group_m_id >= cumsum_tiles_for_experts) {
+    if (group_id >= cumsum_tiles_for_experts) {
       pre_rows = cumsum_rows_for_experts;
       pre_tiles = cumsum_tiles_for_experts;
       continue;
@@ -169,10 +178,15 @@ CUTE_DEVICE void MoEGEMM(
     // Nothing extra is computed (the tile spans those rows either way) and no
     // extra result is written, because D keeps the true row and column counts.
     // The last expert has nothing after it, so it keeps its true height.
-    const int padded_m = (gemm_m + wg_tile_m - 1) / wg_tile_m * wg_tile_m;
-    const int a_rows = cute::max(gemm_m, cute::min(padded_m, total_rows - pre_rows));
-    const int b_rows =
-        expert_id + 1 < num_experts ? (gemm_n + wg_tile_n - 1) / wg_tile_n * wg_tile_n : gemm_n;
+    int a_rows = gemm_m;
+    int b_rows = gemm_n;
+    if (total_rows > 0) {
+      const int padded_m = (gemm_m + wg_tile_m - 1) / wg_tile_m * wg_tile_m;
+      a_rows = cute::max(gemm_m, cute::min(padded_m, total_rows - pre_rows));
+      if (expert_id + 1 < num_experts) {
+        b_rows = (gemm_n + wg_tile_n - 1) / wg_tile_n * wg_tile_n;
+      }
+    }
 
     auto A_tensor = make_moe_tensor<ElementA, LayoutKindA>(ptr_A_curr_batch, a_rows, gemm_k);
     auto B_tensor = [&]() {
@@ -193,14 +207,32 @@ CUTE_DEVICE void MoEGEMM(
     }();
     auto D_tensor = make_moe_tensor<ElementD, LayoutKindD>(ptr_D_curr_batch, gemm_m, gemm_n);
 
-    while (group_m_id < cumsum_tiles_for_experts) {
-      int n_coord = (group_id * wg_tile_n) % gemm_n_pad / wg_tile_n;
-      int m_coord = (group_m_id - pre_tiles);
+    while (group_id < cumsum_tiles_for_experts) {
+      // Group `m_group` M-tiles with all of their N-tiles and walk M inside the
+      // group, so that consecutive tiles read the same B block. The last group of
+      // an expert may be short, which is why the M extent is re-derived per group
+      // instead of being the constant m_group.
+      const int tiles_per_group = m_group * n_tiles;
+      const int tile_in_expert = group_id - pre_tiles;
+      const int group_idx = tile_in_expert / tiles_per_group;
+      const int group_m0 = group_idx * m_group;
+      const int group_m_extent = cute::min(m_group, expert_m_tiles - group_m0);
+      const int tile_in_group = tile_in_expert - group_idx * tiles_per_group;
+      int m_coord = group_m0 + tile_in_group % group_m_extent;
+      int n_coord = tile_in_group / group_m_extent;
       auto tile_coord = make_coord(m_coord, n_coord, _, 0);
 
       if constexpr (is_B_4bits) {
 #define XE_GEMM_4BITS_CALLER(GroupSize)                                              \
-  xe_gemm_4bits<GmemTiledCopyA, GmemTiledCopyB, GmemTiledCopyD, GroupSize, HasZero>( \
+  xe_gemm_4bits<                                                                     \
+      GmemTiledCopyA,                                                                \
+      GmemTiledCopyB,                                                                \
+      GmemTiledCopyD,                                                                \
+      GroupSize,                                                                     \
+      HasZero,                                                                       \
+      PrefetchDist,                                                                  \
+      MainloopBarrier,                                                               \
+      SkipPaddedN>(                                                                  \
       A_tensor,                                                                      \
       B_tensor,                                                                      \
       ptr_Scales_curr_batch,                                                         \
@@ -224,12 +256,20 @@ CUTE_DEVICE void MoEGEMM(
             A_tensor, B_tensor, ptr_Scales_curr_batch, ptr_Bias_curr_batch, D_tensor, tile_coord, mma);
       }
 
-      if (local_id == 0) {
-        slm_mem[0] = cutlass::atomicAdd(atomic_buffer, 1);
+      // Work stealing in chunks of StealChunk tiles: one atomic per chunk, and
+      // the tiles inside a chunk are consecutive in the tile order, so they share
+      // their B block.
+      if (steal_tiles_left > 0) {
+        ++group_id;
+        --steal_tiles_left;
+      } else {
+        if (local_id == 0) {
+          slm_mem[0] = cutlass::atomicAdd(atomic_buffer, StealChunk);
+        }
+        item.barrier(sycl::access::fence_space::local_space);
+        group_id = group_range + slm_mem[0];
+        steal_tiles_left = StealChunk - 1;
       }
-      item.barrier(sycl::access::fence_space::local_space);
-      group_id = group_range + slm_mem[0];
-      group_m_id = (group_id * wg_tile_n) / gemm_n_pad;
     }
     pre_rows = cumsum_rows_for_experts;
     pre_tiles = cumsum_tiles_for_experts;
