@@ -45,6 +45,55 @@ class xe_gemm_policy_base {
   using GmemTiledCopyA = void;
   using GmemTiledCopyB = void;
   using GmemTiledCopyD = void;
+
+  // Ask for the per-k-tile work-group split barrier in the 4-bit mainloop.
+  // Nothing there is shared through SLM, so the barrier is purely a scheduling
+  // device: it holds the subgroups in lockstep so their A/B prefetches stay
+  // timely. `true` is the unconditional barrier the hand-written policies below
+  // were written against; w4a16_tile overrides it per tile
+  // (w4a16_tile_wants_barrier).
+  //
+  // The (work-stealing chunk, prefetch distance) pair upstream also carries per
+  // policy is a *launch* template argument here instead, so the example can sweep
+  // it at run time; see tuned_sched() in 16_bmg_moe_gemm.cpp.
+  static constexpr bool MainloopBarrier = true;
+};
+
+// Which tiles want the mainloop barrier, measured per tile in the avg_m band it
+// serves: it costs a little on the 8- and 16-row tiles and pays on the 32-row one,
+// and a tile whose work-group spans several M subgroups needs it -- its subgroups
+// sit on different rows and drift apart without it.
+constexpr bool w4a16_tile_wants_barrier(int BlkM, int BlkN, int SgCountM) {
+  if (SgCountM > 1) return true;
+  return BlkM == 32 && BlkN == 64;
+}
+
+// Generic (work-group tile, subgroup layout) pair, so a caller can pick the tile
+// that fits an expert's row count instead of padding up to the nearest policy in
+// the hand-written menu below. Every policy in that menu is expressible as one of
+// these; the tile registry in 16_bmg_moe_gemm.cpp instantiates them by name.
+//
+// BlkK is a parameter because it is the only knob that trades the A fragment's
+// register footprint against loop overhead. A subgroup holds SG_M*BlkK bf16 of A
+// (SG_M*BlkK/32 registers) and SG_M*SG_N/16 floats of C. It cannot go below 16,
+// the bf16 DPAS K, and it cannot go above the quantization group, because the
+// mainloop gathers one scale per B column per k-tile.
+template <
+    int BlkM,
+    int BlkN,
+    int SgCountM,
+    int SgCountN,
+    int BlkK = 32,
+    bool Barrier = w4a16_tile_wants_barrier(BlkM, BlkN, SgCountM)>
+class w4a16_tile : public xe_gemm_policy_base {
+ public:
+  static_assert(
+      BlkK == 32 || BlkK == 16,
+      "BLK_K must be one MXFP4 group (32) or one bf16 DPAS K (16)");
+  using WGTile = Shape<Int<BlkM>, Int<BlkN>, Int<BlkK>>;
+  using SGLayout = Layout<Shape<Int<SgCountM>, Int<SgCountN>, _1>, Stride<Int<SgCountN>, _1, _0>>;
+
+  static constexpr bool MainloopBarrier = Barrier;
 };
 
 // Policy menu. Every policy keeps the *per-subgroup* tile at 32x32: the 4-bit
