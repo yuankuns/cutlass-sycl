@@ -27,6 +27,9 @@ std::vector<relh::RelProjCase> quick_suite() {
       {"tiny_reference_05_1", 3, 2, 4, 5, 8, true, relh::kTauPostRow, 0.0},
       {"production_t1_tau", 1, 16, 16, 1024, 256, false, relh::kTauPreToken, 0.0},
       {"production_t32_tau", 32, 16, 16, 1024, 256, false, relh::kTauPreToken, 0.0},
+      {"local_e512_tau", 9, 12, 16, 512, 1984, false, relh::kTauPreToken, 0.0},
+      {"segmented_e1022_tau", 9, 5, 16, 1022, 80, false, relh::kTauPreToken, 0.0},
+      {"odd_e1023_tau", 9, 5, 16, 1023, 80, false, relh::kTauPreToken, 0.0},
       {"tail_dims_pre_row", 7, 3, 13, 29, 44, false, relh::kTauPreRow, 0.0},
       {"tail_e_no_tau", 8, 5, 16, 257, 80, false, relh::kTauNone, 0.0},
   };
@@ -37,8 +40,9 @@ std::vector<relh::RelProjCase> quick_suite() {
 //   * decode: T = 1
 //   * target-verify: T = draft_token_num = 9
 //   * extend head/tail into the small band: T = 32
-// Every real call passes d_rel = 16 and e = rel_extent = 1024 (local layers use
-// local_extent = sliding_window_size = 512). Per-rank head geometry:
+// Every call passes d_rel = 16. Global attention uses rel_extent = 1024, while
+// local attention uses local_extent = sliding_window_size = 512. Per-rank head
+// geometry:
 //   config defaults (hidden=1536): H = 12/6/3 for TP=1/2/4 (TP=8 skipped, 12%8)
 //   production      (hidden=6144): H = 48/24/12/6 for TP=1/2/4/8
 // r is a strided view into the packed [q||k||v||r] qkvr row, so r_stride_t is
@@ -70,6 +74,11 @@ std::vector<relh::RelProjCase> inkling_suite() {
       {"prod_tp4_extend_t32",  32, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 0.0},
       {"prod_tp8_extend_t32",  32,  6, 16, 1024,  6*128 + 2*1*128 +  6*16, false, relh::kTauPreToken, 0.0},
 
+      // Production local attention: local_extent = sliding_window_size = 512.
+      {"prod_tp4_local_decode_t1",  1, 12, 16, 512, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 0.0},
+      {"prod_tp4_local_verify_t9",  9, 12, 16, 512, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 0.0},
+      {"prod_tp4_local_extend_t32", 32, 12, 16, 512, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 0.0},
+
       // Tau OFF path still lands in the kernel when the caller opts out of
       // fused-tau (SGLANG_OPT_USE_INKLING_FUSED_LOG_TAU=0); cover it at prod TP=4.
       {"prod_tp4_no_tau_t9",    9, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, relh::kTauNone,     0.0},
@@ -86,6 +95,8 @@ std::vector<relh::RelProjCase> perf_suite() {
       {"perf_prod_tp2_t32", 32, 24, 16, 1024, 24*128 + 2*2*128 + 24*16, false, relh::kTauPreToken, 0.0},
       {"perf_prod_tp4_t32", 32, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 0.0},
       {"perf_prod_tp8_t32", 32,  6, 16, 1024,  6*128 + 2*1*128 +  6*16, false, relh::kTauPreToken, 0.0},
+      {"perf_prod_tp1_t32", 32, 48, 16, 1024, 48*128 + 2*4*128 + 48*16, false, relh::kTauPreToken, 0.0},
+      {"perf_prod_tp1_local_t32", 32, 48, 16, 512, 48*128 + 2*4*128 + 48*16, false, relh::kTauPreToken, 0.0},
   };
 }
 
