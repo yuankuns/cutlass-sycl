@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -762,12 +763,6 @@ static constexpr bool tau_is_row_v = Tau == kTauPreRow || Tau == kTauPostRow;
 template <typename Element, bool ProjPerHead, int Tau, int Vec>
 class RelProjKernel;
 
-// Integer division by a runtime divisor costs tens of instructions on Xe and
-// sits on the critical path before any address can be formed, which is a fixed
-// cost the small-T decode launches cannot amortize. Both divisors (column
-// slices per row tile, heads per token) are known on the host, so they are
-// passed as a Granlund-Montgomery multiply-shift; magic == 0 encodes an exact
-// power of two.
 // A runtime integer division costs tens of instructions on Xe and sits ahead of
 // every address computation, so at T=1 it is a large share of a launch that is
 // already within 15% of an empty kernel: replacing the two divisions below with
@@ -777,12 +772,35 @@ class RelProjKernel;
 // divisor larger than any value it will ever divide (the T=1 rows, where t is
 // always 0), and a Granlund-Montgomery magic otherwise. Only the fallback needs
 // a branch, so the hot path is a single multiply and shift.
+//
+// The two knobs below exist because a wrong magic is silent in exactly the way
+// that costs the most time to find: the multiply is only exact while the
+// host-side bound on the dividend holds, and an overflowing magic once broke
+// every T > 1 case while every T = 1 case still passed (t is 0 there, so the
+// quotient is 0 either way).
+//   -DCUTLASS_RELPROJ_FAST_DIV=0        build the kernel with plain divisions,
+//                                       the reference for both results and cost
+//                                       (it reproduces the delta above: the
+//                                       12-row decode cases read 1.379 us /
+//                                       338.6 GB/s against 1.207 / 386.8, and
+//                                       every case is 5-14% slower)
+//   -DCUTLASS_RELPROJ_FAST_DIV_VERIFY=1 assert every magic against real division
+//                                       over its whole declared dividend range
+// Verification is host-side and O(max_value) per launch, so it is off by default
+// and belongs in a debug or single-shot (--benchmark=0) run.
+#if !defined(CUTLASS_RELPROJ_FAST_DIV)
+#define CUTLASS_RELPROJ_FAST_DIV 1
+#endif
+#if !defined(CUTLASS_RELPROJ_FAST_DIV_VERIFY)
+#define CUTLASS_RELPROJ_FAST_DIV_VERIFY 0
+#endif
+
 struct RelProjFastDiv {
   uint32_t magic = 0;
   int shift = -1;  // negative falls back to a real division
 };
 
-inline RelProjFastDiv make_rel_proj_fast_div(int divisor, int max_value) {
+inline RelProjFastDiv make_rel_proj_fast_div_magic(int divisor, int max_value) {
   RelProjFastDiv fd;
   if (divisor <= 0 || max_value < 0) {
     return fd;
@@ -819,12 +837,45 @@ inline RelProjFastDiv make_rel_proj_fast_div(int divisor, int max_value) {
   return fd;
 }
 
+// All three encodings share the device expression below, so one loop checks any
+// of them; the magic is built once per launch, so the check is affordable enough
+// to leave enabled through a whole suite when a t/h index is under suspicion.
+inline RelProjFastDiv make_rel_proj_fast_div(int divisor, int max_value) {
+#if CUTLASS_RELPROJ_FAST_DIV
+  RelProjFastDiv fd = make_rel_proj_fast_div_magic(divisor, max_value);
+#if CUTLASS_RELPROJ_FAST_DIV_VERIFY
+  if (fd.shift >= 0) {
+    for (int value = 0; value <= max_value; ++value) {
+      int got = static_cast<int>((static_cast<uint32_t>(value) * fd.magic) >> fd.shift);
+      if (got != value / divisor) {
+        std::cerr << "rel_proj fast div is wrong: " << value << " / " << divisor
+                  << " gave " << got << ", expected " << (value / divisor)
+                  << " (magic " << fd.magic << ", shift " << fd.shift
+                  << ", max_value " << max_value << ")\n";
+        std::abort();
+      }
+    }
+  }
+#endif
+  return fd;
+#else
+  (void)divisor;
+  (void)max_value;
+  return RelProjFastDiv{};  // shift < 0: the device path divides for real
+#endif
+}
+
 CUTLASS_DEVICE
 inline int rel_proj_fast_div(int value, RelProjFastDiv fd, int divisor) {
+#if CUTLASS_RELPROJ_FAST_DIV
   if (fd.shift < 0) {
     return value / divisor;
   }
   return static_cast<int>((static_cast<uint32_t>(value) * fd.magic) >> fd.shift);
+#else
+  (void)fd;  // no branch at all, so the division's cost is measured on its own
+  return value / divisor;
+#endif
 }
 
 // out[t, h, :] = bf16(tau[t] * r[t, h, :]) @ proj
