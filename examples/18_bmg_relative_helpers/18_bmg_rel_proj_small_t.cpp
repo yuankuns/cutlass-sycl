@@ -18,20 +18,20 @@ relh::RelProjCase custom_default() {
   cfg.e = 5;
   cfg.r_stride_t = cfg.h * cfg.d;
   cfg.proj_per_head = true;
-  cfg.tau_mode = relh::kTauPostRow;
+  cfg.fuse_tau = true;
   return cfg;
 }
 
 std::vector<relh::RelProjCase> quick_suite() {
   return {
-      {"tiny_reference_05_1", 3, 2, 4, 5, 8, true, relh::kTauPostRow, 0.0},
-      {"production_t1_tau", 1, 16, 16, 1024, 256, false, relh::kTauPreToken, 0.0},
-      {"production_t32_tau", 32, 16, 16, 1024, 256, false, relh::kTauPreToken, 0.0},
-      {"local_e512_tau", 9, 12, 16, 512, 1984, false, relh::kTauPreToken, 0.0},
-      {"segmented_e1022_tau", 9, 5, 16, 1022, 80, false, relh::kTauPreToken, 0.0},
-      {"odd_e1023_tau", 9, 5, 16, 1023, 80, false, relh::kTauPreToken, 0.0},
-      {"tail_dims_pre_row", 7, 3, 13, 29, 44, false, relh::kTauPreRow, 0.0},
-      {"tail_e_no_tau", 8, 5, 16, 257, 80, false, relh::kTauNone, 0.0},
+      {"tiny_reference_05_1", 3, 2, 4, 5, 8, true, true, 0.0},
+      {"production_t1_tau", 1, 16, 16, 1024, 256, false, true, 0.0},
+      {"production_t32_tau", 32, 16, 16, 1024, 256, false, true, 0.0},
+      {"local_e512_tau", 9, 12, 16, 512, 1984, false, true, 0.0},
+      {"segmented_e1022_tau", 9, 5, 16, 1022, 80, false, true, 0.0},
+      {"odd_e1023_tau", 9, 5, 16, 1023, 80, false, true, 0.0},
+      {"tail_dims_odd", 7, 3, 13, 29, 44, false, true, 0.0},
+      {"tail_e_no_tau", 8, 5, 16, 257, 80, false, false, 0.0},
   };
 }
 
@@ -62,53 +62,53 @@ std::vector<relh::RelProjCase> quick_suite() {
 std::vector<relh::RelProjCase> inkling_suite() {
   return {
       // Config defaults, decode T=1.
-      {"cfg_tp1_decode_t1",     1, 12, 16, 1024, 12*128 + 2*4*128 + 12*16, false, relh::kTauPreToken, 350.0},
-      {"cfg_tp2_decode_t1",     1,  6, 16, 1024,  6*128 + 2*2*128 +  6*16, false, relh::kTauPreToken, 190.0},
-      {"cfg_tp4_decode_t1",     1,  3, 16, 1024,  3*128 + 2*1*128 +  3*16, false, relh::kTauPreToken, 96.0},
+      {"cfg_tp1_decode_t1",     1, 12, 16, 1024, 12*128 + 2*4*128 + 12*16, false, true, 350.0},
+      {"cfg_tp2_decode_t1",     1,  6, 16, 1024,  6*128 + 2*2*128 +  6*16, false, true, 190.0},
+      {"cfg_tp4_decode_t1",     1,  3, 16, 1024,  3*128 + 2*1*128 +  3*16, false, true, 96.0},
       // Config defaults, target-verify T=9 (draft_token_num).
-      {"cfg_tp2_verify_t9",     9,  6, 16, 1024,  6*128 + 2*2*128 +  6*16, false, relh::kTauPreToken, 1200.0},
-      {"cfg_tp4_verify_t9",     9,  3, 16, 1024,  3*128 + 2*1*128 +  3*16, false, relh::kTauPreToken, 690.0},
+      {"cfg_tp2_verify_t9",     9,  6, 16, 1024,  6*128 + 2*2*128 +  6*16, false, true, 1200.0},
+      {"cfg_tp4_verify_t9",     9,  3, 16, 1024,  3*128 + 2*1*128 +  3*16, false, true, 690.0},
       // Config defaults, small-t band max T=32.
-      {"cfg_tp2_extend_t32",   32,  6, 16, 1024,  6*128 + 2*2*128 +  6*16, false, relh::kTauPreToken, 2550.0},
-      {"cfg_tp4_extend_t32",   32,  3, 16, 1024,  3*128 + 2*1*128 +  3*16, false, relh::kTauPreToken, 1900.0},
+      {"cfg_tp2_extend_t32",   32,  6, 16, 1024,  6*128 + 2*2*128 +  6*16, false, true, 2550.0},
+      {"cfg_tp4_extend_t32",   32,  3, 16, 1024,  3*128 + 2*1*128 +  3*16, false, true, 1900.0},
 
       // Production, decode T=1.
-      {"prod_tp1_decode_t1",    1, 48, 16, 1024, 48*128 + 2*4*128 + 48*16, false, relh::kTauPreToken, 1100.0},
-      {"prod_tp2_decode_t1",    1, 24, 16, 1024, 24*128 + 2*2*128 + 24*16, false, relh::kTauPreToken, 610.0},
-      {"prod_tp4_decode_t1",    1, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 350.0},
-      {"prod_tp8_decode_t1",    1,  6, 16, 1024,  6*128 + 2*1*128 +  6*16, false, relh::kTauPreToken, 190.0},
+      {"prod_tp1_decode_t1",    1, 48, 16, 1024, 48*128 + 2*4*128 + 48*16, false, true, 1100.0},
+      {"prod_tp2_decode_t1",    1, 24, 16, 1024, 24*128 + 2*2*128 + 24*16, false, true, 610.0},
+      {"prod_tp4_decode_t1",    1, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, true, 350.0},
+      {"prod_tp8_decode_t1",    1,  6, 16, 1024,  6*128 + 2*1*128 +  6*16, false, true, 190.0},
       // Production, target-verify T=9.
-      {"prod_tp2_verify_t9",    9, 24, 16, 1024, 24*128 + 2*2*128 + 24*16, false, relh::kTauPreToken, 2700.0},
-      {"prod_tp4_verify_t9",    9, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 2050.0},
-      {"prod_tp8_verify_t9",    9,  6, 16, 1024,  6*128 + 2*1*128 +  6*16, false, relh::kTauPreToken, 1200.0},
+      {"prod_tp2_verify_t9",    9, 24, 16, 1024, 24*128 + 2*2*128 + 24*16, false, true, 2700.0},
+      {"prod_tp4_verify_t9",    9, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, true, 2050.0},
+      {"prod_tp8_verify_t9",    9,  6, 16, 1024,  6*128 + 2*1*128 +  6*16, false, true, 1200.0},
       // Production, small-t band max T=32.
-      {"prod_tp2_extend_t32",  32, 24, 16, 1024, 24*128 + 2*2*128 + 24*16, false, relh::kTauPreToken, 3150.0},
-      {"prod_tp4_extend_t32",  32, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 2700.0},
-      {"prod_tp8_extend_t32",  32,  6, 16, 1024,  6*128 + 2*1*128 +  6*16, false, relh::kTauPreToken, 2550.0},
+      {"prod_tp2_extend_t32",  32, 24, 16, 1024, 24*128 + 2*2*128 + 24*16, false, true, 3150.0},
+      {"prod_tp4_extend_t32",  32, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, true, 2700.0},
+      {"prod_tp8_extend_t32",  32,  6, 16, 1024,  6*128 + 2*1*128 +  6*16, false, true, 2550.0},
 
       // Production local attention: local_extent = sliding_window_size = 512.
-      {"prod_tp4_local_decode_t1",  1, 12, 16, 512, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 185.0},
-      {"prod_tp4_local_verify_t9",  9, 12, 16, 512, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 1250.0},
-      {"prod_tp4_local_extend_t32", 32, 12, 16, 512, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 2200.0},
+      {"prod_tp4_local_decode_t1",  1, 12, 16, 512, 12*128 + 2*1*128 + 12*16, false, true, 185.0},
+      {"prod_tp4_local_verify_t9",  9, 12, 16, 512, 12*128 + 2*1*128 + 12*16, false, true, 1250.0},
+      {"prod_tp4_local_extend_t32", 32, 12, 16, 512, 12*128 + 2*1*128 + 12*16, false, true, 2200.0},
 
       // Tau OFF path still lands in the kernel when the caller opts out of
       // fused-tau (SGLANG_OPT_USE_INKLING_FUSED_LOG_TAU=0); cover it at prod TP=4.
-      {"prod_tp4_no_tau_t9",    9, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, relh::kTauNone,     2350.0},
+      {"prod_tp4_no_tau_t9",    9, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, false, 2350.0},
   };
 }
 
 std::vector<relh::RelProjCase> perf_suite() {
   return {
-      {"perf_t1_h16_d16_e1024", 1, 16, 16, 1024, 256, false, relh::kTauPreToken, 440.0},
-      {"perf_t16_h16_d16_e1024", 16, 16, 16, 1024, 256, false, relh::kTauPreToken, 2950.0},
-      {"perf_t32_h16_d16_e1024", 32, 16, 16, 1024, 256, false, relh::kTauPreToken, 2900.0},
+      {"perf_t1_h16_d16_e1024", 1, 16, 16, 1024, 256, false, true, 440.0},
+      {"perf_t16_h16_d16_e1024", 16, 16, 16, 1024, 256, false, true, 2950.0},
+      {"perf_t32_h16_d16_e1024", 32, 16, 16, 1024, 256, false, true, 2900.0},
 
       // Production per-rank shapes at T=32 (the tau-fused band's max T).
-      {"perf_prod_tp2_t32", 32, 24, 16, 1024, 24*128 + 2*2*128 + 24*16, false, relh::kTauPreToken, 3150.0},
-      {"perf_prod_tp4_t32", 32, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 2700.0},
-      {"perf_prod_tp8_t32", 32,  6, 16, 1024,  6*128 + 2*1*128 +  6*16, false, relh::kTauPreToken, 2500.0},
-      {"perf_prod_tp1_t32", 32, 48, 16, 1024, 48*128 + 2*4*128 + 48*16, false, relh::kTauPreToken, 3400.0},
-      {"perf_prod_tp1_local_t32", 32, 48, 16, 512, 48*128 + 2*4*128 + 48*16, false, relh::kTauPreToken, 3150.0},
+      {"perf_prod_tp2_t32", 32, 24, 16, 1024, 24*128 + 2*2*128 + 24*16, false, true, 3150.0},
+      {"perf_prod_tp4_t32", 32, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, true, 2700.0},
+      {"perf_prod_tp8_t32", 32,  6, 16, 1024,  6*128 + 2*1*128 +  6*16, false, true, 2500.0},
+      {"perf_prod_tp1_t32", 32, 48, 16, 1024, 48*128 + 2*4*128 + 48*16, false, true, 3400.0},
+      {"perf_prod_tp1_local_t32", 32, 48, 16, 512, 48*128 + 2*4*128 + 48*16, false, true, 3150.0},
   };
 }
 
@@ -136,7 +136,7 @@ int main(int argc, char const** argv) {
       relh::print_common_usage(
           argv[0],
           "quick|inkling|perf",
-          "t=<int>,h=<int>,d=<int>,e=<int>,rpad=<int>,proj=shared|head,tau=none|pre_token|pre_row|post_token|post_row");
+          "t=<int>,h=<int>,d=<int>,e=<int>,rpad=<int>,proj=shared|head,tau=fused|none");
       return 0;
     }
   } catch (std::exception const& e) {

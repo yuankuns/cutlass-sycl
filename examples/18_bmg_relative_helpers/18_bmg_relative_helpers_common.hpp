@@ -66,13 +66,17 @@ enum class DType {
   kFp16
 };
 
-enum TauMode : int {
-  kTauNone = 0,
-  kTauPreToken = 1,
-  kTauPreRow = 2,
-  kTauPostToken = 3,
-  kTauPostRow = 4
-};
+// rel_proj is one expression, with tau either folded in or absent:
+//
+//   out[t, h, e] = sum_d bf16(r[t*r_stride_t + h*d + d] * tau[t]) * proj[d, e]
+//
+// tau is a scalar per token, so it commutes with the projection exactly; the only
+// reason folding it in is observable at all is the bf16 round-trip above, which
+// is where the caller's fused-log-tau path rounds. The kernel therefore
+// reproduces that rounding point rather than scaling the fp32 accumulator, and
+// there is no second placement or second tau shape to select between.
+// fuse_tau == false is the SGLANG_OPT_USE_INKLING_FUSED_LOG_TAU=0 path: tau is
+// applied by the caller and this kernel never reads it.
 
 struct Options {
   std::string suite = "quick";
@@ -103,7 +107,7 @@ struct RelProjCase {
   int e = 16;
   int r_stride_t = 16;
   bool proj_per_head = false;
-  TauMode tau_mode = kTauPreToken;
+  bool fuse_tau = true;
   double target_gbps = 0.0;
 };
 
@@ -272,36 +276,13 @@ inline bool parse_dtype(std::string const& text, DType& dtype) {
   return false;
 }
 
-inline std::string tau_mode_text(TauMode mode) {
-  switch (mode) {
-    case kTauNone: return "none";
-    case kTauPreToken: return "pre_token";
-    case kTauPreRow: return "pre_row";
-    case kTauPostToken: return "post_token";
-    case kTauPostRow: return "post_row";
-  }
-  return "unknown";
-}
-
-inline bool parse_tau_mode(std::string const& text, TauMode& mode) {
-  if (text == "none") {
-    mode = kTauNone;
+inline bool parse_fuse_tau(std::string const& text, bool& fuse_tau) {
+  if (text == "fused" || text == "1") {
+    fuse_tau = true;
     return true;
   }
-  if (text == "pre_token") {
-    mode = kTauPreToken;
-    return true;
-  }
-  if (text == "pre_row") {
-    mode = kTauPreRow;
-    return true;
-  }
-  if (text == "post_token") {
-    mode = kTauPostToken;
-    return true;
-  }
-  if (text == "post_row") {
-    mode = kTauPostRow;
+  if (text == "none" || text == "0") {
+    fuse_tau = false;
     return true;
   }
   return false;
@@ -430,7 +411,7 @@ inline bool parse_rel_shape(std::string const& text, RelProjCase& cfg) {
         return false;
       }
     } else if (key == "tau") {
-      if (!parse_tau_mode(value, cfg.tau_mode)) {
+      if (!parse_fuse_tau(value, cfg.fuse_tau)) {
         return false;
       }
     } else {
@@ -645,8 +626,8 @@ uint64_t scale_pack4(uint64_t raw, float scale) {
 
 // bf16 round-trip of an fp32 intermediate. The software path below is four
 // integer ops per value; on device the same RNE rounding is a single hardware
-// convert pair, which is worth 8% of a decode launch because the pre-tau modes
-// round-trip all 16 D values per work item.
+// convert pair, which is worth 8% of a decode launch because the fused-tau path
+// round-trips all 16 D values per work item.
 CUTLASS_DEVICE
 inline float bf16_round_trip(float value) {
 #if defined(__SYCL_DEVICE_ONLY__)
@@ -751,16 +732,7 @@ sycl::event launch_row_kernel(sycl::queue& queue, RowParams<Element> const& para
   return launch_row_kernel_static<Element, HasTau, kRowLargeLaneElems>(queue, params);
 }
 
-template <int Tau>
-static constexpr bool tau_is_pre_v = Tau == kTauPreToken || Tau == kTauPreRow;
-
-template <int Tau>
-static constexpr bool tau_is_post_v = Tau == kTauPostToken || Tau == kTauPostRow;
-
-template <int Tau>
-static constexpr bool tau_is_row_v = Tau == kTauPreRow || Tau == kTauPostRow;
-
-template <typename Element, bool ProjPerHead, int Tau, int Vec>
+template <typename Element, bool ProjPerHead, bool FuseTau, int Vec>
 class RelProjKernel;
 
 // A runtime integer division costs tens of instructions on Xe and sits ahead of
@@ -885,7 +857,7 @@ inline int rel_proj_fast_div(int value, RelProjFastDiv fd, int divisor) {
 // loads that projection slice once, and applies it to MTile rows. The launcher
 // composes 8-, 4-, and 2-column kernels for an arbitrary even E, preserving
 // this reuse without making E=1024 an interface constraint.
-template <int MTile, int Vec, int Tau>
+template <int MTile, int Vec, bool FuseTau>
 class RelProjBf16D16SimtKernel {
  public:
   static_assert(Vec % 2 == 0, "Vec must be even so proj/out move as 32-bit pairs");
@@ -934,8 +906,8 @@ class RelProjBf16D16SimtKernel {
       }
 
       float scale = 1.0f;
-      if constexpr (Tau != kTauNone) {
-        scale = params.tau[tau_is_row_v<Tau> ? m : ti];
+      if constexpr (FuseTau) {
+        scale = params.tau[ti];
       }
       cutlass::bfloat16_t const* r_row =
           params.r + static_cast<int64_t>(ti) * params.r_stride_t + hi * kRelProjProductionD;
@@ -954,7 +926,7 @@ class RelProjBf16D16SimtKernel {
         uint32_t pair = r_pairs[d / 2];
         float r_lo = raw16_to_float<cutlass::bfloat16_t>(static_cast<uint16_t>(pair & 0xffffu));
         float r_hi = raw16_to_float<cutlass::bfloat16_t>(static_cast<uint16_t>(pair >> 16));
-        if constexpr (tau_is_pre_v<Tau>) {
+        if constexpr (FuseTau) {
           r_lo = bf16_round_trip(r_lo * scale);
           r_hi = bf16_round_trip(r_hi * scale);
         }
@@ -962,13 +934,6 @@ class RelProjBf16D16SimtKernel {
         for (int i = 0; i < Vec; ++i) {
           acc[i] += r_lo * proj_tile[d][i];
           acc[i] += r_hi * proj_tile[d + 1][i];
-        }
-      }
-
-      if constexpr (tau_is_post_v<Tau>) {
-#pragma unroll
-        for (int i = 0; i < Vec; ++i) {
-          acc[i] *= scale;
         }
       }
 
@@ -1030,7 +995,7 @@ inline RelProjLaunchPlan rel_proj_launch_plan(int rows) {
   return {8, 16, 1};
 }
 
-template <int MTile, int Tau, int Vec>
+template <int MTile, bool FuseTau, int Vec>
 sycl::event launch_rel_proj_bf16_d16_simt_static(
     sycl::queue& queue,
     RelProjParams<cutlass::bfloat16_t> const& params,
@@ -1041,7 +1006,7 @@ sycl::event launch_rel_proj_bf16_d16_simt_static(
   int total = ceil_div(params.t * params.h, MTile) * col_slices;
   int local = std::max(1, std::min(local_size, total));
   int global = round_up(total, local);
-  RelProjBf16D16SimtKernel<MTile, Vec, Tau> kernel{
+  RelProjBf16D16SimtKernel<MTile, Vec, FuseTau> kernel{
       params, total, e_offset, col_slices,
       make_rel_proj_fast_div(col_slices, total),
       make_rel_proj_fast_div(params.h, params.t * params.h)};
@@ -1049,7 +1014,7 @@ sycl::event launch_rel_proj_bf16_d16_simt_static(
     if (!dependencies.empty()) {
       cgh.depends_on(dependencies);
     }
-    cgh.parallel_for<RelProjBf16D16SimtKernel<MTile, Vec, Tau>>(
+    cgh.parallel_for<RelProjBf16D16SimtKernel<MTile, Vec, FuseTau>>(
         sycl::nd_range<1>(
             sycl::range<1>(static_cast<std::size_t>(global)),
             sycl::range<1>(static_cast<std::size_t>(local))),
@@ -1057,7 +1022,7 @@ sycl::event launch_rel_proj_bf16_d16_simt_static(
   });
 }
 
-template <int MTile, int Tau, int VecMain>
+template <int MTile, bool FuseTau, int VecMain>
 sycl::event launch_rel_proj_bf16_d16_simt_segments(
     sycl::queue& queue,
     RelProjParams<cutlass::bfloat16_t> const& params,
@@ -1069,7 +1034,7 @@ sycl::event launch_rel_proj_bf16_d16_simt_segments(
 
   int col_slices = remaining / VecMain;
   if (col_slices > 0) {
-    last = launch_rel_proj_bf16_d16_simt_static<MTile, Tau, VecMain>(
+    last = launch_rel_proj_bf16_d16_simt_static<MTile, FuseTau, VecMain>(
         queue, params, e_offset, col_slices, local_size, dependencies);
     dependencies = {last};
     e_offset += col_slices * VecMain;
@@ -1077,7 +1042,7 @@ sycl::event launch_rel_proj_bf16_d16_simt_segments(
   }
   if constexpr (VecMain > 4) {
     if (remaining >= 4) {
-      last = launch_rel_proj_bf16_d16_simt_static<MTile, Tau, 4>(
+      last = launch_rel_proj_bf16_d16_simt_static<MTile, FuseTau, 4>(
           queue, params, e_offset, 1, local_size, dependencies);
       dependencies = {last};
       e_offset += 4;
@@ -1086,7 +1051,7 @@ sycl::event launch_rel_proj_bf16_d16_simt_segments(
   }
   if constexpr (VecMain > 2) {
     if (remaining >= 2) {
-      last = launch_rel_proj_bf16_d16_simt_static<MTile, Tau, 2>(
+      last = launch_rel_proj_bf16_d16_simt_static<MTile, FuseTau, 2>(
           queue, params, e_offset, 1, local_size, dependencies);
     }
   }
@@ -1095,44 +1060,39 @@ sycl::event launch_rel_proj_bf16_d16_simt_segments(
 
 // Only the Vec=4 band ever asks for MTile > 1, so the other widths are
 // instantiated once and the kernel count stays bounded.
-template <int Tau>
+template <bool FuseTau>
 sycl::event launch_rel_proj_bf16_d16_simt_mtile(
     sycl::queue& queue,
     RelProjParams<cutlass::bfloat16_t> const& params) {
   RelProjLaunchPlan plan = rel_proj_launch_plan(params.t * params.h);
   if (plan.vec == 2) {
-    return launch_rel_proj_bf16_d16_simt_segments<1, Tau, 2>(queue, params, plan.local);
+    return launch_rel_proj_bf16_d16_simt_segments<1, FuseTau, 2>(queue, params, plan.local);
   }
   if (plan.vec == 4) {
     switch (plan.mtile) {
-      case 1: return launch_rel_proj_bf16_d16_simt_segments<1, Tau, 4>(queue, params, plan.local);
-      case 2: return launch_rel_proj_bf16_d16_simt_segments<2, Tau, 4>(queue, params, plan.local);
-      case 4: return launch_rel_proj_bf16_d16_simt_segments<4, Tau, 4>(queue, params, plan.local);
-      case 8: return launch_rel_proj_bf16_d16_simt_segments<8, Tau, 4>(queue, params, plan.local);
-      default: return launch_rel_proj_bf16_d16_simt_segments<16, Tau, 4>(queue, params, plan.local);
+      case 1: return launch_rel_proj_bf16_d16_simt_segments<1, FuseTau, 4>(queue, params, plan.local);
+      case 2: return launch_rel_proj_bf16_d16_simt_segments<2, FuseTau, 4>(queue, params, plan.local);
+      case 4: return launch_rel_proj_bf16_d16_simt_segments<4, FuseTau, 4>(queue, params, plan.local);
+      case 8: return launch_rel_proj_bf16_d16_simt_segments<8, FuseTau, 4>(queue, params, plan.local);
+      default: return launch_rel_proj_bf16_d16_simt_segments<16, FuseTau, 4>(queue, params, plan.local);
     }
   }
-  return launch_rel_proj_bf16_d16_simt_segments<1, Tau, 8>(queue, params, plan.local);
+  return launch_rel_proj_bf16_d16_simt_segments<1, FuseTau, 8>(queue, params, plan.local);
 }
 
-// Every tau mode reuses the same register-tiled kernel. Leaving kTauNone on the
-// generic fallback cost 5x (12.5 us against 2.5 us for the identical shape with
-// tau=pre_token) because the fallback re-reads proj per output element instead of
-// holding a register tile across MTile rows.
+// Both tau settings reuse the same register-tiled kernel. Leaving the tau=none
+// case on the generic fallback cost 5x (12.5 us against 2.5 us for the identical
+// shape with tau fused) because the fallback re-reads proj per output element
+// instead of holding a register tile across MTile rows.
 inline sycl::event launch_rel_proj_bf16_d16_simt(
     sycl::queue& queue,
     RelProjParams<cutlass::bfloat16_t> const& params,
-    TauMode tau_mode) {
-  switch (tau_mode) {
-    case kTauNone: return launch_rel_proj_bf16_d16_simt_mtile<kTauNone>(queue, params);
-    case kTauPreToken: return launch_rel_proj_bf16_d16_simt_mtile<kTauPreToken>(queue, params);
-    case kTauPreRow: return launch_rel_proj_bf16_d16_simt_mtile<kTauPreRow>(queue, params);
-    case kTauPostToken: return launch_rel_proj_bf16_d16_simt_mtile<kTauPostToken>(queue, params);
-    default: return launch_rel_proj_bf16_d16_simt_mtile<kTauPostRow>(queue, params);
-  }
+    bool fuse_tau) {
+  return fuse_tau ? launch_rel_proj_bf16_d16_simt_mtile<true>(queue, params)
+                  : launch_rel_proj_bf16_d16_simt_mtile<false>(queue, params);
 }
 
-template <typename Element, bool ProjPerHead, int Tau, int Vec = kRelProjVec>
+template <typename Element, bool ProjPerHead, bool FuseTau, int Vec = kRelProjVec>
 sycl::event launch_rel_proj_static(sycl::queue& queue, RelProjParams<Element> const& params) {
   int e_vecs = ceil_div(params.e, Vec);
   int total = params.t * params.h * e_vecs;
@@ -1140,7 +1100,7 @@ sycl::event launch_rel_proj_static(sycl::queue& queue, RelProjParams<Element> co
   int global = round_up(total, local);
 
   return queue.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for<RelProjKernel<Element, ProjPerHead, Tau, Vec>>(
+    cgh.parallel_for<RelProjKernel<Element, ProjPerHead, FuseTau, Vec>>(
         sycl::nd_range<1>(
             sycl::range<1>(static_cast<std::size_t>(global)),
             sycl::range<1>(static_cast<std::size_t>(local))),
@@ -1156,12 +1116,8 @@ sycl::event launch_rel_proj_static(sycl::queue& queue, RelProjParams<Element> co
           int e0 = ev * Vec;
 
           float scale = 1.0f;
-          if constexpr (Tau != kTauNone) {
-            if constexpr (tau_is_row_v<Tau>) {
-              scale = params.tau[ti * params.h + hi];
-            } else {
-              scale = params.tau[ti];
-            }
+          if constexpr (FuseTau) {
+            scale = params.tau[ti];
           }
 
           float acc[Vec];
@@ -1179,7 +1135,7 @@ sycl::event launch_rel_proj_static(sycl::queue& queue, RelProjParams<Element> co
 
           for (int d = 0; d < params.d; ++d) {
             float rv = to_float(r_row[d]);
-            if constexpr (tau_is_pre_v<Tau>) {
+            if constexpr (FuseTau) {
               rv = to_float(from_float<Element>(rv * scale));
             }
             Element const* proj_row = proj_base + static_cast<int64_t>(d) * params.e;
@@ -1198,11 +1154,7 @@ sycl::event launch_rel_proj_static(sycl::queue& queue, RelProjParams<Element> co
           for (int i = 0; i < Vec; ++i) {
             int e_col = e0 + i;
             if (e_col < params.e) {
-              float value = acc[i];
-              if constexpr (tau_is_post_v<Tau>) {
-                value *= scale;
-              }
-              out_row[e_col] = from_float<Element>(value);
+              out_row[e_col] = from_float<Element>(acc[i]);
             }
           }
         });
@@ -1216,27 +1168,15 @@ sycl::event launch_rel_proj(sycl::queue& queue, RelProjParams<Element> const& pa
         params.d == kRelProjProductionD &&
         params.e % 2 == 0 &&
         params.r_stride_t % 2 == 0) {
-      return launch_rel_proj_bf16_d16_simt(queue, params, cfg.tau_mode);
+      return launch_rel_proj_bf16_d16_simt(queue, params, cfg.fuse_tau);
     }
   }
   if (cfg.proj_per_head) {
-    switch (cfg.tau_mode) {
-      case kTauNone: return launch_rel_proj_static<Element, true, kTauNone>(queue, params);
-      case kTauPreToken: return launch_rel_proj_static<Element, true, kTauPreToken>(queue, params);
-      case kTauPreRow: return launch_rel_proj_static<Element, true, kTauPreRow>(queue, params);
-      case kTauPostToken: return launch_rel_proj_static<Element, true, kTauPostToken>(queue, params);
-      case kTauPostRow: return launch_rel_proj_static<Element, true, kTauPostRow>(queue, params);
-    }
-  } else {
-    switch (cfg.tau_mode) {
-      case kTauNone: return launch_rel_proj_static<Element, false, kTauNone>(queue, params);
-      case kTauPreToken: return launch_rel_proj_static<Element, false, kTauPreToken>(queue, params);
-      case kTauPreRow: return launch_rel_proj_static<Element, false, kTauPreRow>(queue, params);
-      case kTauPostToken: return launch_rel_proj_static<Element, false, kTauPostToken>(queue, params);
-      case kTauPostRow: return launch_rel_proj_static<Element, false, kTauPostRow>(queue, params);
-    }
+    return cfg.fuse_tau ? launch_rel_proj_static<Element, true, true>(queue, params)
+                        : launch_rel_proj_static<Element, true, false>(queue, params);
   }
-  throw std::invalid_argument("unknown tau mode");
+  return cfg.fuse_tau ? launch_rel_proj_static<Element, false, true>(queue, params)
+                      : launch_rel_proj_static<Element, false, false>(queue, params);
 }
 
 template <typename Element>
@@ -1302,12 +1242,7 @@ RelHostTensors<Element> initialize_rel_case(
     uint32_t seed) {
   RelHostTensors<Element> h;
   std::size_t proj_count = static_cast<std::size_t>(cfg.proj_per_head ? cfg.h : 1) * cfg.d * cfg.e;
-  std::size_t tau_count = 0;
-  if (cfg.tau_mode == kTauPreToken || cfg.tau_mode == kTauPostToken) {
-    tau_count = static_cast<std::size_t>(cfg.t);
-  } else if (cfg.tau_mode == kTauPreRow || cfg.tau_mode == kTauPostRow) {
-    tau_count = static_cast<std::size_t>(cfg.t) * cfg.h;
-  }
+  std::size_t tau_count = cfg.fuse_tau ? static_cast<std::size_t>(cfg.t) : 0;
 
   h.r.resize(static_cast<std::size_t>(cfg.t) * cfg.r_stride_t);
   h.proj.resize(proj_count);
@@ -1333,17 +1268,12 @@ RelHostTensors<Element> initialize_rel_case(
 
     for (int ti = 0; ti < cfg.t; ++ti) {
       for (int hi = 0; hi < cfg.h; ++hi) {
-        float scale = 1.0f;
-        if (cfg.tau_mode == kTauPreToken || cfg.tau_mode == kTauPostToken) {
-          scale = h.tau[ti];
-        } else if (cfg.tau_mode == kTauPreRow || cfg.tau_mode == kTauPostRow) {
-          scale = h.tau[static_cast<std::size_t>(ti) * cfg.h + hi];
-        }
+        float scale = cfg.fuse_tau ? h.tau[ti] : 1.0f;
         for (int e_col = 0; e_col < cfg.e; ++e_col) {
           float acc = 0.0f;
           for (int d = 0; d < cfg.d; ++d) {
             float rv = to_float(h.r[static_cast<std::size_t>(ti) * cfg.r_stride_t + hi * cfg.d + d]);
-            if (cfg.tau_mode == kTauPreToken || cfg.tau_mode == kTauPreRow) {
+            if (cfg.fuse_tau) {
               rv = to_float(from_float<Element>(rv * scale));
             }
             std::size_t proj_offset = static_cast<std::size_t>(d) * cfg.e + e_col;
@@ -1351,9 +1281,6 @@ RelHostTensors<Element> initialize_rel_case(
               proj_offset += static_cast<std::size_t>(hi) * cfg.d * cfg.e;
             }
             acc += rv * to_float(h.proj[proj_offset]);
-          }
-          if (cfg.tau_mode == kTauPostToken || cfg.tau_mode == kTauPostRow) {
-            acc *= scale;
           }
           h.ref[(static_cast<std::size_t>(ti) * cfg.h + hi) * cfg.e + e_col] = from_float<Element>(acc);
         }
@@ -1532,11 +1459,10 @@ bool run_rel_case(sycl::queue& queue, RelProjCase cfg, Options const& options) {
   double r_bytes = static_cast<double>(cfg.t) * cfg.h * e_vecs * cfg.d * sizeof(Element);
   double proj_bytes = static_cast<double>(cfg.t) * cfg.h * cfg.d * cfg.e * sizeof(Element);
   double out_bytes = static_cast<double>(cfg.t) * cfg.h * cfg.e * sizeof(Element);
-  double tau_bytes = cfg.tau_mode == kTauNone ? 0.0 :
-      static_cast<double>(cfg.t) * (cfg.tau_mode == kTauPreRow || cfg.tau_mode == kTauPostRow ? cfg.h : 1) * sizeof(float);
+  double tau_bytes = cfg.fuse_tau ? static_cast<double>(cfg.t) * sizeof(float) : 0.0;
   double bytes = r_bytes + proj_bytes + out_bytes + tau_bytes;
   double flops = static_cast<double>(cfg.t) * cfg.h * cfg.d * cfg.e * 2.0;
-  if (cfg.tau_mode != kTauNone) {
+  if (cfg.fuse_tau) {
     flops += static_cast<double>(cfg.t) * cfg.h * cfg.d;
   }
 
@@ -1571,7 +1497,7 @@ bool run_rel_case(sycl::queue& queue, RelProjCase cfg, Options const& options) {
             << " E=" << cfg.e
             << " r_stride_t=" << cfg.r_stride_t
             << " proj=" << (cfg.proj_per_head ? "head" : "shared")
-            << " tau=" << tau_mode_text(cfg.tau_mode);
+            << " tau=" << (cfg.fuse_tau ? "fused" : "none");
   if (options.benchmark) {
     std::cout << "  " << std::fixed << std::setprecision(3) << (avg_ms * 1000.0) << " us"
               << "  " << std::setprecision(2) << gbps << " GB/s"
