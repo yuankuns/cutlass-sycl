@@ -47,56 +47,68 @@ std::vector<relh::RelProjCase> quick_suite() {
 //   production      (hidden=6144): H = 48/24/12/6 for TP=1/2/4/8
 // r is a strided view into the packed [q||k||v||r] qkvr row, so r_stride_t is
 // the whole qkvr row width per token: h*head_dim + 2*kv*head_dim + h*d_rel.
+// Perf gates below are the B60 bf16 measurements with roughly 10% headroom.
+// The harness only enforces target_gbps once a case moves at least
+// kMinSustainedTargetBytes (32 MiB), so for this suite -- whose largest case
+// moves 30 MiB -- they document the measured level rather than fail a build.
+//
+// The four T=1 cases that sit near 200 GB/s and below are pinned by the launch
+// floor, not by the kernel: the smallest launch this harness can measure on B60
+// is 0.731 us (a one-row row_compact) and the smallest rel_proj launch is
+// 1.041 us. Reaching 370 GB/s would need 0.631 us for 6 rows at E=1024
+// (233472 B) or for 12 rows at E=512, and 0.316 us for 3 rows -- all below the
+// empty-launch floor, so no kernel change can get there. The 12-row E=1024
+// decode cases do clear it, at 385-387 GB/s.
 std::vector<relh::RelProjCase> inkling_suite() {
   return {
       // Config defaults, decode T=1.
-      {"cfg_tp1_decode_t1",     1, 12, 16, 1024, 12*128 + 2*4*128 + 12*16, false, relh::kTauPreToken, 0.0},
-      {"cfg_tp2_decode_t1",     1,  6, 16, 1024,  6*128 + 2*2*128 +  6*16, false, relh::kTauPreToken, 0.0},
-      {"cfg_tp4_decode_t1",     1,  3, 16, 1024,  3*128 + 2*1*128 +  3*16, false, relh::kTauPreToken, 0.0},
+      {"cfg_tp1_decode_t1",     1, 12, 16, 1024, 12*128 + 2*4*128 + 12*16, false, relh::kTauPreToken, 350.0},
+      {"cfg_tp2_decode_t1",     1,  6, 16, 1024,  6*128 + 2*2*128 +  6*16, false, relh::kTauPreToken, 190.0},
+      {"cfg_tp4_decode_t1",     1,  3, 16, 1024,  3*128 + 2*1*128 +  3*16, false, relh::kTauPreToken, 96.0},
       // Config defaults, target-verify T=9 (draft_token_num).
-      {"cfg_tp2_verify_t9",     9,  6, 16, 1024,  6*128 + 2*2*128 +  6*16, false, relh::kTauPreToken, 0.0},
-      {"cfg_tp4_verify_t9",     9,  3, 16, 1024,  3*128 + 2*1*128 +  3*16, false, relh::kTauPreToken, 0.0},
+      {"cfg_tp2_verify_t9",     9,  6, 16, 1024,  6*128 + 2*2*128 +  6*16, false, relh::kTauPreToken, 1200.0},
+      {"cfg_tp4_verify_t9",     9,  3, 16, 1024,  3*128 + 2*1*128 +  3*16, false, relh::kTauPreToken, 690.0},
       // Config defaults, small-t band max T=32.
-      {"cfg_tp2_extend_t32",   32,  6, 16, 1024,  6*128 + 2*2*128 +  6*16, false, relh::kTauPreToken, 0.0},
-      {"cfg_tp4_extend_t32",   32,  3, 16, 1024,  3*128 + 2*1*128 +  3*16, false, relh::kTauPreToken, 0.0},
+      {"cfg_tp2_extend_t32",   32,  6, 16, 1024,  6*128 + 2*2*128 +  6*16, false, relh::kTauPreToken, 2550.0},
+      {"cfg_tp4_extend_t32",   32,  3, 16, 1024,  3*128 + 2*1*128 +  3*16, false, relh::kTauPreToken, 1900.0},
 
       // Production, decode T=1.
-      {"prod_tp1_decode_t1",    1, 48, 16, 1024, 48*128 + 2*4*128 + 48*16, false, relh::kTauPreToken, 0.0},
-      {"prod_tp2_decode_t1",    1, 24, 16, 1024, 24*128 + 2*2*128 + 24*16, false, relh::kTauPreToken, 0.0},
-      {"prod_tp4_decode_t1",    1, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 0.0},
-      {"prod_tp8_decode_t1",    1,  6, 16, 1024,  6*128 + 2*1*128 +  6*16, false, relh::kTauPreToken, 0.0},
+      {"prod_tp1_decode_t1",    1, 48, 16, 1024, 48*128 + 2*4*128 + 48*16, false, relh::kTauPreToken, 1100.0},
+      {"prod_tp2_decode_t1",    1, 24, 16, 1024, 24*128 + 2*2*128 + 24*16, false, relh::kTauPreToken, 610.0},
+      {"prod_tp4_decode_t1",    1, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 350.0},
+      {"prod_tp8_decode_t1",    1,  6, 16, 1024,  6*128 + 2*1*128 +  6*16, false, relh::kTauPreToken, 190.0},
       // Production, target-verify T=9.
-      {"prod_tp2_verify_t9",    9, 24, 16, 1024, 24*128 + 2*2*128 + 24*16, false, relh::kTauPreToken, 0.0},
-      {"prod_tp4_verify_t9",    9, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 0.0},
-      {"prod_tp8_verify_t9",    9,  6, 16, 1024,  6*128 + 2*1*128 +  6*16, false, relh::kTauPreToken, 0.0},
+      {"prod_tp2_verify_t9",    9, 24, 16, 1024, 24*128 + 2*2*128 + 24*16, false, relh::kTauPreToken, 2700.0},
+      {"prod_tp4_verify_t9",    9, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 2050.0},
+      {"prod_tp8_verify_t9",    9,  6, 16, 1024,  6*128 + 2*1*128 +  6*16, false, relh::kTauPreToken, 1200.0},
       // Production, small-t band max T=32.
-      {"prod_tp2_extend_t32",  32, 24, 16, 1024, 24*128 + 2*2*128 + 24*16, false, relh::kTauPreToken, 0.0},
-      {"prod_tp4_extend_t32",  32, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 0.0},
-      {"prod_tp8_extend_t32",  32,  6, 16, 1024,  6*128 + 2*1*128 +  6*16, false, relh::kTauPreToken, 0.0},
+      {"prod_tp2_extend_t32",  32, 24, 16, 1024, 24*128 + 2*2*128 + 24*16, false, relh::kTauPreToken, 3150.0},
+      {"prod_tp4_extend_t32",  32, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 2700.0},
+      {"prod_tp8_extend_t32",  32,  6, 16, 1024,  6*128 + 2*1*128 +  6*16, false, relh::kTauPreToken, 2550.0},
 
       // Production local attention: local_extent = sliding_window_size = 512.
-      {"prod_tp4_local_decode_t1",  1, 12, 16, 512, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 0.0},
-      {"prod_tp4_local_verify_t9",  9, 12, 16, 512, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 0.0},
-      {"prod_tp4_local_extend_t32", 32, 12, 16, 512, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 0.0},
+      {"prod_tp4_local_decode_t1",  1, 12, 16, 512, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 185.0},
+      {"prod_tp4_local_verify_t9",  9, 12, 16, 512, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 1250.0},
+      {"prod_tp4_local_extend_t32", 32, 12, 16, 512, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 2200.0},
 
       // Tau OFF path still lands in the kernel when the caller opts out of
       // fused-tau (SGLANG_OPT_USE_INKLING_FUSED_LOG_TAU=0); cover it at prod TP=4.
-      {"prod_tp4_no_tau_t9",    9, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, relh::kTauNone,     0.0},
+      {"prod_tp4_no_tau_t9",    9, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, relh::kTauNone,     2350.0},
   };
 }
 
 std::vector<relh::RelProjCase> perf_suite() {
   return {
-      {"perf_t1_h16_d16_e1024", 1, 16, 16, 1024, 256, false, relh::kTauPreToken, 0.0},
-      {"perf_t16_h16_d16_e1024", 16, 16, 16, 1024, 256, false, relh::kTauPreToken, 0.0},
-      {"perf_t32_h16_d16_e1024", 32, 16, 16, 1024, 256, false, relh::kTauPreToken, 0.0},
+      {"perf_t1_h16_d16_e1024", 1, 16, 16, 1024, 256, false, relh::kTauPreToken, 440.0},
+      {"perf_t16_h16_d16_e1024", 16, 16, 16, 1024, 256, false, relh::kTauPreToken, 2950.0},
+      {"perf_t32_h16_d16_e1024", 32, 16, 16, 1024, 256, false, relh::kTauPreToken, 2900.0},
 
       // Production per-rank shapes at T=32 (the tau-fused band's max T).
-      {"perf_prod_tp2_t32", 32, 24, 16, 1024, 24*128 + 2*2*128 + 24*16, false, relh::kTauPreToken, 0.0},
-      {"perf_prod_tp4_t32", 32, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 0.0},
-      {"perf_prod_tp8_t32", 32,  6, 16, 1024,  6*128 + 2*1*128 +  6*16, false, relh::kTauPreToken, 0.0},
-      {"perf_prod_tp1_t32", 32, 48, 16, 1024, 48*128 + 2*4*128 + 48*16, false, relh::kTauPreToken, 0.0},
-      {"perf_prod_tp1_local_t32", 32, 48, 16, 512, 48*128 + 2*4*128 + 48*16, false, relh::kTauPreToken, 0.0},
+      {"perf_prod_tp2_t32", 32, 24, 16, 1024, 24*128 + 2*2*128 + 24*16, false, relh::kTauPreToken, 3150.0},
+      {"perf_prod_tp4_t32", 32, 12, 16, 1024, 12*128 + 2*1*128 + 12*16, false, relh::kTauPreToken, 2700.0},
+      {"perf_prod_tp8_t32", 32,  6, 16, 1024,  6*128 + 2*1*128 +  6*16, false, relh::kTauPreToken, 2500.0},
+      {"perf_prod_tp1_t32", 32, 48, 16, 1024, 48*128 + 2*4*128 + 48*16, false, relh::kTauPreToken, 3400.0},
+      {"perf_prod_tp1_local_t32", 32, 48, 16, 512, 48*128 + 2*4*128 + 48*16, false, relh::kTauPreToken, 3150.0},
   };
 }
 

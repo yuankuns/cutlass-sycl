@@ -642,6 +642,19 @@ uint64_t scale_pack4(uint64_t raw, float scale) {
   return out;
 }
 
+// bf16 round-trip of an fp32 intermediate. The software path below is four
+// integer ops per value; on device the same RNE rounding is a single hardware
+// convert pair, which is worth 8% of a decode launch because the pre-tau modes
+// round-trip all 16 D values per work item.
+CUTLASS_DEVICE
+inline float bf16_round_trip(float value) {
+#if defined(__SYCL_DEVICE_ONLY__)
+  return static_cast<float>(static_cast<sycl::ext::oneapi::bfloat16>(value));
+#else
+  return raw16_to_float<cutlass::bfloat16_t>(float_to_raw16<cutlass::bfloat16_t>(value));
+#endif
+}
+
 template <typename Element, bool HasTau, int Vec>
 sycl::event launch_row_kernel_static(sycl::queue& queue, RowParams<Element> const& params) {
   static_assert(Vec % kRowPackElems == 0, "row lane must contain whole 16B packs");
@@ -749,6 +762,71 @@ static constexpr bool tau_is_row_v = Tau == kTauPreRow || Tau == kTauPostRow;
 template <typename Element, bool ProjPerHead, int Tau, int Vec>
 class RelProjKernel;
 
+// Integer division by a runtime divisor costs tens of instructions on Xe and
+// sits on the critical path before any address can be formed, which is a fixed
+// cost the small-T decode launches cannot amortize. Both divisors (column
+// slices per row tile, heads per token) are known on the host, so they are
+// passed as a Granlund-Montgomery multiply-shift; magic == 0 encodes an exact
+// power of two.
+// A runtime integer division costs tens of instructions on Xe and sits ahead of
+// every address computation, so at T=1 it is a large share of a launch that is
+// already within 15% of an empty kernel: replacing the two divisions below with
+// a multiply-shift took the 12-row decode case from 1.376 us to 1.192 us.
+// Both divisors are known on the host, and every quotient this kernel needs has
+// an exact 32-bit multiply-shift form: magic 1 for a power of two, magic 0 for a
+// divisor larger than any value it will ever divide (the T=1 rows, where t is
+// always 0), and a Granlund-Montgomery magic otherwise. Only the fallback needs
+// a branch, so the hot path is a single multiply and shift.
+struct RelProjFastDiv {
+  uint32_t magic = 0;
+  int shift = -1;  // negative falls back to a real division
+};
+
+inline RelProjFastDiv make_rel_proj_fast_div(int divisor, int max_value) {
+  RelProjFastDiv fd;
+  if (divisor <= 0 || max_value < 0) {
+    return fd;
+  }
+  if (max_value < divisor) {
+    fd.magic = 0;
+    fd.shift = 0;
+    return fd;
+  }
+  int l = 0;
+  while ((1 << l) < divisor) {
+    ++l;
+  }
+  if ((1 << l) == divisor) {
+    fd.magic = 1;
+    fd.shift = l;
+    return fd;
+  }
+  // Smallest shift with max_value * divisor < 2^shift keeps the multiply exact
+  // and the magic as small as possible; anything that still does not fit in 32
+  // bits degrades to a correct division rather than a wrong quotient.
+  uint64_t need = static_cast<uint64_t>(max_value) * static_cast<uint64_t>(divisor) + 1ull;
+  int shift = 0;
+  while ((1ull << shift) < need) {
+    ++shift;
+  }
+  uint64_t magic = (1ull << shift) / static_cast<uint64_t>(divisor) + 1ull;
+  if (magic > 0xffffffffull ||
+      magic * static_cast<uint64_t>(max_value) > 0xffffffffull) {
+    return fd;
+  }
+  fd.magic = static_cast<uint32_t>(magic);
+  fd.shift = shift;
+  return fd;
+}
+
+CUTLASS_DEVICE
+inline int rel_proj_fast_div(int value, RelProjFastDiv fd, int divisor) {
+  if (fd.shift < 0) {
+    return value / divisor;
+  }
+  return static_cast<int>((static_cast<uint32_t>(value) * fd.magic) >> fd.shift);
+}
+
 // out[t, h, :] = bf16(tau[t] * r[t, h, :]) @ proj
 //
 // Production uses a 16 x 1024 bf16 projection (32 KiB), while the output has
@@ -756,7 +834,7 @@ class RelProjKernel;
 // loads that projection slice once, and applies it to MTile rows. The launcher
 // composes 8-, 4-, and 2-column kernels for an arbitrary even E, preserving
 // this reuse without making E=1024 an interface constraint.
-template <int MTile, int Vec>
+template <int MTile, int Vec, int Tau>
 class RelProjBf16D16SimtKernel {
  public:
   static_assert(Vec % 2 == 0, "Vec must be even so proj/out move as 32-bit pairs");
@@ -765,6 +843,8 @@ class RelProjBf16D16SimtKernel {
   int total;
   int e_offset;
   int col_slices;
+  RelProjFastDiv col_div;
+  RelProjFastDiv h_div;
 
   void operator()(sycl::nd_item<1> item) const {
     int idx = static_cast<int>(item.get_global_id(0));
@@ -772,8 +852,8 @@ class RelProjBf16D16SimtKernel {
       return;
     }
 
-    int col_slice = idx % col_slices;
-    int m_tile = idx / col_slices;
+    int m_tile = rel_proj_fast_div(idx, col_div, col_slices);
+    int col_slice = idx - m_tile * col_slices;
     int e0 = e_offset + col_slice * Vec;
 
     float proj_tile[kRelProjProductionD][Vec];
@@ -793,7 +873,7 @@ class RelProjBf16D16SimtKernel {
 
     int m = m_tile * MTile;
     int rows = params.t * params.h;
-    int ti = m / params.h;
+    int ti = rel_proj_fast_div(m, h_div, params.h);
     int hi = m - ti * params.h;
 
 #pragma unroll
@@ -802,7 +882,10 @@ class RelProjBf16D16SimtKernel {
         return;
       }
 
-      float scale = params.tau[ti];
+      float scale = 1.0f;
+      if constexpr (Tau != kTauNone) {
+        scale = params.tau[tau_is_row_v<Tau> ? m : ti];
+      }
       cutlass::bfloat16_t const* r_row =
           params.r + static_cast<int64_t>(ti) * params.r_stride_t + hi * kRelProjProductionD;
       float acc[Vec];
@@ -811,15 +894,30 @@ class RelProjBf16D16SimtKernel {
         acc[i] = 0.0f;
       }
 
+      // Two D values per dword halves r's load messages; keeping only the two
+      // live values (instead of an r[16] array) avoids the register pressure
+      // that a full-row prepass costs.
+      uint32_t const* r_pairs = reinterpret_cast<uint32_t const*>(r_row);
 #pragma unroll
-      for (int d = 0; d < kRelProjProductionD; ++d) {
-        uint16_t r_bits = element_to_raw16(r_row[d]);
-        float r_value = raw16_to_float<cutlass::bfloat16_t>(
-            float_to_raw16<cutlass::bfloat16_t>(
-                raw16_to_float<cutlass::bfloat16_t>(r_bits) * scale));
+      for (int d = 0; d < kRelProjProductionD; d += 2) {
+        uint32_t pair = r_pairs[d / 2];
+        float r_lo = raw16_to_float<cutlass::bfloat16_t>(static_cast<uint16_t>(pair & 0xffffu));
+        float r_hi = raw16_to_float<cutlass::bfloat16_t>(static_cast<uint16_t>(pair >> 16));
+        if constexpr (tau_is_pre_v<Tau>) {
+          r_lo = bf16_round_trip(r_lo * scale);
+          r_hi = bf16_round_trip(r_hi * scale);
+        }
 #pragma unroll
         for (int i = 0; i < Vec; ++i) {
-          acc[i] += r_value * proj_tile[d][i];
+          acc[i] += r_lo * proj_tile[d][i];
+          acc[i] += r_hi * proj_tile[d + 1][i];
+        }
+      }
+
+      if constexpr (tau_is_post_v<Tau>) {
+#pragma unroll
+        for (int i = 0; i < Vec; ++i) {
+          acc[i] *= scale;
         }
       }
 
@@ -841,22 +939,66 @@ class RelProjBf16D16SimtKernel {
   }
 };
 
-template <int MTile, int Vec = kRelProjVec>
+// Launch shape for the register-tiled kernel, measured on B60 across the
+// Inkling per-rank shapes (T in {1, 9, 32} x H in {3..48}, E in {512, 1024}).
+// Two effects trade off against each other:
+//   * A small Vec and a small work-group keep the launch short, which is all
+//     that matters for the T=1 decode rows -- there the whole launch is within
+//     15% of an empty kernel, so any extra code or work-group setup shows up
+//     one-for-one (12 rows read 393 GB/s at Vec=2/local=16 against 332 at
+//     Vec=8/local=256).
+//   * Once there are enough rows to fill the machine, wider columns per
+//     work-item amortize the 16 projection loads and win instead (768 rows read
+//     3608 GB/s at Vec=8 against 1332 at Vec=2).
+// MTile row reuse only pays in the middle band; past ~256 rows there are enough
+// row tiles already and tiling them costs more than the reuse returns.
+struct RelProjLaunchPlan {
+  int vec = kRelProjVec;
+  int local = kDefaultBlock;
+  int mtile = 1;
+};
+
+inline RelProjLaunchPlan rel_proj_launch_plan(int rows) {
+  if (rows <= 12) {
+    return {2, 16, 1};
+  }
+  if (rows <= 40) {
+    return {2, 64, 1};
+  }
+  if (rows <= 64) {
+    return {8, 16, 1};
+  }
+  if (rows <= 256) {
+    constexpr int kMinRowTiles = 40;
+    int mtile = 1;
+    while (mtile < 16 && rows >= kMinRowTiles * mtile * 2) {
+      mtile *= 2;
+    }
+    return {4, 64, mtile};
+  }
+  return {8, 16, 1};
+}
+
+template <int MTile, int Tau, int Vec>
 sycl::event launch_rel_proj_bf16_d16_simt_static(
     sycl::queue& queue,
     RelProjParams<cutlass::bfloat16_t> const& params,
     int e_offset,
     int col_slices,
+    int local_size,
     std::vector<sycl::event> const& dependencies = {}) {
   int total = ceil_div(params.t * params.h, MTile) * col_slices;
-  int local = std::min(kDefaultBlock, col_slices);
+  int local = std::max(1, std::min(local_size, total));
   int global = round_up(total, local);
-  RelProjBf16D16SimtKernel<MTile, Vec> kernel{params, total, e_offset, col_slices};
+  RelProjBf16D16SimtKernel<MTile, Vec, Tau> kernel{
+      params, total, e_offset, col_slices,
+      make_rel_proj_fast_div(col_slices, total),
+      make_rel_proj_fast_div(params.h, params.t * params.h)};
   return queue.submit([&](sycl::handler& cgh) {
     if (!dependencies.empty()) {
       cgh.depends_on(dependencies);
     }
-    cgh.parallel_for<RelProjBf16D16SimtKernel<MTile, Vec>>(
+    cgh.parallel_for<RelProjBf16D16SimtKernel<MTile, Vec, Tau>>(
         sycl::nd_range<1>(
             sycl::range<1>(static_cast<std::size_t>(global)),
             sycl::range<1>(static_cast<std::size_t>(local))),
@@ -864,55 +1006,79 @@ sycl::event launch_rel_proj_bf16_d16_simt_static(
   });
 }
 
-template <int MTile>
+template <int MTile, int Tau, int VecMain>
 sycl::event launch_rel_proj_bf16_d16_simt_segments(
     sycl::queue& queue,
-    RelProjParams<cutlass::bfloat16_t> const& params) {
+    RelProjParams<cutlass::bfloat16_t> const& params,
+    int local_size) {
   std::vector<sycl::event> dependencies;
   sycl::event last;
   int e_offset = 0;
   int remaining = params.e;
 
-  int col_slices = remaining / kRelProjVec;
+  int col_slices = remaining / VecMain;
   if (col_slices > 0) {
-    last = launch_rel_proj_bf16_d16_simt_static<MTile, kRelProjVec>(
-        queue, params, e_offset, col_slices, dependencies);
+    last = launch_rel_proj_bf16_d16_simt_static<MTile, Tau, VecMain>(
+        queue, params, e_offset, col_slices, local_size, dependencies);
     dependencies = {last};
-    e_offset += col_slices * kRelProjVec;
-    remaining -= col_slices * kRelProjVec;
+    e_offset += col_slices * VecMain;
+    remaining -= col_slices * VecMain;
   }
-  if (remaining >= 4) {
-    last = launch_rel_proj_bf16_d16_simt_static<MTile, 4>(
-        queue, params, e_offset, 1, dependencies);
-    dependencies = {last};
-    e_offset += 4;
-    remaining -= 4;
+  if constexpr (VecMain > 4) {
+    if (remaining >= 4) {
+      last = launch_rel_proj_bf16_d16_simt_static<MTile, Tau, 4>(
+          queue, params, e_offset, 1, local_size, dependencies);
+      dependencies = {last};
+      e_offset += 4;
+      remaining -= 4;
+    }
   }
-  if (remaining >= 2) {
-    last = launch_rel_proj_bf16_d16_simt_static<MTile, 2>(
-        queue, params, e_offset, 1, dependencies);
+  if constexpr (VecMain > 2) {
+    if (remaining >= 2) {
+      last = launch_rel_proj_bf16_d16_simt_static<MTile, Tau, 2>(
+          queue, params, e_offset, 1, local_size, dependencies);
+    }
   }
   return last;
 }
 
-inline sycl::event launch_rel_proj_bf16_d16_simt(
+// Only the Vec=4 band ever asks for MTile > 1, so the other widths are
+// instantiated once and the kernel count stays bounded.
+template <int Tau>
+sycl::event launch_rel_proj_bf16_d16_simt_mtile(
     sycl::queue& queue,
     RelProjParams<cutlass::bfloat16_t> const& params) {
-  constexpr int kMinRowTiles = 40;
-  int rows = params.t * params.h;
-  if (rows >= kMinRowTiles * 16) {
-    return launch_rel_proj_bf16_d16_simt_segments<16>(queue, params);
+  RelProjLaunchPlan plan = rel_proj_launch_plan(params.t * params.h);
+  if (plan.vec == 2) {
+    return launch_rel_proj_bf16_d16_simt_segments<1, Tau, 2>(queue, params, plan.local);
   }
-  if (rows >= kMinRowTiles * 8) {
-    return launch_rel_proj_bf16_d16_simt_segments<8>(queue, params);
+  if (plan.vec == 4) {
+    switch (plan.mtile) {
+      case 1: return launch_rel_proj_bf16_d16_simt_segments<1, Tau, 4>(queue, params, plan.local);
+      case 2: return launch_rel_proj_bf16_d16_simt_segments<2, Tau, 4>(queue, params, plan.local);
+      case 4: return launch_rel_proj_bf16_d16_simt_segments<4, Tau, 4>(queue, params, plan.local);
+      case 8: return launch_rel_proj_bf16_d16_simt_segments<8, Tau, 4>(queue, params, plan.local);
+      default: return launch_rel_proj_bf16_d16_simt_segments<16, Tau, 4>(queue, params, plan.local);
+    }
   }
-  if (rows >= kMinRowTiles * 4) {
-    return launch_rel_proj_bf16_d16_simt_segments<4>(queue, params);
+  return launch_rel_proj_bf16_d16_simt_segments<1, Tau, 8>(queue, params, plan.local);
+}
+
+// Every tau mode reuses the same register-tiled kernel. Leaving kTauNone on the
+// generic fallback cost 5x (12.5 us against 2.5 us for the identical shape with
+// tau=pre_token) because the fallback re-reads proj per output element instead of
+// holding a register tile across MTile rows.
+inline sycl::event launch_rel_proj_bf16_d16_simt(
+    sycl::queue& queue,
+    RelProjParams<cutlass::bfloat16_t> const& params,
+    TauMode tau_mode) {
+  switch (tau_mode) {
+    case kTauNone: return launch_rel_proj_bf16_d16_simt_mtile<kTauNone>(queue, params);
+    case kTauPreToken: return launch_rel_proj_bf16_d16_simt_mtile<kTauPreToken>(queue, params);
+    case kTauPreRow: return launch_rel_proj_bf16_d16_simt_mtile<kTauPreRow>(queue, params);
+    case kTauPostToken: return launch_rel_proj_bf16_d16_simt_mtile<kTauPostToken>(queue, params);
+    default: return launch_rel_proj_bf16_d16_simt_mtile<kTauPostRow>(queue, params);
   }
-  if (rows >= kMinRowTiles * 2) {
-    return launch_rel_proj_bf16_d16_simt_segments<2>(queue, params);
-  }
-  return launch_rel_proj_bf16_d16_simt_segments<1>(queue, params);
 }
 
 template <typename Element, bool ProjPerHead, int Tau, int Vec = kRelProjVec>
@@ -996,10 +1162,10 @@ template <typename Element>
 sycl::event launch_rel_proj(sycl::queue& queue, RelProjParams<Element> const& params, RelProjCase const& cfg) {
   if constexpr (std::is_same_v<Element, cutlass::bfloat16_t>) {
     if (!cfg.proj_per_head &&
-        cfg.tau_mode == kTauPreToken &&
         params.d == kRelProjProductionD &&
-        params.e % 2 == 0) {
-      return launch_rel_proj_bf16_d16_simt(queue, params);
+        params.e % 2 == 0 &&
+        params.r_stride_t % 2 == 0) {
+      return launch_rel_proj_bf16_d16_simt(queue, params, cfg.tau_mode);
     }
   }
   if (cfg.proj_per_head) {
