@@ -469,9 +469,21 @@ inline std::vector<CaseConfig> inkling_suite() {
   // The Inkling audio tower (InklingAudio.encoder) is a plain nn.Embedding
   // and does not participate in tensor-parallel sharding -- every rank runs
   // the full [n_mel_bins*mel_vocab_size, decoder_dmodel] lookup + reduction.
-  // The two shipped decoder_dmodel values (cfg=1536 tied to text hidden_size,
-  // prod=6144) are therefore covered per-rank regardless of TP=1/2/4/8, so
-  // this suite mirrors the same T bands across both configs.
+  // The three shipped decoder_dmodel values (ckpt=768 from the published
+  // thinkingmachines/Inkling config.json audio_config, cfg=1536 tied to the
+  // text hidden_size default, prod=6144) are therefore covered per-rank
+  // regardless of TP=1/2/4/8, so this suite mirrors the same T bands across
+  // all three configs.
+  //
+  // Index math mirrors InklingAudio.forward
+  // (sglang/python/sglang/srt/models/inkling.py:971-980): the embedding table
+  // is nn.Embedding(n_mel_bins * mel_vocab_size, decoder_dmodel) (line 957-959)
+  // and the gather index is arange(n_mel_bins) * mel_vocab_size + features,
+  // reduced with .sum(axis=1). n_mel_bins=80 / mel_vocab_size=16 are the
+  // InklingAudioConfig defaults (configs/inkling.py:263-264) and match the
+  // feature extractor's n_mels=80 / num_dmel_bins=16
+  // (multimodal/inkling/feature_extraction.py:25-26), whose _dmel_bins()
+  // returns an int32 [T, n_mels] bin tensor in [0, num_dmel_bins).
   //
   // Chunk-boundary T bands mirror the upstream PR-31557 CPU CI test
   // (num_tokens in {1, 511, 512, 513, 1025}), which was added specifically
@@ -504,6 +516,20 @@ inline std::vector<CaseConfig> inkling_suite() {
       {"cfg_h1536_chunk_tail_t513", 513, 80, 16, 1536, 512, 0.0, true},
       {"cfg_h1536_two_chunks_t1025", 1025, 80, 16, 1536, 512, 0.0, true},
       {"cfg_h1536_irregular", 65, 80, 16, 1537, 32, 0.0, true},
+      // Shipped checkpoint decoder_dmodel=768, read from
+      // audio_config.decoder_dmodel in the published thinkingmachines/Inkling
+      // config.json (HF snapshot 85b071f87d9bf5ff16a213a2d825faeed3af2cbf),
+      // which also equals that checkpoint's text_config.hidden_size. Not
+      // derivable from sglang alone: InklingAudioConfig.decoder_dmodel defaults
+      // to None (configs/inkling.py:262) and is filled in from the checkpoint. Same replicated-per-rank
+      // reasoning as above, so one set of bands covers TP=1/2/4/8.
+      {"ckpt_h768_decode_t1", 1, 80, 16, 768, 512, 0.0, true},
+      {"ckpt_h768_target_verify_t9", 9, 80, 16, 768, 512, 0.0, true},
+      {"ckpt_h768_below_chunk_t511", 511, 80, 16, 768, 512, 0.0, true},
+      {"ckpt_h768_full_chunk_t512", 512, 80, 16, 768, 512, 0.0, true},
+      {"ckpt_h768_chunk_tail_t513", 513, 80, 16, 768, 512, 0.0, true},
+      {"ckpt_h768_two_chunks_t1025", 1025, 80, 16, 768, 512, 0.0, true},
+      {"ckpt_h768_irregular", 65, 80, 16, 769, 32, 0.0, true},
   };
 }
 
@@ -519,6 +545,26 @@ inline std::vector<CaseConfig> perf_suite() {
       {"perf_cfg_h1536_t2048", 2048, 80, 16, 1536, 512, kMemoryBoundTargetGBps, false},
       {"perf_cfg_h1536_t18432", 18432, 80, 16, 1536, 512, kMemoryBoundTargetGBps, false},
       {"perf_cfg_h1536_t36864", 36864, 80, 16, 1536, 512, kMemoryBoundTargetGBps, false},
+      // Shipped checkpoint decoder_dmodel=768 bands. The chunk-boundary token
+      // counts are carried over from the inkling suite so the perf suite times
+      // the same launch shapes the accuracy suite verifies; the small-T cases
+      // are dominated by the per-launch floor rather than bandwidth, so they
+      // are report-only (target 0.0) instead of gated.
+      {"perf_ckpt_h768_t1", 1, 80, 16, 768, 512, 0.0, false},
+      {"perf_ckpt_h768_t9", 9, 80, 16, 768, 512, 0.0, false},
+      {"perf_ckpt_h768_t511", 511, 80, 16, 768, 512, 0.0, false},
+      {"perf_ckpt_h768_t512", 512, 80, 16, 768, 512, 0.0, false},
+      {"perf_ckpt_h768_t513", 513, 80, 16, 768, 512, 0.0, false},
+      {"perf_ckpt_h768_t1025", 1025, 80, 16, 768, 512, 0.0, false},
+      // Large-T checkpoint bands, mirroring the 6144/1536 coverage above. B60
+      // measures 469-632 GB/s (bf16) / 556-587 GB/s (fp16) across these three
+      // token counts -- t18432 is the fastest point (632/583) and t2048 the
+      // slowest bf16 point (469) -- so the shared 350 GB/s memory-bound target
+      // keeps headroom on every one of them. Do not tighten it past the t2048
+      // number.
+      {"perf_ckpt_h768_t2048", 2048, 80, 16, 768, 512, kMemoryBoundTargetGBps, false},
+      {"perf_ckpt_h768_t18432", 18432, 80, 16, 768, 512, kMemoryBoundTargetGBps, false},
+      {"perf_ckpt_h768_t36864", 36864, 80, 16, 768, 512, kMemoryBoundTargetGBps, false},
       // Larger mel_vocab_size bands (kept at prod hidden).
       // These intentionally defeat cache-hot table reuse. They are kept as a
       // random-row DRAM stress floor, while production/cache-reuse shapes gate
@@ -547,6 +593,24 @@ inline int choose_channels_per_item(CaseConfig const& cfg, Options const& option
   }
   if (cfg.hidden >= 1536 && cfg.n_mel_bins >= 64) {
     return 8;
+  }
+  // Narrow hidden, i.e. the shipped checkpoint's decoder_dmodel=768. The
+  // vectorized 8-channels-per-item path still wins here even though it leaves
+  // lanes idle: one channel tile of 256 work items covers 2048 channels, so only
+  // 96 lanes are live, yet the 16-byte loads measure 632 GB/s on B60 at T=18432
+  // versus 607 (cpi=4), 475 (cpi=2) and 381 (cpi=1).
+  //
+  // Two guards on that choice, both measured on B60:
+  //   * hidden % 8 != 0 disables the vec8 fast path at runtime, so cpi=8 would
+  //     keep all of the idle lanes and none of the vectorization -- hidden=769,
+  //     T=18432 measures 393 GB/s at cpi=8 versus 589 at cpi=4.
+  //   * cpi=8 collapses the launch to a single work group per token, which only
+  //     pays once there are enough tokens to fill the machine. The crossover is
+  //     near T=64 (T=9: 0.0225 ms at cpi=1 versus 0.030 at cpi=8; T=64: 0.055 ms
+  //     at cpi=1 versus 0.034 at cpi=8), so short token counts fall through to
+  //     the narrower defaults below.
+  if (cfg.hidden >= 768 && cfg.n_mel_bins >= 64 && cfg.tokens >= 64) {
+    return (cfg.hidden % 8 == 0) ? 8 : 4;
   }
   if (cfg.hidden >= 4096 && (cfg.tokens >= 8192 || cfg.mel_vocab_size >= 128)) {
     return 4;
