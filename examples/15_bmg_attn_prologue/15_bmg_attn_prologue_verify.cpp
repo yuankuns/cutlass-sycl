@@ -1268,11 +1268,27 @@ std::vector<CaseConfig> quick_suite() {
   };
 }
 
-// Inkling target-verify: q = draft_token_num = 9, W = sconv_kernel_size = 4,
-// head_dim = 128, num_kv_heads = 4. dq = 128 * num_heads/tp, dkv = 128 * max(1, 4/tp).
-// hidden_size=1536 uses num_heads=12 (legal power-of-2 TP: 1,2,4); hidden_size=6144
-// uses num_heads=48 (legal TP: 1,2,4,8). Batches sized to expose real per-token work
-// while keeping host-reference times bounded.
+// Inkling target-verify: W = sconv_kernel_size = 4, head_dim = 128.
+//   dq  = head_dim * (num_attention_heads / P)
+//   dkv = head_dim * max(1, num_key_value_heads / P)
+// The max(1, ...) is the real replication rule: once P > num_kv_heads the K/V
+// heads are REPLICATED across ranks, not split, so dkv floors at head_dim
+// (InklingAttention.num_tp_kv_heads and InklingConfig.tp_local_kv_conv_dim in
+// sglang). SWA (local) layers use swa_num_key_value_heads instead.
+// Geometries:
+//   config defaults  hidden_size=1536, Nq=12, Nkv=4          (TP∈{1,2,4})
+//   production       hidden_size=6144, Nq=48, Nkv=4          (TP∈{1,2,4,8})
+//   shipped ckpt     hidden_size=768,  Nq=8,  Nkv=2, swa 4   (TP∈{1,2,4,8})
+// The checkpoint geometry is thinkingmachines/Inkling config.json text_config:
+// hidden_size=768, num_attention_heads=8, head_dim=128, num_key_value_heads=2,
+// swa_num_key_value_heads=4. head_dim is set EXPLICITLY there, so it is not
+// hidden_size/Nq (InklingConfig only falls back to that when head_dim is None):
+// dq = 8 * 128 = 1024 at TP=1, wider than hidden_size.
+// q = draft_token_num = speculative_num_steps + 1, bounded by
+// mtp_config.num_nextn_predict_layers: 9 in the production MTP config, 3 for the
+// shipped checkpoint (num_nextn_predict_layers=2). Both bands are covered.
+// Batches sized to expose real per-token work while keeping host-reference times
+// bounded.
 std::vector<CaseConfig> inkling_suite() {
   return {
       // hidden_size=1536 (config defaults)
@@ -1284,6 +1300,20 @@ std::vector<CaseConfig> inkling_suite() {
       {"verify_h6144_tp2_dq3072_dkv256",  32, 9, 3072, 256, 4, 0, 0, 0, 0, 0, 8, false, true,  true,  false, false, false},
       {"verify_h6144_tp4_dq1536_dkv128",  64, 9, 1536, 128, 4, 0, 0, 0, 0, 0, 8, false, true,  true,  false, false, false},
       {"verify_h6144_tp8_dq768_dkv128",  128, 9,  768, 128, 4, 0, 0, 0, 0, 0, 8, false, true,  true,  false, false, false},
+      // shipped checkpoint (hidden_size=768, Nq=8, head_dim=128) at its own
+      // draft_token_num=3 (num_nextn_predict_layers=2): full layers Nkv=2, SWA
+      // layers swa_num_key_value_heads=4. At P>=4 the KV heads are replicated,
+      // so full and SWA collapse onto the same dkv=128.
+      {"verify_ckpt_tp1_q3_dq1024_dkv256",      32, 3, 1024, 256, 4, 0, 0, 0, 0, 0, 8, false, true,  true,  false, false, false},
+      {"verify_ckpt_tp1_swa_q3_dq1024_dkv512",  32, 3, 1024, 512, 4, 0, 0, 0, 0, 0, 8, false, true,  true,  false, false, false},
+      {"verify_ckpt_tp2_q3_dq512_dkv128",       32, 3,  512, 128, 4, 0, 0, 0, 0, 0, 8, false, true,  true,  false, false, false},
+      {"verify_ckpt_tp2_swa_q3_dq512_dkv256",   32, 3,  512, 256, 4, 0, 0, 0, 0, 0, 8, false, true,  true,  true,  true,  true },
+      {"verify_ckpt_tp4_q3_dq256_dkv128",       64, 3,  256, 128, 4, 0, 0, 0, 0, 0, 8, false, true,  true,  false, false, false},
+      {"verify_ckpt_tp8_q3_dq128_dkv128",      128, 3,  128, 128, 4, 0, 0, 0, 0, 0, 8, false, true,  true,  false, false, false},
+      // draft_token_num=3 band at the other two geometries (the q axis is
+      // independent of the QKVR widths, so cover it there too)
+      {"verify_h1536_tp1_q3_dq1536_dkv512",     32, 3, 1536, 512, 4, 0, 0, 0, 0, 0, 8, false, true,  true,  false, false, false},
+      {"verify_h6144_tp1_q3_dq6144_dkv512",     32, 3, 6144, 512, 4, 0, 0, 0, 0, 0, 8, false, true,  true,  false, false, false},
       // Behavior variants at a real shape (flagship h=1536 TP=1)
       {"verify_h1536_silu",               16, 9, 1536, 512, 4, 0, 0, 0, 0, 0, 8, true,  true,  true,  false, false, false},
       {"verify_h1536_no_residual",        16, 9, 1536, 512, 4, 0, 0, 0, 0, 0, 8, false, false, true,  false, false, false},
@@ -1304,6 +1334,17 @@ std::vector<CaseConfig> perf_suite() {
       {"perf_h6144_tp2_dq3072_dkv256_B256",   256, 9, 3072, 256, 4, 0, 0, 0, 0, 0, 8, false, true, true, false, false, false, 335.0},
       {"perf_h6144_tp4_dq1536_dkv128_B512",   512, 9, 1536, 128, 4, 0, 0, 0, 0, 0, 8, false, true, true, false, false, false, 410.0},
       {"perf_h6144_tp8_dq768_dkv128_B1024",  1024, 9,  768, 128, 4, 0, 0, 0, 0, 0, 8, false, true, true, false, false, false, 400.0},
+      // Shipped-checkpoint geometry (hidden_size=768, Nq=8, Nkv=2, swa Nkv=4) at
+      // its own draft_token_num=3; batches are raised so batch*q keeps the working
+      // set above the sustained gate. target_gbps=0.0: report-only, these gates are
+      // not calibrated yet (the measuring GPU was shared, so a number here would
+      // flake CI).
+      {"perf_ckpt_tp1_q3_dq1024_dkv256_B2048",     2048, 3, 1024, 256, 4, 0, 0, 0, 0, 0, 8, false, true, true, false, false, false, 0.0},
+      {"perf_ckpt_tp1_swa_q3_dq1024_dkv512_B2048", 2048, 3, 1024, 512, 4, 0, 0, 0, 0, 0, 8, false, true, true, false, false, false, 0.0},
+      {"perf_ckpt_tp2_q3_dq512_dkv128_B4096",      4096, 3,  512, 128, 4, 0, 0, 0, 0, 0, 8, false, true, true, false, false, false, 0.0},
+      {"perf_ckpt_tp2_swa_q3_dq512_dkv256_B4096",  4096, 3,  512, 256, 4, 0, 0, 0, 0, 0, 8, false, true, true, false, false, false, 0.0},
+      {"perf_ckpt_tp4_q3_dq256_dkv128_B4096",      4096, 3,  256, 128, 4, 0, 0, 0, 0, 0, 8, false, true, true, false, false, false, 0.0},
+      {"perf_ckpt_tp8_q3_dq128_dkv128_B8192",      8192, 3,  128, 128, 4, 0, 0, 0, 0, 0, 8, false, true, true, false, false, false, 0.0},
   };
 }
 
