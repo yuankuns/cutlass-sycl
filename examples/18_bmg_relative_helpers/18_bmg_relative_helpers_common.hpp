@@ -23,7 +23,7 @@
 #pragma once
 
 #include <sycl/sycl.hpp>
-#include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/oneapi/experimental/group_load_store.hpp>
 
 #include "cutlass/bfloat16.h"
 #include "cutlass/cutlass.h"
@@ -53,9 +53,15 @@ constexpr int kRowPackElems = kRowPackBytes / static_cast<int>(sizeof(cutlass::b
 constexpr int kRowSmallLaneElems = kRowPackElems;
 constexpr int kRowLargePacksPerLane = 4;
 constexpr int kRowLargeLaneElems = kRowPackElems * kRowLargePacksPerLane;
-constexpr int kRowEsimdCopyWords = 64;
-constexpr int kRowEsimdMinRows = 512;
 constexpr int kRowSmallWorkItemsThreshold = 8192;
+// Wide row path: one subgroup block load/store per contiguous chunk of a row.
+// kRowWideWords dwords per lane with *striped* placement lowers to one
+// intel_sub_group_block_read/write of that width; see launch_row_kernel_wide
+// for why the width and the placement are both load-bearing.
+constexpr int kRowWideSubgroup = 16;
+constexpr int kRowWideWords = 4;
+constexpr int kRowWideChunkWords = kRowWideSubgroup * kRowWideWords;
+constexpr int kRowWideChunkBytes = kRowWideChunkWords * static_cast<int>(sizeof(uint32_t));
 constexpr int kRelProjVec = 8;
 constexpr int kRelProjProductionD = 16;
 constexpr double kMinSustainedTargetBytes = 32.0 * 1024.0 * 1024.0;
@@ -496,87 +502,6 @@ template <typename Element, bool HasTau, int Vec>
 class RowScaleKernel;
 
 template <typename Element>
-class RowCompactEsimdKernel {
- public:
-  RowParams<Element> params;
-  int chunks_per_row;
-
-  void operator()(sycl::item<1> item) const SYCL_ESIMD_KERNEL {
-    int linear = static_cast<int>(item.get_linear_id());
-    int total = params.rows * chunks_per_row;
-    if (linear >= total) {
-      return;
-    }
-    int row = linear / chunks_per_row;
-    int chunk = linear - row * chunks_per_row;
-    Element const* src_row = params.x + static_cast<int64_t>(row) * params.stride;
-    Element* dst_row = params.out + static_cast<int64_t>(row) * params.inner;
-    auto value = sycl::ext::intel::esimd::block_load<uint32_t, kRowEsimdCopyWords>(
-        reinterpret_cast<uint32_t const*>(src_row) + chunk * kRowEsimdCopyWords);
-    sycl::ext::intel::esimd::block_store<uint32_t, kRowEsimdCopyWords>(
-        reinterpret_cast<uint32_t*>(dst_row) + chunk * kRowEsimdCopyWords, value);
-  }
-};
-
-class RowScaleBf16EsimdKernel {
- public:
-  RowParams<cutlass::bfloat16_t> params;
-  int chunks_per_row;
-
-  void operator()(sycl::item<1> item) const SYCL_ESIMD_KERNEL {
-    int linear = static_cast<int>(item.get_linear_id());
-    int total = params.rows * chunks_per_row;
-    if (linear >= total) {
-      return;
-    }
-    int row = linear / chunks_per_row;
-    int chunk = linear - row * chunks_per_row;
-    cutlass::bfloat16_t const* src_row = params.x + static_cast<int64_t>(row) * params.stride;
-    cutlass::bfloat16_t* dst_row = params.out + static_cast<int64_t>(row) * params.inner;
-    float scale = params.tau[row];
-
-    auto raw = sycl::ext::intel::esimd::block_load<uint32_t, kRowEsimdCopyWords>(
-        reinterpret_cast<uint32_t const*>(src_row) + chunk * kRowEsimdCopyWords);
-    auto lo_bits = (raw & 0x0000ffffu) << 16;
-    auto hi_bits = raw & 0xffff0000u;
-    auto lo = lo_bits.template bit_cast_view<float>();
-    auto hi = hi_bits.template bit_cast_view<float>();
-    lo = lo * scale;
-    hi = hi * scale;
-
-    auto lo_fbits = lo.template bit_cast_view<uint32_t>();
-    auto hi_fbits = hi.template bit_cast_view<uint32_t>();
-    auto lo_round = ((lo_fbits >> 16) & 1u) + 0x7fffu;
-    auto hi_round = ((hi_fbits >> 16) & 1u) + 0x7fffu;
-    auto out = ((lo_fbits + lo_round) >> 16) |
-        (((hi_fbits + hi_round) >> 16) << 16);
-    sycl::ext::intel::esimd::block_store<uint32_t, kRowEsimdCopyWords>(
-        reinterpret_cast<uint32_t*>(dst_row) + chunk * kRowEsimdCopyWords, out);
-  }
-};
-
-template <typename Element>
-sycl::event launch_row_compact_esimd(
-    sycl::queue& queue,
-    RowParams<Element> const& params,
-    int chunks_per_row) {
-  int total = params.rows * chunks_per_row;
-  RowCompactEsimdKernel<Element> kernel{params, chunks_per_row};
-  return queue.parallel_for<RowCompactEsimdKernel<Element>>(
-      sycl::range<1>(static_cast<std::size_t>(total)), kernel);
-}
-
-inline sycl::event launch_row_scale_bf16_esimd(
-    sycl::queue& queue,
-    RowParams<cutlass::bfloat16_t> const& params,
-    int chunks_per_row) {
-  int total = params.rows * chunks_per_row;
-  RowScaleBf16EsimdKernel kernel{params, chunks_per_row};
-  return queue.parallel_for<RowScaleBf16EsimdKernel>(
-      sycl::range<1>(static_cast<std::size_t>(total)), kernel);
-}
-
-template <typename Element>
 CUTLASS_DEVICE
 Element element_from_raw16(uint16_t raw) {
   return Element::bitcast(raw);
@@ -624,6 +549,21 @@ uint64_t scale_pack4(uint64_t raw, float scale) {
   return out;
 }
 
+// Same contract as scale_pack4 for the two elements packed in one dword, which
+// is the unit the subgroup block load/store of the wide path below moves.
+template <typename Element>
+CUTLASS_DEVICE
+uint32_t scale_pack2(uint32_t raw, float scale) {
+  uint32_t out = 0;
+#pragma unroll
+  for (int lane = 0; lane < 2; ++lane) {
+    uint16_t in_bits = static_cast<uint16_t>(raw >> (16 * lane));
+    uint16_t out_bits = float_to_raw16<Element>(raw16_to_float<Element>(in_bits) * scale);
+    out |= static_cast<uint32_t>(out_bits) << (16 * lane);
+  }
+  return out;
+}
+
 // bf16 round-trip of an fp32 intermediate. The software path below is four
 // integer ops per value; on device the same RNE rounding is a single hardware
 // convert pair, which is worth 8% of a decode launch because the fused-tau path
@@ -637,33 +577,142 @@ inline float bf16_round_trip(float value) {
 #endif
 }
 
+// Both row paths address whole 16 B packs, so they share one alignment test.
+template <typename Element>
+bool row_is_pack_aligned(RowParams<Element> const& params) {
+  return (params.inner % kRowPackElems == 0) &&
+      (params.stride % kRowPackElems == 0) &&
+      (reinterpret_cast<std::uintptr_t>(params.x) % kRowPackBytes == 0) &&
+      (reinterpret_cast<std::uintptr_t>(params.out) % kRowPackBytes == 0);
+}
+
+template <typename Element, bool HasTau>
+class RowWideKernel;
+
+// Wide row path. Both helpers are pure streaming, so the only thing that decides
+// their throughput is the width of the memory messages IGC emits, and reaching
+// the widest ones from plain SYCL needs three things at once:
+//
+//   1. sycl::ext::oneapi::experimental::group_load/group_store rather than
+//      per-work-item vector loads. A per-lane sycl::vec<uint32_t,4> lands as a
+//      16 B-per-lane access with a 64 B lane stride, i.e. a strided gather whose
+//      message footprint is 4x the bytes it uses.
+//   2. data_placement_striped. Under the default *blocked* placement the
+//      extension's own legality test (BlockInfo::has_builtin) computes the block
+//      size as sizeof(word) * words_per_lane and requires it to be <= 8, so
+//      kRowWideWords = 4 dwords per lane (16 B) is rejected and the call
+//      silently falls back to a per-lane gather plus scalar scatter. Striped
+//      placement makes the block size one dword and the block count the lane
+//      width instead, which is the shape the intel_sub_group_block_read
+//      builtins take. full_group and contiguous_memory are also required by
+//      that test, and a 16 B alignment is required for the store side.
+//   3. A (row, lane) launch geometry, so the row index is a launch coordinate
+//      instead of a runtime division by lanes-per-row. The same division was
+//      measured to be the T=1 bottleneck of this file's rel_proj kernel.
+//
+// Placement direction is not observable in the results: it only permutes which
+// lane holds which dword of the chunk, the load and the store agree on that
+// permutation, and tau is a per-row scalar, so every element of a chunk is
+// scaled by the same value whichever lane it lands in.
+template <typename Element, bool HasTau>
+sycl::event launch_row_kernel_wide(
+    sycl::queue& queue,
+    RowParams<Element> const& params,
+    int chunks_per_row) {
+  namespace syclex = sycl::ext::oneapi::experimental;
+  // The alignment property is a promise, not a check: the extension skips its
+  // own pointer test once the property is at least the alignment the block
+  // store needs, so a misaligned pointer would be UB rather than a fallback.
+  // Spell it as kRowPackBytes so it stays tied to the constant that
+  // row_is_pack_aligned actually verifies below.
+  constexpr auto kBlockProps = syclex::properties{
+      syclex::data_placement_striped,
+      syclex::full_group,
+      syclex::contiguous_memory,
+      syclex::alignment<kRowPackBytes>};
+
+  RowParams<Element> launch_params = params;
+  int lanes_per_row = chunks_per_row * kRowWideSubgroup;
+
+  // A row shorter than a work-group must share the group with other rows rather
+  // than pad it: a (1, kDefaultBlock) group on the 512 B rows of perf_64k_x256
+  // leaves 2 of its 16 subgroups doing work and measured 279 GB/s against 396
+  // for the same kernel on rows that fill the group. Take the widest whole
+  // divisor of lanes_per_row that still fits a group, so no lane is padded in
+  // either dimension, and fill the rest of the group with more rows. The step of
+  // kRowWideSubgroup keeps every subgroup inside one row, which the row-uniform
+  // tau load and the group-wide block io both require.
+  int lanes_per_group = std::min(lanes_per_row, kDefaultBlock);
+  lanes_per_group -= lanes_per_group % kRowWideSubgroup;
+  while (lanes_per_row % lanes_per_group != 0) {
+    lanes_per_group -= kRowWideSubgroup;
+  }
+  int rows_per_group = std::max(1, kDefaultBlock / lanes_per_group);
+  int global_rows = round_up(launch_params.rows, rows_per_group);
+
+  return queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<RowWideKernel<Element, HasTau>>(
+        sycl::nd_range<2>(
+            sycl::range<2>(
+                static_cast<std::size_t>(global_rows),
+                static_cast<std::size_t>(lanes_per_row)),
+            sycl::range<2>(
+                static_cast<std::size_t>(rows_per_group),
+                static_cast<std::size_t>(lanes_per_group))),
+        [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(kRowWideSubgroup)]] {
+          int row = static_cast<int>(item.get_global_id(0));
+          if (row >= launch_params.rows) {
+            return;
+          }
+          // kRowWideSubgroup is a power of two, so this shifts rather than
+          // divides; dim 1 is exactly lanes_per_row wide, so every chunk index
+          // it produces is in range.
+          int chunk = static_cast<int>(item.get_global_id(1)) / kRowWideSubgroup;
+          uint32_t const* src = reinterpret_cast<uint32_t const*>(
+              launch_params.x + static_cast<int64_t>(row) * launch_params.stride) +
+              chunk * kRowWideChunkWords;
+          uint32_t* dst = reinterpret_cast<uint32_t*>(
+              launch_params.out + static_cast<int64_t>(row) * launch_params.inner) +
+              chunk * kRowWideChunkWords;
+
+          // Decorated global pointers keep the extension on its block-io path
+          // without a generic-address-space dynamic_address_cast and the dead
+          // local-memory fallback that comes with it.
+          auto src_global = sycl::address_space_cast<
+              sycl::access::address_space::global_space,
+              sycl::access::decorated::yes>(src);
+          auto dst_global = sycl::address_space_cast<
+              sycl::access::address_space::global_space,
+              sycl::access::decorated::yes>(dst);
+
+          uint32_t words[kRowWideWords];
+          syclex::group_load(
+              item.get_sub_group(),
+              src_global.get_decorated(),
+              sycl::span<uint32_t, kRowWideWords>{words},
+              kBlockProps);
+          if constexpr (HasTau) {
+            float scale = launch_params.tau[row];
+#pragma unroll
+            for (int i = 0; i < kRowWideWords; ++i) {
+              words[i] = scale_pack2<Element>(words[i], scale);
+            }
+          }
+          syclex::group_store(
+              item.get_sub_group(),
+              sycl::span<uint32_t const, kRowWideWords>{words},
+              dst_global.get_decorated(),
+              kBlockProps);
+        });
+  });
+}
+
 template <typename Element, bool HasTau, int Vec>
 sycl::event launch_row_kernel_static(sycl::queue& queue, RowParams<Element> const& params) {
   static_assert(Vec % kRowPackElems == 0, "row lane must contain whole 16B packs");
   constexpr int kPacksPerLane = Vec / kRowPackElems;
   RowParams<Element> launch_params = params;
-  bool aligned = (params.inner % kRowPackElems == 0) &&
-      (params.stride % kRowPackElems == 0) &&
-      (reinterpret_cast<std::uintptr_t>(params.x) % kRowPackBytes == 0) &&
-      (reinterpret_cast<std::uintptr_t>(params.out) % kRowPackBytes == 0);
-  int row_bytes = params.inner * static_cast<int>(sizeof(Element));
-  int row_words = row_bytes / static_cast<int>(sizeof(uint32_t));
-  if constexpr (!HasTau) {
-    if (params.rows >= kRowEsimdMinRows &&
-        aligned &&
-        row_bytes % static_cast<int>(sizeof(uint32_t)) == 0 &&
-        row_words % kRowEsimdCopyWords == 0) {
-      return launch_row_compact_esimd<Element>(queue, params, row_words / kRowEsimdCopyWords);
-    }
-  }
-  if constexpr (HasTau && std::is_same_v<Element, cutlass::bfloat16_t>) {
-    if (params.rows >= kRowEsimdMinRows &&
-        aligned &&
-        row_bytes % static_cast<int>(sizeof(uint32_t)) == 0 &&
-        row_words % kRowEsimdCopyWords == 0) {
-      return launch_row_scale_bf16_esimd(queue, params, row_words / kRowEsimdCopyWords);
-    }
-  }
+  bool aligned = row_is_pack_aligned(params);
   launch_params.vec_count = aligned ? params.inner / Vec : 0;
   int scalar_tail = params.inner - launch_params.vec_count * Vec;
   launch_params.lanes_per_row = launch_params.vec_count + scalar_tail;
@@ -728,6 +777,14 @@ sycl::event launch_row_kernel(sycl::queue& queue, RowParams<Element> const& para
   int logical_work_items = params.rows * ceil_div(params.inner, kRowPackElems);
   if (logical_work_items <= kRowSmallWorkItemsThreshold) {
     return launch_row_kernel_static<Element, HasTau, kRowSmallLaneElems>(queue, params);
+  }
+  // The wide path only covers rows that are a whole number of subgroup chunks;
+  // the lane path below still covers every other shape, and above the small
+  // threshold there is always enough work to fill the machine either way.
+  int row_bytes = params.inner * static_cast<int>(sizeof(Element));
+  if (row_bytes % kRowWideChunkBytes == 0 && row_is_pack_aligned(params)) {
+    return launch_row_kernel_wide<Element, HasTau>(
+        queue, params, row_bytes / kRowWideChunkBytes);
   }
   return launch_row_kernel_static<Element, HasTau, kRowLargeLaneElems>(queue, params);
 }
