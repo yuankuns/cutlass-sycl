@@ -5,7 +5,7 @@ Standalone CUTLASS SYCL examples for Inkling `06_comm_ar_sconv`.
 Targets:
 
 - `19_bmg_all_reduce_variants`: two-shot, full one-shot, push one-shot, and direct staged all-reduce semantics.
-- `19_bmg_ar_fused_decode`: fused decode all-reduce, SConv cache update, residual add, and RMSNorm.
+- `19_bmg_ar_fused_decode`: the two fused all-reduce + SConv + add-RMSNorm kernels. `inkling_ar_sconv_norm` (decode: one row per sequence, cache shift-update) and `inkling_ar_sconv_norm_verify` (target verify: `draft_token_num` rows per sequence, causal conv along the draft-token axis, cache read-only, per-position windows written to `inter_out`). Suites: `quick`, `stress`, `inkling` (shipped Inkling verify shapes), `perf`.
 - `19_bmg_ar_scattered_sconv`: reduce-scatter/all-gather equivalent fused with causal SConv and local cache update.
 - `19_bmg_xpu_collective_mapping`: XPU collective mapping contract for direct reduce and shard/gather round trip.
 
