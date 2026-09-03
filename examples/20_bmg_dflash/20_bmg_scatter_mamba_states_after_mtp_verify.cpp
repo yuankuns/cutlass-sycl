@@ -5,38 +5,63 @@
 
 #include "20_bmg_dflash_common.hpp"
 
+#include <numeric>
+
 namespace dflash = cutlass::examples::bmg_dflash;
 
 namespace {
 
+// Mirrors sglang's scatter_mamba_states_after_mtp_verify (see
+// python/sglang/kernels/ops/mamba/mamba_state_scatter_triton.py:685) for one
+// conv stream:
+//   dst[slots[r]]            <- intermediate[r, steps[r]]
+// The *source* row is the request ordinal `r` (the intermediate conv-window
+// cache is [layers, spec_state_size + 1, draft_token_num, W-1, dim], indexed by
+// batch row), while the *destination* row is the pool slot from
+// dst_indices_raw. That asymmetry is explicit in the Triton kernels:
+// `src_idx = pid_req` / `dst_idx = tl.load(dst_indices_raw_ptr + pid_req)`
+// (mamba_state_scatter_triton.py:356-358) and, in the fused multi-stream
+// kernel, `src_idx = tl.where(is2, off2, off1)` with `off2 = pid_req - n1`
+// (mamba_state_scatter_triton.py:497-505) -- i.e. the optional second
+// (interval-crossing "track") index set restarts the source ordinal at 0, which
+// is why the two passes are launched with their own index arrays below.
+//
+// Validity mask, also from the Triton kernels (mamba_state_scatter_triton.py:355
+// and :507-513): `step < 0` means "no accepted step, leave the slot untouched",
+// plus the range guards dst_idx in [0, dst_req_size), src_idx < src_req_size and
+// step < src_step_size.
 template <typename Element>
 struct ScatterRowsParams {
   Element* dst = nullptr;
   Element const* intermediate = nullptr;
-  int64_t const* slots = nullptr;
-  int64_t const* steps = nullptr;
-  int64_t const* track_slots = nullptr;
-  int64_t const* track_steps = nullptr;
-  int main_count = 0;
-  int track_count = 0;
-  int t_max = 0;
-  int row_elems = 0;
+  int64_t const* slots = nullptr;  // dst_indices_raw: pool slot per request
+  int64_t const* steps = nullptr;  // step_indices_raw: entry >= 0 means valid
+  int count = 0;                   // requests in this pass (n1 or n2)
+  int src_rows = 0;                // intermediate request rows (spec_state_size + 1)
+  int dst_slots = 0;               // persistent-state pool slots (size + 1)
+  int t_max = 0;                   // draft_token_num
+  int row_elems = 0;               // (W-1) * dim for a conv stream
 };
 
+// Returns false for a masked-out or out-of-range request (nothing is written).
 template <typename Element>
 CUTLASS_DEVICE
-void scatter_request(ScatterRowsParams<Element> const& params,
-                     int request,
-                     int64_t& slot,
-                     int64_t& step) {
-  if (request < params.main_count) {
-    slot = params.slots[request];
-    step = params.steps[request];
-  } else {
-    int t = request - params.main_count;
-    slot = params.track_slots[t];
-    step = params.track_steps[t];
+bool scatter_row_bases(ScatterRowsParams<Element> const& params,
+                       int request,
+                       int64_t& dst_base,
+                       int64_t& src_base) {
+  int64_t step = params.steps[request];
+  if (step < 0) {
+    return false;
   }
+  int64_t slot = params.slots[request];
+  bool in_range = slot >= 0 && slot < params.dst_slots && request < params.src_rows && step < params.t_max;
+  if (!in_range) {
+    return false;
+  }
+  dst_base = slot * params.row_elems;
+  src_base = (static_cast<int64_t>(request) * params.t_max + step) * params.row_elems;
+  return true;
 }
 
 template <typename Element>
@@ -45,8 +70,7 @@ class ScatterRowsScalarKernel {
   explicit ScatterRowsScalarKernel(ScatterRowsParams<Element> params) : params_(params) {}
 
   void operator()(sycl::nd_item<1> item) const {
-    int64_t total_requests = static_cast<int64_t>(params_.main_count) + params_.track_count;
-    int64_t total_lanes = total_requests * params_.row_elems;
+    int64_t total_lanes = static_cast<int64_t>(params_.count) * params_.row_elems;
     int64_t lane = static_cast<int64_t>(item.get_global_id(0));
     if (lane >= total_lanes) {
       return;
@@ -54,15 +78,11 @@ class ScatterRowsScalarKernel {
     int request = static_cast<int>(lane / params_.row_elems);
     int elem = static_cast<int>(lane - static_cast<int64_t>(request) * params_.row_elems);
 
-    int64_t slot = 0;
-    int64_t step = -1;
-    scatter_request(params_, request, slot, step);
-    if (step < 0) {
+    int64_t dst_base = 0;
+    int64_t src_base = 0;
+    if (!scatter_row_bases(params_, request, dst_base, src_base)) {
       return;
     }
-
-    int64_t dst_base = slot * params_.row_elems;
-    int64_t src_base = (slot * params_.t_max + step) * params_.row_elems;
     params_.dst[dst_base + elem] = params_.intermediate[src_base + elem];
   }
 
@@ -80,8 +100,7 @@ class ScatterRowsPackKernel {
 
   void operator()(sycl::nd_item<1> item) const {
     int packs_per_row = params_.row_elems / kPackElems;
-    int64_t total_requests = static_cast<int64_t>(params_.main_count) + params_.track_count;
-    int64_t total_lanes = total_requests * packs_per_row;
+    int64_t total_lanes = static_cast<int64_t>(params_.count) * packs_per_row;
     int64_t lane = static_cast<int64_t>(item.get_global_id(0));
     if (lane >= total_lanes) {
       return;
@@ -89,15 +108,11 @@ class ScatterRowsPackKernel {
     int request = static_cast<int>(lane / packs_per_row);
     int pack = static_cast<int>(lane - static_cast<int64_t>(request) * packs_per_row);
 
-    int64_t slot = 0;
-    int64_t step = -1;
-    scatter_request(params_, request, slot, step);
-    if (step < 0) {
+    int64_t dst_base = 0;
+    int64_t src_base = 0;
+    if (!scatter_row_bases(params_, request, dst_base, src_base)) {
       return;
     }
-
-    int64_t dst_base = slot * params_.row_elems;
-    int64_t src_base = (slot * params_.t_max + step) * params_.row_elems;
     auto* dst_pack = reinterpret_cast<Pack*>(params_.dst + dst_base);
     auto const* src_pack = reinterpret_cast<Pack const*>(params_.intermediate + src_base);
     dst_pack[pack] = src_pack[pack];
@@ -130,17 +145,27 @@ sycl::event submit_1d(sycl::queue& queue, int64_t lanes, Kernel const& kernel) {
 
 template <typename Element>
 sycl::event launch_scatter_rows_pass(sycl::queue& queue, ScatterRowsParams<Element> const& params) {
-  int64_t requests = static_cast<int64_t>(params.main_count) + params.track_count;
-  if (requests <= 0 || params.row_elems <= 0) {
+  if (params.count <= 0 || params.row_elems <= 0) {
     return {};
   }
   if (can_use_pack_path(params)) {
     constexpr int kPackElems = dflash::kCopyPackBytes / static_cast<int>(sizeof(Element));
-    int64_t lanes = requests * (params.row_elems / kPackElems);
+    int64_t lanes = static_cast<int64_t>(params.count) * (params.row_elems / kPackElems);
     return submit_1d(queue, lanes, ScatterRowsPackKernel<Element>(params));
   }
-  return submit_1d(queue, requests * params.row_elems, ScatterRowsScalarKernel<Element>(params));
+  return submit_1d(queue, static_cast<int64_t>(params.count) * params.row_elems,
+                   ScatterRowsScalarKernel<Element>(params));
 }
+
+// The accept commit plus the optional interval-crossing track pass. The real op
+// runs them as two request-index sets over the same source buffer (one fused
+// launch in fused_conv_window_scatter_multi, two launches in the per-stream
+// fallback fused_conv_window_scatter_with_mask).
+template <typename Element>
+struct ScatterPasses {
+  ScatterRowsParams<Element> main;
+  ScatterRowsParams<Element> track;
+};
 
 struct ScatterLaunchEvents {
   sycl::event events[2];
@@ -148,25 +173,13 @@ struct ScatterLaunchEvents {
 };
 
 template <typename Element>
-ScatterLaunchEvents launch_scatter_rows(sycl::queue& queue, ScatterRowsParams<Element> const& params) {
+ScatterLaunchEvents launch_scatter_rows(sycl::queue& queue, ScatterPasses<Element> const& passes) {
   ScatterLaunchEvents launched;
-  ScatterRowsParams<Element> main_params = params;
-  main_params.track_count = 0;
-  main_params.track_slots = nullptr;
-  main_params.track_steps = nullptr;
-  if (main_params.main_count > 0) {
-    launched.events[launched.count++] = launch_scatter_rows_pass(queue, main_params);
+  if (passes.main.count > 0) {
+    launched.events[launched.count++] = launch_scatter_rows_pass(queue, passes.main);
   }
-
-  if (params.track_count > 0) {
-    ScatterRowsParams<Element> track_params = params;
-    track_params.slots = params.track_slots;
-    track_params.steps = params.track_steps;
-    track_params.main_count = params.track_count;
-    track_params.track_count = 0;
-    track_params.track_slots = nullptr;
-    track_params.track_steps = nullptr;
-    launched.events[launched.count++] = launch_scatter_rows_pass(queue, track_params);
+  if (passes.track.count > 0) {
+    launched.events[launched.count++] = launch_scatter_rows_pass(queue, passes.track);
   }
   return launched;
 }
@@ -201,6 +214,9 @@ struct ScatterCase {
   int main_count = 3;
   int track_count = 2;
   double target_gbps = 0.0;
+  // Request rows in the intermediate window cache; 0 derives it from the
+  // request counts. A smaller value exercises the src_idx < src_req_size guard.
+  int src_rows = 0;
 };
 
 template <typename Element>
@@ -218,7 +234,15 @@ struct ScatterHost {
   std::vector<int64_t> steps;
   std::vector<int64_t> track_slots;
   std::vector<int64_t> track_steps;
+  int src_rows = 0;
 };
+
+// Request rows in the intermediate conv-window cache. The real buffer is
+// [layers, spec_state_size + 1, draft_token_num, W-1, dim]: sized by the
+// speculative batch, not by the conv-state pool.
+int intermediate_rows(ScatterCase const& cfg) {
+  return cfg.src_rows > 0 ? cfg.src_rows : std::max(cfg.main_count, cfg.track_count);
+}
 
 ScatterCase custom_default() {
   ScatterCase cfg;
@@ -231,6 +255,10 @@ std::vector<ScatterCase> quick_suite() {
       {"reference_small_t3_d5", 4, 3, 5, 2, 3, 6, 3, 2, 0.0},
       {"tail_rows_t5_d19", 17, 5, 19, 3, 4, 13, 11, 5, 0.0},
       {"aligned_pack_bf16_like", 64, 7, 128, 3, 3, 256, 41, 13, 0.0},
+      // Covers every branch of the validity mask: a negative step, a step past
+      // draft_token_num, an out-of-range destination slot, and (via src_rows=2)
+      // a request ordinal past the intermediate cache's request rows.
+      {"masked_out_of_range", 4, 3, 5, 2, 3, 6, 4, 2, 0.0, 2},
   };
 }
 
@@ -242,50 +270,148 @@ std::vector<ScatterCase> stress_suite() {
   };
 }
 
-std::vector<ScatterCase> perf_suite() {
-  return {
-      {"perf_b4096_d1536_w3", 8192, 9, 1536, 3, 3, 1536, 4096, 1024, 350.0},
-      {"perf_b8192_d768_w3", 16384, 9, 768, 3, 3, 768, 8192, 2048, 350.0},
-  };
+// Inkling conv-state geometry, from InklingModelConfig.mamba2_cache_params
+// (python/sglang/srt/configs/inkling.py:215-252). Per layer it allocates SIX
+// conv streams, each (sconv_kernel_size - 1, dim) in bf16:
+//   K_FULL, V_FULL    dim = max(1, num_key_value_heads / tp) * head_dim
+//   K_LOCAL, V_LOCAL  dim = max(1, swa_num_key_value_heads / tp) * swa_head_dim
+//   ATTN, MLP         dim = hidden_size, or hidden_size / tp under
+//                           --enable-scattered-sconv (inkling.py:231-237)
+// and temporal=(0, 0, 0) (inkling.py:248) -- Inkling has NO SSM state, so
+// scatter_mamba_states_after_mtp_verify skips the temporal scatter entirely
+// (mamba_state_scatter_triton.py:696). d_ssm is therefore kept at 1: the
+// memory-bound work is the conv-row copies.
+//
+// A case carries two conv streams (conv_a, conv_b) of equal width, so one case
+// models one (K, V) / (ATTN, MLP) *pair* at one tp: three cases cover all six
+// streams of a layer. width_a = width_b = W-1 = 3.
+constexpr int kSconvKernelSize = 4;                        // inkling.py:52
+constexpr int kConvLen = kSconvKernelSize - 1;             // W-1 rows per conv state
+// draft_token_num = num_nextn_predict_layers + 1: 3 for the shipped checkpoint
+// (num_nextn_predict_layers 2), 9 for production (8).
+constexpr int kDraftTokensCheckpoint = 3;
+constexpr int kDraftTokensProduction = 9;
+
+struct InklingConvConfig {
+  char const* tag;
+  int hidden;
+  int num_kv_heads;
+  int head_dim;
+  int swa_num_kv_heads;
+  int swa_head_dim;
+};
+
+// hidden 768 is the shipped checkpoint, 1536 the config defaults, 6144
+// production. head_dim = hidden_size / num_attention_heads = 128 in all three
+// (Nq 8 / 12 / 48); swa_* default to the full-attention values when unset
+// (inkling.py:82-85), which the checkpoint overrides with swa kv heads 4.
+constexpr InklingConvConfig kInklingConvConfigs[] = {
+    {"h768", 768, 2, 128, 4, 128},
+    {"h1536", 1536, 4, 128, 4, 128},
+    {"h6144", 6144, 4, 128, 4, 128},
+};
+
+constexpr int kInklingTpSizes[] = {1, 2, 4, 8};
+
+// inkling.py:222-224 tp_local_kv_conv_dim
+int tp_local_kv_conv_dim(int num_kv_heads, int head_dim, int tp) {
+  return std::max(1, num_kv_heads / tp) * head_dim;
 }
 
-// Inkling suite: DFLASH target-verify commit copies rows of the per-layer
-// mamba2 conv cache. sconv_kernel_size-1 is 3, so each conv row spans
-// (K-1) * D bytes. Row-D follows InklingModelConfig.mamba2_cache_params:
-//   kv_conv  = head_dim * max(1, num_kv_heads/tp)  → {512,256,128,128}
-//              for TP=1/2/4/8 (head_dim=128, num_kv_heads=4).
-//   stream   = hidden_size (non-scattered) or hidden_size/tp (scattered).
-// Inkling has no temporal SSM cache (temporal=(0,0,0)), so d_ssm is kept
-// small — the memory-bound path is the two conv-row copies. Slots reflect
-// verify pool bands; draft_token_num=9 sets t_max; main/track counts
-// approximate the target-verify + track-slot pass ratio.
-//
-// Each case models one conv-layer type at a given TP: both conv_a and
-// conv_b share d_conv, matching the per-layer conv-state layout. Cases
-// are named _<config>_tp<n>_<layer>D<row-dim>.
+struct ScatterSizing {
+  int slots = 0;
+  int main_count = 0;
+  int track_count = 0;
+};
+
+using SizingFn = ScatterSizing (*)(int dim, int t_max);
+
+// Verify-friendly: a small pool with a handful of accepted + tracked requests.
+ScatterSizing inkling_sizing(int dim, int t_max) {
+  (void)dim;
+  (void)t_max;
+  return {256, 64, 16};
+}
+
+// Perf sizing scales the request count with the stream width so every case
+// moves a comparable working set (tens of MB, i.e. tens of us per launch)
+// instead of degenerating to a launch-latency measurement at dim = 128. The
+// budget also bounds the intermediate window cache at ~42 MB per stream, which
+// keeps the whole 72-case sweep affordable on host and device.
+constexpr int64_t kPerfIntermediateElems = 8 << 20;
+
+ScatterSizing perf_sizing(int dim, int t_max) {
+  int64_t per_row = static_cast<int64_t>(t_max) * kConvLen * dim;
+  int64_t rows = std::min<int64_t>(std::max<int64_t>(kPerfIntermediateElems / per_row, 64), 8192);
+  int main_count = static_cast<int>(rows * 4 / 5);
+  int track_count = static_cast<int>(rows) - main_count;
+  return {2 * static_cast<int>(rows), main_count, track_count};
+}
+
+// One case per conv-stream pair, per tp, per draft_token_num band.
+// `target_gbps` applies to every generated case; 0.0 is report-only.
+std::vector<ScatterCase> inkling_conv_cases(SizingFn sizing, double target_gbps) {
+  std::vector<ScatterCase> cases;
+  for (InklingConvConfig const& cfg : kInklingConvConfigs) {
+    for (int tp : kInklingTpSizes) {
+      struct Stream {
+        char const* name;
+        int dim;
+      };
+      // ATTN/MLP use the scattered dim; non-scattered sconv keeps dim =
+      // hidden_size for every tp, i.e. the tp=1 entry of this row.
+      Stream const streams[] = {
+          {"kvfull", tp_local_kv_conv_dim(cfg.num_kv_heads, cfg.head_dim, tp)},
+          {"kvlocal", tp_local_kv_conv_dim(cfg.swa_num_kv_heads, cfg.swa_head_dim, tp)},
+          {"attnmlp", cfg.hidden / tp},
+      };
+      for (int t_max : {kDraftTokensCheckpoint, kDraftTokensProduction}) {
+        for (Stream const& stream : streams) {
+          ScatterSizing const size = sizing(stream.dim, t_max);
+          ScatterCase c;
+          c.name = std::string(cfg.tag) + "_tp" + std::to_string(tp) + "_t" + std::to_string(t_max) + "_" +
+                   stream.name + "D" + std::to_string(stream.dim);
+          c.slots = size.slots;
+          c.t_max = t_max;
+          c.d_ssm = 1;  // temporal=(0,0,0): no SSM state in Inkling
+          c.width_a = kConvLen;
+          c.width_b = kConvLen;
+          c.d_conv = stream.dim;
+          c.main_count = size.main_count;
+          c.track_count = size.track_count;
+          c.target_gbps = target_gbps;
+          cases.push_back(std::move(c));
+        }
+      }
+    }
+  }
+  return cases;
+}
+
 std::vector<ScatterCase> inkling_suite() {
-  return {
-      // hidden_size=1536 (config defaults) kv_conv layers.
-      {"cfg_h1536_tp1_kvD512",   512, 9, 1, 3, 3,  512, 128, 16, 0.0},
-      {"cfg_h1536_tp2_kvD256",   512, 9, 1, 3, 3,  256, 128, 16, 0.0},
-      {"cfg_h1536_tp4_kvD128",   512, 9, 1, 3, 3,  128, 128, 16, 0.0},
-      {"cfg_h1536_tp8_kvD128",   512, 9, 1, 3, 3,  128, 128, 16, 0.0},
-      // hidden_size=1536 stream-conv layers (scattered sconv / non-scattered).
-      {"cfg_h1536_tp1_streamD1536", 512, 9, 1, 3, 3, 1536, 128, 16, 0.0},
-      {"cfg_h1536_tp2_streamD768",  512, 9, 1, 3, 3,  768, 128, 16, 0.0},
-      {"cfg_h1536_tp4_streamD384",  512, 9, 1, 3, 3,  384, 128, 16, 0.0},
-      {"cfg_h1536_tp8_streamD192",  512, 9, 1, 3, 3,  192, 128, 16, 0.0},
-      // hidden_size=6144 (production) kv_conv layers.
-      {"prod_h6144_tp1_kvD512",  256, 9, 1, 3, 3,  512,  96, 12, 0.0},
-      {"prod_h6144_tp2_kvD256",  256, 9, 1, 3, 3,  256,  96, 12, 0.0},
-      {"prod_h6144_tp4_kvD128",  256, 9, 1, 3, 3,  128,  96, 12, 0.0},
-      {"prod_h6144_tp8_kvD128",  256, 9, 1, 3, 3,  128,  96, 12, 0.0},
-      // hidden_size=6144 stream-conv layers.
-      {"prod_h6144_tp1_streamD6144", 256, 9, 1, 3, 3, 6144, 96, 12, 0.0},
-      {"prod_h6144_tp2_streamD3072", 256, 9, 1, 3, 3, 3072, 96, 12, 0.0},
-      {"prod_h6144_tp4_streamD1536", 256, 9, 1, 3, 3, 1536, 96, 12, 0.0},
-      {"prod_h6144_tp8_streamD768",  256, 9, 1, 3, 3,  768, 96, 12, 0.0},
+  return inkling_conv_cases(inkling_sizing, 0.0);
+}
+
+std::vector<ScatterCase> perf_suite() {
+  // Re-calibrated from 350.0: on B60 the slowest measured points are 338.9 GB/s
+  // (perf_b8192_d768_w3, bf16) and 346.4 GB/s (perf_b4096_d1536_w3, bf16) over
+  // 3x50 iterations, so 350.0 was already missed at bf16/fp16 even before the
+  // source-row indexing fix (see ScatterRowsParams). 300.0 keeps ~11% headroom.
+  std::vector<ScatterCase> cases = {
+      {"perf_b4096_d1536_w3", 8192, 9, 1536, 3, 3, 1536, 4096, 1024, 300.0},
+      {"perf_b8192_d768_w3", 16384, 9, 768, 3, 3, 768, 8192, 2048, 300.0},
   };
+  // The real conv-stream widths at every tp and both draft_token_num bands.
+  // Report-only (0.0) gates: these shapes are new and uncalibrated on BMG, and
+  // a guessed number would flake CI (same convention as
+  // examples/17_bmg_relative_attention_backend). Their working sets are also
+  // small enough to sit in L2 (measured 410-650 GB/s on a B60, i.e. above the
+  // part's DRAM ceiling), so the numbers compare stream widths against each
+  // other rather than against sustained DRAM bandwidth.
+  std::vector<ScatterCase> conv_cases = inkling_conv_cases(perf_sizing, 0.0);
+  cases.insert(cases.end(), std::make_move_iterator(conv_cases.begin()),
+               std::make_move_iterator(conv_cases.end()));
+  return cases;
 }
 
 std::vector<ScatterCase> make_suite(std::string const& suite) {
@@ -311,21 +437,34 @@ void fill_pattern(std::vector<Element>& values, int salt) {
   }
 }
 
+// Smallest stride >= seed that is coprime with `modulus`, so that
+// i -> (i * stride + c) % modulus is injective for i < modulus.
+int coprime_stride(int seed, int modulus) {
+  int stride = std::max(1, seed);
+  while (std::gcd(stride, modulus) != 1) {
+    ++stride;
+  }
+  return stride;
+}
+
+// CPU reference for one request-index set; `i` is the source request ordinal.
 template <typename Element>
 void apply_reference_pass(std::vector<Element>& dst,
                           std::vector<Element> const& intermediate,
                           std::vector<int64_t> const& slots,
                           std::vector<int64_t> const& steps,
                           int t_max,
-                          int row_elems) {
+                          int row_elems,
+                          int src_rows,
+                          int dst_slots) {
   for (std::size_t i = 0; i < slots.size(); ++i) {
     int64_t step = steps[i];
-    if (step < 0) {
+    int64_t slot = slots[i];
+    if (step < 0 || step >= t_max || slot < 0 || slot >= dst_slots || static_cast<int64_t>(i) >= src_rows) {
       continue;
     }
-    int64_t slot = slots[i];
     std::size_t dst_base = static_cast<std::size_t>(slot) * row_elems;
-    std::size_t src_base = (static_cast<std::size_t>(slot) * t_max + static_cast<std::size_t>(step)) * row_elems;
+    std::size_t src_base = (i * static_cast<std::size_t>(t_max) + static_cast<std::size_t>(step)) * row_elems;
     std::copy(intermediate.begin() + static_cast<std::ptrdiff_t>(src_base),
               intermediate.begin() + static_cast<std::ptrdiff_t>(src_base + row_elems),
               dst.begin() + static_cast<std::ptrdiff_t>(dst_base));
@@ -337,13 +476,15 @@ ScatterHost<Element> initialize_case(ScatterCase const& cfg) {
   ScatterHost<Element> h;
   int conv_a_elems = cfg.width_a * cfg.d_conv;
   int conv_b_elems = cfg.width_b * cfg.d_conv;
+  h.src_rows = intermediate_rows(cfg);
+  std::size_t src_windows = static_cast<std::size_t>(h.src_rows) * cfg.t_max;
 
   h.ssm_states.resize(static_cast<std::size_t>(cfg.slots) * cfg.d_ssm);
-  h.ssm_intermediate.resize(static_cast<std::size_t>(cfg.slots) * cfg.t_max * cfg.d_ssm);
+  h.ssm_intermediate.resize(src_windows * cfg.d_ssm);
   h.conv_a_states.resize(static_cast<std::size_t>(cfg.slots) * conv_a_elems);
-  h.conv_a_intermediate.resize(static_cast<std::size_t>(cfg.slots) * cfg.t_max * conv_a_elems);
+  h.conv_a_intermediate.resize(src_windows * conv_a_elems);
   h.conv_b_states.resize(static_cast<std::size_t>(cfg.slots) * conv_b_elems);
-  h.conv_b_intermediate.resize(static_cast<std::size_t>(cfg.slots) * cfg.t_max * conv_b_elems);
+  h.conv_b_intermediate.resize(src_windows * conv_b_elems);
 
   fill_pattern(h.ssm_states, 3);
   fill_pattern(h.ssm_intermediate, 5);
@@ -362,13 +503,26 @@ ScatterHost<Element> initialize_case(ScatterCase const& cfg) {
     h.steps = {1, -1, 2};
     h.track_slots = {1, 3};
     h.track_steps = {0, 2};
+  } else if (cfg.name == "masked_out_of_range") {
+    // request 0 copies; 1 has step < 0; 2 has step >= t_max; 3 is past src_rows
+    // (= 2) and also names a slot past the pool.
+    h.slots = {1, 2, 3, static_cast<int64_t>(cfg.slots)};
+    h.steps = {0, -1, cfg.t_max, 1};
+    h.track_slots = {0, 2};
+    h.track_steps = {2, -1};
   } else {
+    // Both index sets must stay injective: duplicate destination slots inside
+    // one pass would race between work items and make verify nondeterministic
+    // (the real op's slot ids are distinct requests). A stride coprime with the
+    // pool size keeps the walk scattered but collision-free.
+    int const main_stride = coprime_stride(7, cfg.slots);
+    int const track_stride = coprime_stride(13, cfg.slots);
     for (int i = 0; i < cfg.main_count; ++i) {
-      h.slots[i] = (i * 7 + 2) % cfg.slots;
+      h.slots[i] = (static_cast<int64_t>(i) * main_stride + 2) % cfg.slots;
       h.steps[i] = (i % 11 == 3) ? -1 : ((i * 5 + 1) % cfg.t_max);
     }
     for (int i = 0; i < cfg.track_count; ++i) {
-      h.track_slots[i] = (i * 13 + 1) % cfg.slots;
+      h.track_slots[i] = (static_cast<int64_t>(i) * track_stride + 1) % cfg.slots;
       h.track_steps[i] = (i % 7 == 4) ? -1 : ((i * 3) % cfg.t_max);
     }
   }
@@ -376,20 +530,28 @@ ScatterHost<Element> initialize_case(ScatterCase const& cfg) {
   h.ssm_ref = h.ssm_states;
   h.conv_a_ref = h.conv_a_states;
   h.conv_b_ref = h.conv_b_states;
-  apply_reference_pass(h.ssm_ref, h.ssm_intermediate, h.slots, h.steps, cfg.t_max, cfg.d_ssm);
-  apply_reference_pass(h.conv_a_ref, h.conv_a_intermediate, h.slots, h.steps, cfg.t_max, conv_a_elems);
-  apply_reference_pass(h.conv_b_ref, h.conv_b_intermediate, h.slots, h.steps, cfg.t_max, conv_b_elems);
-  apply_reference_pass(h.ssm_ref, h.ssm_intermediate, h.track_slots, h.track_steps, cfg.t_max, cfg.d_ssm);
-  apply_reference_pass(h.conv_a_ref, h.conv_a_intermediate, h.track_slots, h.track_steps, cfg.t_max, conv_a_elems);
-  apply_reference_pass(h.conv_b_ref, h.conv_b_intermediate, h.track_slots, h.track_steps, cfg.t_max, conv_b_elems);
+  auto reference_stream = [&](std::vector<Element>& dst, std::vector<Element> const& intermediate, int row_elems) {
+    apply_reference_pass(dst, intermediate, h.slots, h.steps, cfg.t_max, row_elems, h.src_rows, cfg.slots);
+    apply_reference_pass(dst, intermediate, h.track_slots, h.track_steps, cfg.t_max, row_elems, h.src_rows,
+                         cfg.slots);
+  };
+  reference_stream(h.ssm_ref, h.ssm_intermediate, cfg.d_ssm);
+  reference_stream(h.conv_a_ref, h.conv_a_intermediate, conv_a_elems);
+  reference_stream(h.conv_b_ref, h.conv_b_intermediate, conv_b_elems);
 
   return h;
 }
 
-int active_requests(std::vector<int64_t> const& steps) {
+int active_requests(std::vector<int64_t> const& slots,
+                    std::vector<int64_t> const& steps,
+                    int t_max,
+                    int src_rows,
+                    int dst_slots) {
   int count = 0;
-  for (int64_t step : steps) {
-    if (step >= 0) {
+  for (std::size_t i = 0; i < slots.size(); ++i) {
+    int64_t step = steps[i];
+    int64_t slot = slots[i];
+    if (step >= 0 && step < t_max && slot >= 0 && slot < dst_slots && static_cast<int64_t>(i) < src_rows) {
       ++count;
     }
   }
@@ -399,8 +561,13 @@ int active_requests(std::vector<int64_t> const& steps) {
 template <typename Element>
 bool run_case_for_dtype(sycl::queue& queue, ScatterCase const& cfg, dflash::Options const& options) {
   if (cfg.slots <= 0 || cfg.t_max <= 0 || cfg.d_ssm <= 0 || cfg.width_a <= 0 || cfg.width_b <= 0 ||
-      cfg.d_conv <= 0 || cfg.main_count < 0 || cfg.track_count < 0) {
+      cfg.d_conv <= 0 || cfg.main_count < 0 || cfg.track_count < 0 || cfg.src_rows < 0) {
     throw std::runtime_error("invalid scatter case dimensions");
+  }
+  // Each pass writes one row per request, so a pass with more requests than
+  // pool slots could not have distinct destinations (see initialize_case).
+  if (cfg.main_count > cfg.slots || cfg.track_count > cfg.slots) {
+    throw std::runtime_error("scatter case needs slots >= main/track request count");
   }
 
   ScatterHost<Element> h = initialize_case<Element>(cfg);
@@ -429,31 +596,36 @@ bool run_case_for_dtype(sycl::queue& queue, ScatterCase const& cfg, dflash::Opti
   d_track_slots.copy_from(h.track_slots);
   d_track_steps.copy_from(h.track_steps);
 
-  ScatterRowsParams<Element> ssm_params;
-  ssm_params.dst = d_ssm_states.get();
-  ssm_params.intermediate = d_ssm_intermediate.get();
-  ssm_params.slots = d_slots.get();
-  ssm_params.steps = d_steps.get();
-  ssm_params.track_slots = d_track_slots.get();
-  ssm_params.track_steps = d_track_steps.get();
-  ssm_params.main_count = cfg.main_count;
-  ssm_params.track_count = cfg.track_count;
-  ssm_params.t_max = cfg.t_max;
-  ssm_params.row_elems = cfg.d_ssm;
+  ScatterRowsParams<Element> base;
+  base.src_rows = h.src_rows;
+  base.dst_slots = cfg.slots;
+  base.t_max = cfg.t_max;
 
-  ScatterRowsParams<Element> conv_a_params = ssm_params;
-  conv_a_params.dst = d_conv_a_states.get();
-  conv_a_params.intermediate = d_conv_a_intermediate.get();
-  conv_a_params.row_elems = conv_a_elems;
+  auto make_passes = [&](Element* dst, Element const* intermediate, int row_elems) {
+    ScatterPasses<Element> passes;
+    passes.main = base;
+    passes.main.dst = dst;
+    passes.main.intermediate = intermediate;
+    passes.main.slots = d_slots.get();
+    passes.main.steps = d_steps.get();
+    passes.main.count = cfg.main_count;
+    passes.main.row_elems = row_elems;
+    passes.track = passes.main;
+    passes.track.slots = d_track_slots.get();
+    passes.track.steps = d_track_steps.get();
+    passes.track.count = cfg.track_count;
+    return passes;
+  };
 
-  ScatterRowsParams<Element> conv_b_params = ssm_params;
-  conv_b_params.dst = d_conv_b_states.get();
-  conv_b_params.intermediate = d_conv_b_intermediate.get();
-  conv_b_params.row_elems = conv_b_elems;
+  ScatterPasses<Element> ssm_passes = make_passes(d_ssm_states.get(), d_ssm_intermediate.get(), cfg.d_ssm);
+  ScatterPasses<Element> conv_a_passes =
+      make_passes(d_conv_a_states.get(), d_conv_a_intermediate.get(), conv_a_elems);
+  ScatterPasses<Element> conv_b_passes =
+      make_passes(d_conv_b_states.get(), d_conv_b_intermediate.get(), conv_b_elems);
 
-  launch_scatter_rows(queue, ssm_params);
-  launch_scatter_rows(queue, conv_a_params);
-  launch_scatter_rows(queue, conv_b_params);
+  launch_scatter_rows(queue, ssm_passes);
+  launch_scatter_rows(queue, conv_a_passes);
+  launch_scatter_rows(queue, conv_b_passes);
   queue.wait();
 
   bool passed = true;
@@ -478,18 +650,18 @@ bool run_case_for_dtype(sycl::queue& queue, ScatterCase const& cfg, dflash::Opti
   double ms = 0.0;
   if (options.benchmark && options.iterations > 0) {
     for (int i = 0; i < options.warmup; ++i) {
-      launch_scatter_rows(queue, ssm_params);
-      launch_scatter_rows(queue, conv_a_params);
-      launch_scatter_rows(queue, conv_b_params);
+      launch_scatter_rows(queue, ssm_passes);
+      launch_scatter_rows(queue, conv_a_passes);
+      launch_scatter_rows(queue, conv_b_passes);
     }
     queue.wait();
     auto begin = std::chrono::steady_clock::now();
     std::vector<sycl::event> timed_events;
     timed_events.reserve(static_cast<std::size_t>(options.iterations) * 6);
     for (int i = 0; i < options.iterations; ++i) {
-      append_events(timed_events, launch_scatter_rows(queue, ssm_params));
-      append_events(timed_events, launch_scatter_rows(queue, conv_a_params));
-      append_events(timed_events, launch_scatter_rows(queue, conv_b_params));
+      append_events(timed_events, launch_scatter_rows(queue, ssm_passes));
+      append_events(timed_events, launch_scatter_rows(queue, conv_a_passes));
+      append_events(timed_events, launch_scatter_rows(queue, conv_b_passes));
     }
     queue.wait();
     auto end = std::chrono::steady_clock::now();
@@ -500,7 +672,8 @@ bool run_case_for_dtype(sycl::queue& queue, ScatterCase const& cfg, dflash::Opti
     }
   }
 
-  int active = active_requests(h.steps) + active_requests(h.track_steps);
+  int active = active_requests(h.slots, h.steps, cfg.t_max, h.src_rows, cfg.slots) +
+               active_requests(h.track_slots, h.track_steps, cfg.t_max, h.src_rows, cfg.slots);
   double row_elems = static_cast<double>(cfg.d_ssm + conv_a_elems + conv_b_elems);
   double bytes = static_cast<double>(active) * row_elems * sizeof(Element) * 2.0;
   double seconds = ms / 1000.0;
@@ -512,15 +685,16 @@ bool run_case_for_dtype(sycl::queue& queue, ScatterCase const& cfg, dflash::Opti
               << " got=" << gbps << " target=" << target_gbps << "\n";
   }
 
-  bool packed_ssm = can_use_pack_path(ssm_params);
-  bool packed_conv_a = can_use_pack_path(conv_a_params);
-  bool packed_conv_b = can_use_pack_path(conv_b_params);
+  bool packed_ssm = can_use_pack_path(ssm_passes.main);
+  bool packed_conv_a = can_use_pack_path(conv_a_passes.main);
+  bool packed_conv_b = can_use_pack_path(conv_b_passes.main);
   std::cout << "case=" << std::left << std::setw(28) << cfg.name
             << " dtype=" << std::setw(5) << dflash::element_dtype_text<Element>()
             << " slots=" << std::right << std::setw(6) << cfg.slots
             << " tmax=" << std::setw(2) << cfg.t_max
+            << " rows=" << std::setw(6) << h.src_rows
             << " active=" << std::setw(6) << active
-            << " rows=(" << cfg.d_ssm << "," << conv_a_elems << "," << conv_b_elems << ")"
+            << " elems=(" << cfg.d_ssm << "," << conv_a_elems << "," << conv_b_elems << ")"
             << " pack=(" << dflash::bool_text(packed_ssm) << "," << dflash::bool_text(packed_conv_a)
             << "," << dflash::bool_text(packed_conv_b) << ")"
             << " verify=" << dflash::bool_text(!options.verify || passed)
@@ -543,9 +717,13 @@ void print_usage(char const* exe) {
             << "Usage: " << exe << " [--suite=quick|stress|perf|inkling] [--dtype=all|float|bf16|fp16]\n"
             << "       [--shape=slots=4,tmax=3,dssm=5,wa=2,wb=3,dconv=6,main=3,track=2]\n"
             << "       [--iterations=N] [--verify=0|1] [--target-gbps=X]\n"
-            << "\nInkling suite mirrors the per-layer mamba2 conv-cache widths at TP=1/2/4/8:\n"
-            << "kv_conv D = head_dim*max(1,num_kv_heads/tp), stream D = hidden_size/tp\n"
-            << "(hidden 1536 cfg-defaults / 6144 production, sconv_kernel_size-1 = 3).\n";
+            << "\nInkling suite mirrors the six per-layer mamba2 conv streams at TP=1/2/4/8,\n"
+            << "as three (K,V)-style pairs per config x TP x draft_token_num band:\n"
+            << "  kvfull  D = head_dim     * max(1, num_key_value_heads     / tp)\n"
+            << "  kvlocal D = swa_head_dim * max(1, swa_num_key_value_heads / tp)\n"
+            << "  attnmlp D = hidden_size / tp (scattered sconv; non-scattered = tp1 row)\n"
+            << "hidden 768 (checkpoint) / 1536 (config defaults) / 6144 (production),\n"
+            << "sconv_kernel_size-1 = 3 rows, draft_token_num 3 (checkpoint) and 9 (production).\n";
 }
 
 }  // namespace
