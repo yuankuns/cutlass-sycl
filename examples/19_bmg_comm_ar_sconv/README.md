@@ -9,6 +9,20 @@ Targets:
 - `19_bmg_ar_scattered_sconv`: reduce-scatter/all-gather equivalent fused with causal SConv and local cache update.
 - `19_bmg_xpu_collective_mapping`: XPU collective mapping contract for direct reduce and shard/gather round trip.
 
+`19_bmg_ar_scattered_sconv` additionally mirrors the optional modes of the real
+`inkling_ar_scattered_sconv` kernel, each with a CPU reference under `--verify=1`:
+
+- `full_update`: write the replicated full-width `[slots, W-1, hidden]` conv-state
+  cache instead of the column shard, with this rank's columns at `cache_col0 = rank * Hc`.
+- prefix-cache `track`: scatter selected conv rows into a tracking slot, either from the
+  reduced stream (`extend`) or from the post-update conv window (`track_from_cache`, decode).
+- fused add + RMSNorm tail: after the scattered sconv and all-gather, add the residual
+  in place and write the normed hidden to `norm_out`.
+
+`--suite=inkling` sweeps those modes over `world in {1,2,4,8}` x `hidden in {768, 1536, 6144}`
+with `W = 4`. The new `perf` cases for these modes are report-only (`min_GBps = 0.0`)
+because those bands have not been calibrated on this part yet.
+
 These examples model multi-rank communication with multiple buffers on one BMG device. CUDA-only `multimem.ld_reduce/st` and in-kernel cross-GPU barriers are not available in this standalone SYCL environment, so staged-buffer event ordering is used as the XPU fallback boundary.
 
 Build and run inside the required container:
