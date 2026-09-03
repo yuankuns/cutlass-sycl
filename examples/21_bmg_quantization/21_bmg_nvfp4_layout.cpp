@@ -17,7 +17,48 @@ struct Nvfp4Case {
   int m = 1;
   int n = quant::kNvfp4GroupSize;
   double target_gbps = 0.0;
+  // Number of expert slabs stacked in dim 0. The MoE weight tensors are
+  // w13: (E, 2I/P, H) and w2: (E, H, I/P) -- see InklingNvfp4MoEMethod
+  // .create_weights and ModelOptNvFp4FusedMoEMethod.create_weights. The block
+  // scale surface restarts (row padding + swizzle) at every expert, so E is a
+  // real layout parameter and not just a row multiplier. experts == 1 means a
+  // plain 2-D linear weight shard.
+  int experts = 1;
+  // InklingModelOptNvfp4Config.dim1_group_size: 1 when scales_2d is false
+  // (block scales group only along the last axis) and 16 when scales_2d is true
+  // (block_sizes carries a "-2" entry, so scales group over a 16x16 tile).
+  // dim2_group_size is always the NVFP4 group size 16.
+  //
+  // dim1_group_size is read in exactly one place -- InklingNvfp4MoEMethod
+  // .create_weights, which asserts its layer is an InklingBatchDenseMLP, i.e.
+  // the shared experts. Every other quantized weight goes through upstream
+  // ModelOpt, whose scale params have no dim1 grouping:
+  //   ModelOptFp4LinearMethod:      weight_scale (out_per_part, in_per_part/16)
+  //   ModelOptNvFp4FusedMoEMethod:  w13_weight_scale (E, 2I/P, H/16)
+  //                                 w2_weight_scale  (E, H,    I/P/16)
+  // So scale_dim1_group == 16 is only reachable for shared-expert slabs.
+  int scale_dim1_group = 1;
+  // True for the fused gate+up (w13) slab. Whether its per-expert global scale2
+  // widens to (E, 2) depends on which method owns the layer -- see
+  // scale2_columns() below.
+  bool fused_w13 = false;
 };
+
+// Columns of the per-expert global weight scale ("scale2") param.
+//
+// The checkpoint always stores (E,). InklingForCausalLM._ckpt_scale_to_modelopt
+// widens it only when the destination param is 2-D, and the only 2-D scale2
+// param is ModelOpt's w13_weight_scale_2, registered as (E, 2) for gated layers
+// by ModelOptNvFp4FusedMoEMethod.create_weights (column 0 feeds the gate half's
+// alpha, column 1 the up half's -- see _compute_gemm1_alphas).
+//
+// InklingNvfp4MoEMethod -- the shared-expert method, and the only consumer of
+// dim1_group_size -- registers w13_scale2 as torch.empty(num_experts), i.e.
+// (E,). So scale_dim1_group == 16 implies the un-widened (E,) shape even for
+// the fused w13 slab, and the two settings are not independent.
+int scale2_columns(Nvfp4Case const& cfg) {
+  return (cfg.fused_w13 && cfg.scale_dim1_group == 1) ? 2 : 1;
+}
 
 template <typename Element>
 struct Nvfp4Params {
@@ -512,12 +553,194 @@ sycl::event launch_nvfp4_layout(sycl::queue& queue, Nvfp4Params<Element> const& 
   });
 }
 
+// ---------------------------------------------------------------------------
+// Per-expert slabs and the two scales_2d block-scale layouts.
+//
+// InklingModelOptNvfp4Config (models/inkling_common/quantization/config.py)
+// derives two group sizes from the checkpoint's weight-quantizer block_sizes:
+//
+//   dim2_group_size = group_size = 16                (always; the "-1" entry)
+//   dim1_group_size = 16 if scales_2d else 1         (the optional "-2" entry)
+//
+// InklingNvfp4MoEMethod.create_weights -- the shared-expert
+// (InklingBatchDenseMLP) method, which it asserts on entry, and the only reader
+// of dim1_group_size -- then registers, per expert,
+//   w13_scale: (ceil_div(2I/P, dim1_group_size), ceil_div(H,  16))
+//   w2_scale:  (ceil_div(H,    dim1_group_size), ceil_div(I/P, 16))
+//
+// so scales_2d=false gives one FP8 E4M3FN scale per 1x16 row group and
+// scales_2d=true gives one per 16x16 tile. Routed experts and every quantized
+// linear go through upstream ModelOpt instead, which has no dim1 grouping, so
+// the 2-D-group form is reachable only for the shared experts (E = 2).
+//
+// Scale surface layout per expert:
+//   dim1_group == 1  -> the ModelOpt/TRT-LLM swizzle this example already
+//                       models: rows padded to 128, groups padded to 4.
+//   dim1_group == 16 -> plain row-major (ceil_div(m,16), groups) exactly as
+//                       create_weights registers it. swizzle_blockscale is
+//                       defined over a (rows, cols/16) surface and is only
+//                       applied to the 1-D-group form (see
+//                       InklingBatchDenseMLP._build_fp4_linears, which
+//                       reshapes w13_scale assuming dim1 == 2I/P), so the
+//                       2-D-group form stays unswizzled here.
+// ---------------------------------------------------------------------------
+
+template <typename Element, int RowsPerScale>
+class Nvfp4SlabKernel;
+
+class Nvfp4Scale2WidenKernel;
+
+template <typename Element>
+struct Nvfp4SlabParams {
+  Element const* __restrict x = nullptr;
+  uint8_t* __restrict packed = nullptr;
+  uint8_t* __restrict scales = nullptr;
+  int m = 0;
+  int n = 0;
+  int groups = 0;
+  int scale_rows = 0;      // ceil_div(m, RowsPerScale)
+  int rounded_groups = 0;  // only used by the swizzled dim1_group == 1 layout
+  int experts = 1;
+  int64_t input_expert_stride = 0;
+  int64_t packed_expert_stride = 0;
+  int64_t scale_expert_stride = 0;
+  float global_scale = 1.0f;
+  float scale_factor = 1.0f;
+};
+
+template <typename Element, int RowsPerScale>
+sycl::event launch_nvfp4_slab(sycl::queue& queue, Nvfp4SlabParams<Element> const& params) {
+  int64_t blocks_per_expert = static_cast<int64_t>(params.scale_rows) * params.groups;
+  int64_t total = blocks_per_expert * params.experts;
+  constexpr int kWorkgroup = 128;
+  std::size_t global = static_cast<std::size_t>((total + kWorkgroup - 1) / kWorkgroup) *
+      static_cast<std::size_t>(kWorkgroup);
+  return queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<Nvfp4SlabKernel<Element, RowsPerScale>>(
+        sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kWorkgroup)),
+        [=](sycl::nd_item<1> item) {
+          int64_t idx = static_cast<int64_t>(item.get_global_linear_id());
+          if (idx >= total) {
+            return;
+          }
+          int expert = static_cast<int>(idx / blocks_per_expert);
+          int rem = static_cast<int>(idx - static_cast<int64_t>(expert) * blocks_per_expert);
+          int scale_row = rem / params.groups;
+          int group = rem - scale_row * params.groups;
+
+          int row0 = scale_row * RowsPerScale;
+          int rows = RowsPerScale;
+          if constexpr (RowsPerScale > 1) {
+            int remaining = params.m - row0;
+            rows = remaining < RowsPerScale ? remaining : RowsPerScale;
+          }
+          int col0 = group * quant::kNvfp4GroupSize;
+
+          Element const* __restrict xe = params.x + expert * params.input_expert_stride;
+          float max_abs = 0.0f;
+          for (int r = 0; r < rows; ++r) {
+            Element const* __restrict row_ptr =
+                xe + static_cast<int64_t>(row0 + r) * params.n + col0;
+            for (int i = 0; i < quant::kNvfp4GroupSize; ++i) {
+              float v = quant::abs_f(quant::to_float(row_ptr[i]));
+              max_abs = v > max_abs ? v : max_abs;
+            }
+          }
+
+          // Use the exact-reciprocal encoder rather than a device fp32 divide:
+          // icpx compiles the device divide to an approximation, which differs
+          // from the host reference's global_scale / decoded by 1 ULP and flips
+          // E2M1 codes at a rounding boundary. The 1-D fast path above uses the
+          // same helper for the same reason.
+          auto scale = quant::e4m3fn_encode_positive_with_inv_decode(max_abs * params.scale_factor);
+          uint8_t scale_byte = scale.code;
+          float output_scale = params.global_scale * scale.inv_decoded;
+
+          int64_t scale_idx = expert * params.scale_expert_stride;
+          if constexpr (RowsPerScale == 1) {
+            scale_idx += quant::nvfp4_swizzled_scale_index(row0, group, params.rounded_groups);
+          } else {
+            scale_idx += static_cast<int64_t>(scale_row) * params.groups + group;
+          }
+          params.scales[scale_idx] = scale_byte;
+
+          uint8_t* __restrict pe = params.packed + expert * params.packed_expert_stride;
+          for (int r = 0; r < rows; ++r) {
+            Element const* __restrict row_ptr =
+                xe + static_cast<int64_t>(row0 + r) * params.n + col0;
+            int64_t packed_base = (static_cast<int64_t>(row0 + r) * params.n + col0) / 2;
+            for (int i = 0; i < quant::kNvfp4GroupSize; i += 2) {
+              float v0 = quant::clamp_f(quant::to_float(row_ptr[i]) * output_scale,
+                                        -quant::kE2M1Max,
+                                        quant::kE2M1Max);
+              float v1 = quant::clamp_f(quant::to_float(row_ptr[i + 1]) * output_scale,
+                                        -quant::kE2M1Max,
+                                        quant::kE2M1Max);
+              pe[packed_base + i / 2] = quant::pack_e2m1_pair(quant::quantize_e2m1_code(v0),
+                                                              quant::quantize_e2m1_code(v1));
+            }
+          }
+        });
+  });
+}
+
+// Per-expert global ("scale2") widening, mirroring
+// InklingForCausalLM._ckpt_scale_to_modelopt: the checkpoint stores one FP32
+// weight scale per expert, shape (E,). ModelOpt's fused w13 param is (E, 2)
+// -- column 0 feeds the gate half, column 1 the up half (see
+// _compute_gemm1_alphas in layers/quantization/modelopt_quant.py) -- while w2
+// keeps (E,). The activation side stores a single global amax which becomes
+// input_scale = amax / (448.0 * 6.0) broadcast over the param shape.
+struct Nvfp4Scale2Params {
+  float const* __restrict ckpt_scale2 = nullptr;  // (E,)
+  float* __restrict widened = nullptr;            // (E, cols) with cols in {1, 2}
+  float* __restrict alphas = nullptr;             // (E, cols)
+  int experts = 0;
+  int cols = 1;
+  float input_scale = 1.0f;
+};
+
+sycl::event launch_nvfp4_scale2_widen(sycl::queue& queue, Nvfp4Scale2Params const& params) {
+  std::size_t total = static_cast<std::size_t>(params.experts) * params.cols;
+  constexpr int kWorkgroup = 64;
+  std::size_t global = ((total + kWorkgroup - 1) / kWorkgroup) * kWorkgroup;
+  return queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<Nvfp4Scale2WidenKernel>(
+        sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kWorkgroup)),
+        [=](sycl::nd_item<1> item) {
+          std::size_t idx = item.get_global_linear_id();
+          if (idx >= total) {
+            return;
+          }
+          int expert = static_cast<int>(idx) / params.cols;
+          float v = params.ckpt_scale2[expert];
+          params.widened[idx] = v;
+          params.alphas[idx] = params.input_scale * v;
+        });
+  });
+}
+
 std::vector<Nvfp4Case> quick_suite() {
   return {
       {"tiny_reference_layout", 3, 16, 0.0},
       {"row_tail_scale_tail", 90, 48, 0.0},
       {"aligned_128x64", 128, 64, 0.0},
       {"padded_150x80", 150, 80, 0.0},
+      // scales_2d=true (dim1_group_size=16): one FP8 scale per 16x16 tile.
+      // Shared-expert-shaped (experts=2) because that is the only method that
+      // reads dim1_group_size. m=3 and m=90 leave a partial trailing tile,
+      // which the 2-D reduction must clamp to the live rows -- synthetic row
+      // counts, since every real shared-expert slab dim (2I/P and H) is a
+      // multiple of 16, so the clamp is unreachable from the shipped shapes.
+      {"tiny_2d_group_tile", 3, 16, 0.0, 2, 16},
+      {"row_tail_2d_group_tile", 90, 48, 0.0, 2, 16},
+      {"aligned_2d_group_tile", 128, 64, 0.0, 2, 16},
+      // Two expert slabs: the scale surface (and its row padding) restarts per
+      // expert, so a 2-slab case is the smallest shape that catches a missing
+      // per-expert stride. fused_w13=true drives the scale2 model: (E, 2) on
+      // the 1-D (ModelOpt FusedMoE) path, (E,) on the 2-D (shared-expert) one.
+      {"two_expert_slabs_1d", 48, 32, 0.0, 2, 1, true},
+      {"two_expert_slabs_2d", 48, 32, 0.0, 2, 16, true},
   };
 }
 
@@ -606,6 +829,70 @@ std::vector<Nvfp4Case> inkling_suite() {
       {"prod_h6144_tp2_qkvr", 3968, 6144, 0.0},
       {"prod_h6144_tp4_qkvr", 1984, 6144, 0.0},
       {"prod_h6144_tp8_qkvr", 1120, 6144, 0.0},
+      // No scales_2d cases here on purpose: the linears run
+      // ModelOptFp4LinearMethod, whose weight_scale is
+      // (output_size_per_partition, input_size_per_partition / group_size) --
+      // ungrouped in dim 0 regardless of InklingModelOptNvfp4Config.scales_2d.
+      // dim1_group_size reaches only the shared-expert slabs, covered by the
+      // "moe" suite.
+  };
+}
+
+// MoE expert-weight slabs. Shapes come straight from
+// ModelOptNvFp4FusedMoEMethod.create_weights (routed experts) and
+// InklingNvfp4MoEMethod.create_weights (shared experts) with
+// intermediate_size_per_partition = I/P:
+//   w13: (E, 2I/P, H)   packed uint8 (E, 2I/P, H/2)
+//   w2:  (E, H,  I/P)   packed uint8 (E, H,  I/P/2)
+// E = n_routed_experts = 256 for the routed FusedMoE and
+// E = n_shared_experts = 2 for the InklingBatchDenseMLP shared experts.
+// I is 384 in the shipped checkpoint's routed experts and 3072 in production
+// (dense_intermediate_size); H is hidden_size in {768, 1536, 6144}; P is the
+// MoE TP degree in {1, 2, 4, 8}.
+//
+// The full (E, rows, cols) tensors are far larger than device memory at
+// E=256 (e.g. 256 * 6144 * 6144 bf16 = 18 GiB), so the runner quantizes a
+// bounded prefix of the expert dim (see kSlabInputByteBudget) while the
+// per-expert global scale2 widening below and audit_moe_expert_shapes() cover
+// the full E. Every case is a single kernel launch over its expert prefix, so
+// the per-expert scale-surface restart is exercised, not just a row multiplier.
+std::vector<Nvfp4Case> moe_suite() {
+  return {
+      // Routed experts, checkpoint intermediate_size = 384 (E = 256).
+      {"moe_routed_i384_h1536_tp1_w13", 768, 1536, 0.0, 256, 1, true},
+      {"moe_routed_i384_h1536_tp8_w13",  96, 1536, 0.0, 256, 1, true},
+      {"moe_routed_i384_h1536_tp1_w2",  1536, 384, 0.0, 256, 1, false},
+      {"moe_routed_i384_h1536_tp8_w2",  1536,  48, 0.0, 256, 1, false},
+      {"moe_routed_i384_h768_tp4_w13",  192,  768, 0.0, 256, 1, true},
+      {"moe_routed_i384_h768_tp4_w2",   768,   96, 0.0, 256, 1, false},
+      {"moe_routed_i384_h6144_tp2_w13", 384, 6144, 0.0, 256, 1, true},
+      {"moe_routed_i384_h6144_tp2_w2", 6144,  192, 0.0, 256, 1, false},
+      // Routed experts, production intermediate_size = 3072 (E = 256).
+      {"moe_routed_i3072_h6144_tp8_w13",  768, 6144, 0.0, 256, 1, true},
+      {"moe_routed_i3072_h6144_tp8_w2",  6144,  384, 0.0, 256, 1, false},
+      {"moe_routed_i3072_h1536_tp4_w13", 1536, 1536, 0.0, 256, 1, true},
+      {"moe_routed_i3072_h1536_tp4_w2",  1536,  768, 0.0, 256, 1, false},
+      // Shared experts (InklingBatchDenseMLP, E = 2, I = 3072).
+      {"moe_shared_i3072_h1536_tp2_w13", 3072, 1536, 0.0, 2, 1, true},
+      {"moe_shared_i3072_h1536_tp2_w2",  1536, 1536, 0.0, 2, 1, false},
+      {"moe_shared_i3072_h6144_tp4_w13", 1536, 6144, 0.0, 2, 1, true},
+      {"moe_shared_i3072_h6144_tp4_w2",  6144,  768, 0.0, 2, 1, false},
+      {"moe_shared_i3072_h768_tp8_w13",   768,  768, 0.0, 2, 1, true},
+      {"moe_shared_i3072_h768_tp8_w2",    768,  384, 0.0, 2, 1, false},
+      // The same shared-expert slabs under scales_2d=true (16x16-tile block
+      // scales). Only the shared experts appear here: dim1_group_size is read
+      // solely by InklingNvfp4MoEMethod.create_weights, which asserts its layer
+      // is an InklingBatchDenseMLP, so no E=256 slab can carry this layout.
+      // fused_w13 stays meaningful (it is still the gate+up slab) but scale2
+      // does not widen on this path -- see scale2_columns().
+      {"moe_shared_i384_h1536_tp1_w13_s2d",   768, 1536, 0.0, 2, 16, true},
+      {"moe_shared_i384_h1536_tp1_w2_s2d",   1536,  384, 0.0, 2, 16, false},
+      {"moe_shared_i3072_h1536_tp2_w13_s2d", 3072, 1536, 0.0, 2, 16, true},
+      {"moe_shared_i3072_h1536_tp2_w2_s2d",  1536, 1536, 0.0, 2, 16, false},
+      {"moe_shared_i3072_h6144_tp4_w13_s2d", 1536, 6144, 0.0, 2, 16, true},
+      {"moe_shared_i3072_h6144_tp4_w2_s2d",  6144,  768, 0.0, 2, 16, false},
+      {"moe_shared_i3072_h768_tp8_w13_s2d",   768,  768, 0.0, 2, 16, true},
+      {"moe_shared_i3072_h768_tp8_w2_s2d",    768,  384, 0.0, 2, 16, false},
   };
 }
 
@@ -657,6 +944,21 @@ std::vector<Nvfp4Case> perf_suite() {
       {"perf_prod_qkvr_tp2_3968x6144", 3968, 6144, 0.0},
       {"perf_prod_qkvr_tp4_1984x6144", 1984, 6144, 0.0},
       {"perf_prod_qkvr_tp8_1120x6144", 1120, 6144, 0.0},
+      // scales_2d=true (16x16-tile block scales) on the shared-expert slabs,
+      // the only place dim1_group_size is read. Report-only (target 0.0): this
+      // is a different kernel from the tuned 1-D path, so its GB/s has no
+      // calibrated baseline yet. Do not guess a gate here -- see
+      // 17_bmg_relative_attention_backend for the same convention.
+      //
+      // No 1-D-group slab cases here: for dim1_group_size == 1 the per-expert
+      // surface is byte-identical to what the tuned launch_nvfp4_layout already
+      // produces at the same (m, n), and it is those linear cases above that
+      // carry the calibrated numbers. A 1-D slab perf case would only measure
+      // the simple verification kernel and could not be compared against them.
+      {"perf_s2d_shared_i3072_h6144_tp1_w13", 6144, 6144, 0.0, 2, 16, true},
+      {"perf_s2d_shared_i3072_h6144_tp4_w13", 1536, 6144, 0.0, 2, 16, true},
+      {"perf_s2d_shared_i3072_h6144_tp4_w2",  6144,  768, 0.0, 2, 16, false},
+      {"perf_s2d_shared_i3072_h1536_tp1_w13", 6144, 1536, 0.0, 2, 16, true},
   };
 }
 
@@ -669,6 +971,9 @@ std::vector<Nvfp4Case> make_suite(std::string const& suite) {
   }
   if (suite == "perf") {
     return perf_suite();
+  }
+  if (suite == "moe") {
+    return moe_suite();
   }
   return {};
 }
@@ -692,6 +997,16 @@ bool parse_nv_shape(std::string const& text, Nvfp4Case& cfg) {
       cfg.n = std::stoi(value);
     } else if (key == "target_gbps" || key == "target-gbps") {
       cfg.target_gbps = std::stod(value);
+    } else if (key == "experts" || key == "e") {
+      cfg.experts = std::stoi(value);
+    } else if (key == "scales_2d" || key == "scales-2d") {
+      // Mirrors InklingModelOptNvfp4Config: scales_2d selects
+      // dim1_group_size = group_size (16) instead of 1.
+      cfg.scale_dim1_group = std::stoi(value) != 0 ? quant::kNvfp4GroupSize : 1;
+    } else if (key == "dim1_group" || key == "dim1-group") {
+      cfg.scale_dim1_group = std::stoi(value);
+    } else if (key == "fused_w13" || key == "fused-w13") {
+      cfg.fused_w13 = std::stoi(value) != 0;
     } else {
       return false;
     }
@@ -708,6 +1023,14 @@ void validate_case(Nvfp4Case& cfg) {
   }
   if (cfg.n % quant::kNvfp4GroupSize != 0) {
     throw std::invalid_argument("n must be divisible by NVFP4 group size 16");
+  }
+  if (cfg.experts <= 0) {
+    throw std::invalid_argument("experts must be positive");
+  }
+  // InklingModelOptNvfp4Config only ever sets dim1_group_size to 1 or to
+  // group_size, and rejects any group_size other than 16.
+  if (cfg.scale_dim1_group != 1 && cfg.scale_dim1_group != quant::kNvfp4GroupSize) {
+    throw std::invalid_argument("scale_dim1_group must be 1 (scales_2d=false) or 16 (scales_2d=true)");
   }
 }
 
@@ -912,6 +1235,414 @@ bool run_case_for_dtype(sycl::queue& queue, Nvfp4Case cfg, quant::Options const&
   }
   std::cout << "\n";
   return passed;
+}
+
+// ---------------------------------------------------------------------------
+// Per-expert slab path (experts > 1 and/or scales_2d).
+// ---------------------------------------------------------------------------
+
+// Cap on the input bytes materialized for one slab case. The routed MoE tensors
+// are (256, 2I/P, H), which never fits on one card, so the runner quantizes a
+// bounded prefix of the expert dim. At least two experts are always run so the
+// per-expert scale-surface restart stays covered.
+constexpr std::size_t kSlabInputByteBudget = 256ull * 1024ull * 1024ull;
+
+struct Nvfp4SlabLayout {
+  int groups = 0;
+  int rows_per_scale = 1;
+  int scale_rows = 0;
+  int rounded_groups = 0;
+  int64_t input_expert_stride = 0;
+  int64_t packed_expert_stride = 0;
+  int64_t scale_expert_stride = 0;
+};
+
+Nvfp4SlabLayout make_slab_layout(Nvfp4Case const& cfg) {
+  Nvfp4SlabLayout layout;
+  layout.groups = cfg.n / quant::kNvfp4GroupSize;
+  layout.rows_per_scale = cfg.scale_dim1_group;
+  layout.scale_rows = quant::ceil_div(cfg.m, layout.rows_per_scale);
+  layout.rounded_groups = quant::round_up(layout.groups, 4);
+  layout.input_expert_stride = static_cast<int64_t>(cfg.m) * cfg.n;
+  layout.packed_expert_stride = layout.input_expert_stride / 2;
+  layout.scale_expert_stride = layout.rows_per_scale == 1
+      // ModelOpt/TRT-LLM swizzle: rows padded to 128, groups padded to 4.
+      ? static_cast<int64_t>(quant::round_up(cfg.m, 128)) * layout.rounded_groups
+      // scales_2d: plain row-major (ceil_div(m,16), groups), as registered by
+      // InklingNvfp4MoEMethod.create_weights.
+      : static_cast<int64_t>(layout.scale_rows) * layout.groups;
+  return layout;
+}
+
+template <typename Element>
+void nvfp4_slab_reference(
+    Nvfp4Case const& cfg,
+    Nvfp4SlabLayout const& layout,
+    int experts_run,
+    std::vector<Element> const& input,
+    float global_scale,
+    float scale_factor,
+    std::vector<uint8_t>& packed,
+    std::vector<uint8_t>& scales) {
+  packed.assign(static_cast<std::size_t>(layout.packed_expert_stride) * experts_run, 0);
+  scales.assign(static_cast<std::size_t>(layout.scale_expert_stride) * experts_run, 0);
+
+  for (int expert = 0; expert < experts_run; ++expert) {
+    int64_t input_base_e = static_cast<int64_t>(expert) * layout.input_expert_stride;
+    int64_t packed_base_e = static_cast<int64_t>(expert) * layout.packed_expert_stride;
+    int64_t scale_base_e = static_cast<int64_t>(expert) * layout.scale_expert_stride;
+    for (int scale_row = 0; scale_row < layout.scale_rows; ++scale_row) {
+      int row0 = scale_row * layout.rows_per_scale;
+      int rows = std::min(layout.rows_per_scale, cfg.m - row0);
+      for (int group = 0; group < layout.groups; ++group) {
+        int col0 = group * quant::kNvfp4GroupSize;
+        float max_abs = 0.0f;
+        for (int r = 0; r < rows; ++r) {
+          int64_t base = input_base_e + static_cast<int64_t>(row0 + r) * cfg.n + col0;
+          for (int i = 0; i < quant::kNvfp4GroupSize; ++i) {
+            max_abs = std::max(max_abs, std::fabs(quant::to_float(input[base + i])));
+          }
+        }
+
+        uint8_t scale_byte = quant::e4m3fn_encode(max_abs * scale_factor);
+        float encoded_scale = quant::e4m3fn_decode(scale_byte);
+        float output_scale = encoded_scale == 0.0f ? 0.0f : global_scale / encoded_scale;
+
+        int64_t scale_idx = scale_base_e;
+        if (layout.rows_per_scale == 1) {
+          scale_idx += quant::nvfp4_swizzled_scale_index(row0, group, layout.rounded_groups);
+        } else {
+          scale_idx += static_cast<int64_t>(scale_row) * layout.groups + group;
+        }
+        scales[static_cast<std::size_t>(scale_idx)] = scale_byte;
+
+        for (int r = 0; r < rows; ++r) {
+          int64_t base = input_base_e + static_cast<int64_t>(row0 + r) * cfg.n + col0;
+          int64_t out_base = packed_base_e +
+              (static_cast<int64_t>(row0 + r) * cfg.n + col0) / 2;
+          for (int i = 0; i < quant::kNvfp4GroupSize; i += 2) {
+            float v0 = quant::clamp_f(quant::to_float(input[base + i]) * output_scale,
+                                      -quant::kE2M1Max,
+                                      quant::kE2M1Max);
+            float v1 = quant::clamp_f(quant::to_float(input[base + i + 1]) * output_scale,
+                                      -quant::kE2M1Max,
+                                      quant::kE2M1Max);
+            packed[static_cast<std::size_t>(out_base + i / 2)] =
+                quant::pack_e2m1_pair(quant::quantize_e2m1_code(v0), quant::quantize_e2m1_code(v1));
+          }
+        }
+      }
+    }
+  }
+}
+
+// Verify the loader's per-expert global-scale ("scale2") handling for the full
+// expert count. Mirrors InklingForCausalLM._ckpt_scale_to_modelopt:
+//   * the checkpoint stores one FP32 weight scale per expert, shape (E,);
+//   * ModelOpt's fused w13 param is (E, 2) -- column 0 becomes the gate half's
+//     alpha and column 1 the up half's (see _compute_gemm1_alphas) -- so the
+//     loader broadcasts the checkpoint column into both;
+//   * w2, and the shared-expert method's w13_scale2, keep (E,) (see
+//     scale2_columns());
+//   * input_amax -> input_scale = amax / (448.0 * 6.0), broadcast to the shape.
+//
+// This is dtype-independent, so run_cases calls it once per case rather than
+// once per element type.
+bool verify_scale2_widening(sycl::queue& queue, Nvfp4Case const& cfg) {
+  int experts = cfg.experts;
+  int cols = scale2_columns(cfg);
+
+  std::vector<float> h_ckpt(static_cast<std::size_t>(experts));
+  std::mt19937 gen(0x51A1E2u + static_cast<uint32_t>(experts));
+  std::uniform_real_distribution<float> dist(0.005f, 0.25f);
+  for (float& v : h_ckpt) {
+    v = dist(gen);
+  }
+  float const input_amax = 12.5f;
+  // input_scale = amax / (448.0 * 6.0) = amax / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX).
+  float const input_scale = input_amax / (quant::kE4M3FnMax * quant::kE2M1Max);
+
+  std::size_t widened_count = static_cast<std::size_t>(experts) * cols;
+  quant::DeviceBuffer<float> d_ckpt(queue, h_ckpt.size());
+  quant::DeviceBuffer<float> d_widened(queue, widened_count);
+  quant::DeviceBuffer<float> d_alphas(queue, widened_count);
+  d_ckpt.copy_from(h_ckpt);
+  d_widened.zero();
+  d_alphas.zero();
+
+  Nvfp4Scale2Params params;
+  params.ckpt_scale2 = d_ckpt.get();
+  params.widened = d_widened.get();
+  params.alphas = d_alphas.get();
+  params.experts = experts;
+  params.cols = cols;
+  params.input_scale = input_scale;
+  launch_nvfp4_scale2_widen(queue, params).wait();
+
+  std::vector<float> h_widened(widened_count);
+  std::vector<float> h_alphas(widened_count);
+  d_widened.copy_to(h_widened);
+  d_alphas.copy_to(h_alphas);
+
+  std::size_t mismatches = 0;
+  for (int e = 0; e < experts; ++e) {
+    for (int c = 0; c < cols; ++c) {
+      std::size_t idx = static_cast<std::size_t>(e) * cols + c;
+      float expected_scale = h_ckpt[static_cast<std::size_t>(e)];
+      float expected_alpha = input_scale * expected_scale;
+      if (h_widened[idx] != expected_scale ||
+          std::fabs(h_alphas[idx] - expected_alpha) >
+              1e-6f * std::fabs(expected_alpha)) {
+        if (mismatches == 0) {
+          std::cerr << "  [FAIL] scale2 widening mismatch at expert=" << e
+                    << " col=" << c << " got_scale=" << h_widened[idx]
+                    << " want_scale=" << expected_scale
+                    << " got_alpha=" << h_alphas[idx]
+                    << " want_alpha=" << expected_alpha << "\n";
+        }
+        ++mismatches;
+      }
+    }
+  }
+  if (mismatches != 0) {
+    std::cerr << "  [FAIL] scale2 widening: " << mismatches << " of " << widened_count
+              << " entries wrong\n";
+    return false;
+  }
+  // The widened columns must be equal: the checkpoint has a single per-expert
+  // scale, so ModelOpt's gate and up alphas coincide for Inkling.
+  if (cols == 2) {
+    for (int e = 0; e < experts; ++e) {
+      std::size_t idx = static_cast<std::size_t>(e) * 2;
+      if (h_widened[idx] != h_widened[idx + 1]) {
+        std::cerr << "  [FAIL] scale2 (E,2) columns differ at expert=" << e << "\n";
+        return false;
+      }
+    }
+  }
+  std::cout << "  [PASS] scale2 case=" << cfg.name
+            << " ckpt=(" << experts << ") -> param=(" << experts;
+  if (cols == 2) {
+    std::cout << ",2)  (ModelOpt fused w13: gate|up)";
+  } else {
+    std::cout << ")   (no widening on this path)";
+  }
+  std::cout << " input_scale=" << std::scientific << std::setprecision(4) << input_scale
+            << std::defaultfloat << "\n";
+  return true;
+}
+
+template <typename Element>
+bool run_slab_for_dtype(sycl::queue& queue, Nvfp4Case cfg, quant::Options const& options) {
+  validate_case(cfg);
+  Nvfp4SlabLayout layout = make_slab_layout(cfg);
+
+  std::size_t slab_bytes = static_cast<std::size_t>(layout.input_expert_stride) * sizeof(Element);
+  int experts_run = cfg.experts;
+  if (slab_bytes > 0) {
+    std::size_t max_experts = kSlabInputByteBudget / slab_bytes;
+    if (max_experts < 1) {
+      max_experts = 1;
+    }
+    if (static_cast<std::size_t>(experts_run) > max_experts) {
+      experts_run = static_cast<int>(max_experts);
+    }
+  }
+  // Always keep at least two slabs when the tensor has them, so a dropped
+  // per-expert stride cannot pass.
+  if (cfg.experts >= 2 && experts_run < 2) {
+    experts_run = 2;
+  }
+
+  std::size_t input_count = static_cast<std::size_t>(layout.input_expert_stride) * experts_run;
+  std::size_t packed_count = static_cast<std::size_t>(layout.packed_expert_stride) * experts_run;
+  std::size_t scale_count = static_cast<std::size_t>(layout.scale_expert_stride) * experts_run;
+
+  std::vector<Element> h_input = quant::make_input<Element>(input_count, 20260903u, -4.0f, 4.0f);
+  seed_edge_values(h_input);
+  float amax = quant::max_abs_host(h_input);
+  float global_scale = amax > 0.0f ? (quant::kE4M3FnMax * quant::kE2M1Max / amax) : 1.0f;
+  float scale_factor = global_scale / quant::kE2M1Max;
+
+  quant::DeviceBuffer<Element> d_input(queue, input_count);
+  quant::DeviceBuffer<uint8_t> d_packed(queue, packed_count);
+  quant::DeviceBuffer<uint8_t> d_scales(queue, scale_count);
+  d_input.copy_from(h_input);
+
+  Nvfp4SlabParams<Element> params;
+  params.x = d_input.get();
+  params.packed = d_packed.get();
+  params.scales = d_scales.get();
+  params.m = cfg.m;
+  params.n = cfg.n;
+  params.groups = layout.groups;
+  params.scale_rows = layout.scale_rows;
+  params.rounded_groups = layout.rounded_groups;
+  params.experts = experts_run;
+  params.input_expert_stride = layout.input_expert_stride;
+  params.packed_expert_stride = layout.packed_expert_stride;
+  params.scale_expert_stride = layout.scale_expert_stride;
+  params.global_scale = global_scale;
+  params.scale_factor = scale_factor;
+
+  bool const two_d = layout.rows_per_scale != 1;
+  auto launch = [&]() {
+    return two_d ? launch_nvfp4_slab<Element, quant::kNvfp4GroupSize>(queue, params)
+                 : launch_nvfp4_slab<Element, 1>(queue, params);
+  };
+
+  bool passed = true;
+  if (options.verify) {
+    d_packed.zero();
+    d_scales.zero();
+    launch().wait();
+
+    std::vector<uint8_t> h_packed(packed_count);
+    std::vector<uint8_t> h_scales(scale_count);
+    d_packed.copy_to(h_packed);
+    d_scales.copy_to(h_scales);
+
+    std::vector<uint8_t> ref_packed;
+    std::vector<uint8_t> ref_scales;
+    nvfp4_slab_reference(cfg, layout, experts_run, h_input, global_scale, scale_factor,
+                         ref_packed, ref_scales);
+
+    quant::ByteCompareResult packed_cmp = quant::compare_bytes(h_packed, ref_packed);
+    quant::ByteCompareResult scale_cmp = quant::compare_bytes(h_scales, ref_scales);
+    if (!packed_cmp.passed || !scale_cmp.passed) {
+      std::cerr << "  [FAIL] dtype=" << quant::element_dtype_text<Element>()
+                << " case=" << cfg.name << "\n";
+      quant::print_byte_compare("packed", packed_cmp);
+      quant::print_byte_compare("scales", scale_cmp);
+      passed = false;
+    }
+  }
+
+  double mean_ms = 0.0;
+  double gbps = 0.0;
+  if (options.benchmark) {
+    mean_ms = quant::benchmark_ms(launch, options.warmup, options.iterations);
+    double moved_bytes = static_cast<double>(input_count * sizeof(Element)) +
+        static_cast<double>(packed_count) +
+        static_cast<double>(experts_run) * layout.scale_rows * layout.groups;
+    gbps = quant::effective_gbps(moved_bytes, mean_ms);
+    double target = options.target_gbps_set ? options.target_gbps : cfg.target_gbps;
+    if (target > 0.0 && gbps < target && moved_bytes >= quant::kMinSustainedTargetBytes) {
+      passed = false;
+    }
+  }
+
+  std::cout << "  [" << (passed ? "PASS" : "FAIL") << "] dtype=" << quant::element_dtype_text<Element>()
+            << " case=" << cfg.name
+            << " experts=" << cfg.experts
+            << " experts_run=" << experts_run
+            << " m=" << cfg.m
+            << " n=" << cfg.n
+            << " groups=" << layout.groups
+            << " dim1_group=" << layout.rows_per_scale
+            << " scale_rows=" << layout.scale_rows
+            << " scale_layout=" << (two_d ? "linear_2d" : "swizzled_1d")
+            << " global_scale=" << std::fixed << std::setprecision(3) << global_scale;
+  if (options.benchmark) {
+    std::cout << " mean_ms=" << std::setprecision(4) << mean_ms
+              << " effective_gbps=" << std::setprecision(2) << gbps;
+  }
+  std::cout << "\n";
+  return passed;
+}
+
+// Host-only shape table for the full MoE expert-weight space. The GPU cases can
+// only materialize a prefix of the expert dim, so this prints -- and checks the
+// divisibility invariants of -- the shape algebra for every shipped (E, I, H, P).
+//
+// The two expert families take different quant methods, and therefore different
+// scale layouts:
+//   routed (E = n_routed_experts = 256) -> ModelOptNvFp4FusedMoEMethod:
+//       block scales (E, rows, cols/16); w13 scale2 (E, 2), w2 scale2 (E,);
+//       dim1_group_size is not read, so scales_2d has no effect.
+//   shared (E = n_shared_experts = 2)   -> InklingNvfp4MoEMethod:
+//       block scales (E, ceil_div(rows, dim1_group_size), cols/16), i.e. both
+//       scales_2d settings; scale2 stays (E,) for w13 and w2 alike.
+//
+// The divisibility checks below all hold for the shipped grid; they are guards
+// against a future shape edit (e.g. a P that does not divide I, or a hidden
+// size that is not a multiple of 16), not live failures.
+bool audit_moe_expert_shapes() {
+  struct Family {
+    char const* label;
+    int experts;
+    bool scales_2d_reachable;
+    bool scale2_widens;
+  };
+  Family const families[] = {
+      {"routed", 256, false, true},
+      {"shared", 2, true, false},
+  };
+  int const intermediates[] = {384, 3072};  // checkpoint routed, production
+  int const hiddens[] = {768, 1536, 6144};
+  int const tps[] = {1, 2, 4, 8};
+
+  std::cout << "MoE expert-weight shape table (w13: (E, 2I/P, H), w2: (E, H, I/P))\n";
+  bool passed = true;
+  int checked = 0;
+  for (Family const& family : families) {
+    int experts = family.experts;
+    for (int intermediate : intermediates) {
+      for (int hidden : hiddens) {
+        for (int tp : tps) {
+          ++checked;
+          if (intermediate % tp != 0) {
+            std::cerr << "  [FAIL] I=" << intermediate << " not divisible by P=" << tp << "\n";
+            passed = false;
+            continue;
+          }
+          int ipp = intermediate / tp;
+          int w13_rows = 2 * ipp;
+          int w13_cols = hidden;
+          int w2_rows = hidden;
+          int w2_cols = ipp;
+          // The last axis is the NVFP4-grouped one for both tensors.
+          if (w13_cols % quant::kNvfp4GroupSize != 0 || w2_cols % quant::kNvfp4GroupSize != 0) {
+            std::cerr << "  [FAIL] " << family.label << " I=" << intermediate << " H=" << hidden
+                      << " P=" << tp << ": grouped axis not a multiple of 16 ("
+                      << w13_cols << ", " << w2_cols << ")\n";
+            passed = false;
+            continue;
+          }
+          // Packed E2M1 halves the last axis.
+          int64_t w13_packed = static_cast<int64_t>(experts) * w13_rows * (w13_cols / 2);
+          int64_t w2_packed = static_cast<int64_t>(experts) * w2_rows * (w2_cols / 2);
+          std::cout << "  " << family.label << " E=" << experts << " I=" << intermediate
+                    << " H=" << hidden << " P=" << tp
+                    << " w13=(" << experts << "," << w13_rows << "," << w13_cols << ")"
+                    << " w2=(" << experts << "," << w2_rows << "," << w2_cols << ")"
+                    << " packed_MiB=" << ((w13_packed + w2_packed) >> 20);
+          std::cout << " scales2d=0:w13=(" << experts << "," << w13_rows
+                    << "," << (w13_cols / quant::kNvfp4GroupSize) << ")"
+                    << ",w2=(" << experts << "," << w2_rows
+                    << "," << (w2_cols / quant::kNvfp4GroupSize) << ")";
+          if (family.scales_2d_reachable) {
+            int dim1 = quant::kNvfp4GroupSize;
+            std::cout << " scales2d=1:w13=(" << experts << "," << quant::ceil_div(w13_rows, dim1)
+                      << "," << (w13_cols / quant::kNvfp4GroupSize) << ")"
+                      << ",w2=(" << experts << "," << quant::ceil_div(w2_rows, dim1)
+                      << "," << (w2_cols / quant::kNvfp4GroupSize) << ")";
+          } else {
+            std::cout << " scales2d=1:n/a";
+          }
+          std::cout << " scale2:w13=(" << experts << (family.scale2_widens ? ",2)" : ")")
+                    << ",w2=(" << experts << ")\n";
+        }
+      }
+    }
+  }
+  std::cout << "  shape table: " << checked << " (family,I,H,P) combinations, "
+            << (passed ? "all invariants hold" : "FAILURES above") << "\n";
+  return passed;
+}
+
+bool needs_slab_path(Nvfp4Case const& cfg) {
+  return cfg.experts != 1 || cfg.scale_dim1_group != 1;
 }
 
 template <typename Element>
@@ -1375,14 +2106,23 @@ bool run_batched_cases(
 bool run_cases(sycl::queue& queue, std::vector<Nvfp4Case> const& cases, quant::Options const& options) {
   bool all_passed = true;
   for (Nvfp4Case cfg : cases) {
+    bool const slab = needs_slab_path(cfg);
+    // The per-expert global scale is FP32 regardless of the weight dtype, so
+    // check it once per case rather than inside the dtype loop below.
+    if (slab && options.verify && cfg.experts > 1) {
+      all_passed &= verify_scale2_widening(queue, cfg);
+    }
     if (options.dtype == quant::DType::kAll || options.dtype == quant::DType::kFloat) {
-      all_passed &= run_case_for_dtype<float>(queue, cfg, options);
+      all_passed &= slab ? run_slab_for_dtype<float>(queue, cfg, options)
+                         : run_case_for_dtype<float>(queue, cfg, options);
     }
     if (options.dtype == quant::DType::kAll || options.dtype == quant::DType::kBf16) {
-      all_passed &= run_case_for_dtype<cutlass::bfloat16_t>(queue, cfg, options);
+      all_passed &= slab ? run_slab_for_dtype<cutlass::bfloat16_t>(queue, cfg, options)
+                         : run_case_for_dtype<cutlass::bfloat16_t>(queue, cfg, options);
     }
     if (options.dtype == quant::DType::kAll || options.dtype == quant::DType::kFp16) {
-      all_passed &= run_case_for_dtype<cutlass::half_t>(queue, cfg, options);
+      all_passed &= slab ? run_slab_for_dtype<cutlass::half_t>(queue, cfg, options)
+                         : run_case_for_dtype<cutlass::half_t>(queue, cfg, options);
     }
   }
   return all_passed;
@@ -1396,7 +2136,17 @@ int main(int argc, char const** argv) {
     options = quant::parse_common_options(argc, argv);
     if (options.help) {
       std::cout << "21_bmg_nvfp4_layout: ModelOpt NVFP4 E2M1 pack plus swizzled FP8 scales\n\n";
-      quant::print_common_usage(argv[0], "quick|inkling|perf|inkling_batched", "m=<int>,n=<int>");
+      quant::print_common_usage(
+          argv[0],
+          "quick|inkling|perf|moe|inkling_batched",
+          "m=<int>,n=<int>,experts=<int>,scales_2d=<0|1>,fused_w13=<0|1>");
+      std::cout << "\n"
+                << "  experts     number of expert slabs in dim 0 (MoE w13/w2); 1 = plain linear\n"
+                << "  scales_2d   InklingModelOptNvfp4Config.scales_2d: 0 -> dim1_group_size=1\n"
+                << "              (one FP8 scale per 1x16 row group, ModelOpt swizzle),\n"
+                << "              1 -> dim1_group_size=16 (one per 16x16 tile, row-major)\n"
+                << "  fused_w13   the slab is the fused gate+up weight, whose per-expert\n"
+                << "              global scale2 the loader widens from (E,) to (E, 2)\n";
       return 0;
     }
   } catch (std::exception const& e) {
@@ -1436,7 +2186,11 @@ int main(int argc, char const** argv) {
               << " verify=" << quant::bool_text(options.verify)
               << " benchmark=" << quant::bool_text(options.benchmark) << "\n";
 
-    bool passed = run_batched
+    bool passed = true;
+    if (options.suite == "moe" && options.shape.empty()) {
+      passed &= audit_moe_expert_shapes();
+    }
+    passed &= run_batched
         ? run_batched_cases(queue, cases, options)
         : run_cases(queue, cases, options);
     return passed ? 0 : -1;
