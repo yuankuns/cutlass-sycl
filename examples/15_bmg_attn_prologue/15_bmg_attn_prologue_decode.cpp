@@ -1302,9 +1302,23 @@ std::vector<CaseConfig> quick_suite() {
 }
 
 // Inkling decode: one token per active sequence (`tokens` = decode batch).
-// W=4, head_dim=128, num_kv_heads=4. dq = 128 * num_heads/tp, dkv = 128 * max(1, 4/tp).
-// hidden_size=1536 → num_heads=12 (TP∈{1,2,4}); hidden_size=6144 → num_heads=48
-// (TP∈{1,2,4,8}). Batches sized to expose all decode-cache traffic.
+// W = sconv_kernel_size = 4, head_dim = 128.
+//   dq  = head_dim * (num_attention_heads / P)
+//   dkv = head_dim * max(1, num_key_value_heads / P)
+// The max(1, ...) is the real replication rule: once P > num_kv_heads the K/V
+// heads are REPLICATED across ranks, not split, so dkv floors at head_dim
+// (InklingAttention.num_tp_kv_heads and InklingConfig.tp_local_kv_conv_dim in
+// sglang). SWA (local) layers use swa_num_key_value_heads instead.
+// Geometries:
+//   config defaults  hidden_size=1536, Nq=12, Nkv=4          (TP∈{1,2,4})
+//   production       hidden_size=6144, Nq=48, Nkv=4          (TP∈{1,2,4,8})
+//   shipped ckpt     hidden_size=768,  Nq=8,  Nkv=2, swa 4   (TP∈{1,2,4,8})
+// The checkpoint geometry is thinkingmachines/Inkling config.json text_config:
+// hidden_size=768, num_attention_heads=8, head_dim=128, num_key_value_heads=2,
+// swa_num_key_value_heads=4. head_dim is set EXPLICITLY there, so it is not
+// hidden_size/Nq (InklingConfig only falls back to that when head_dim is None):
+// dq = 8 * 128 = 1024 at TP=1, wider than hidden_size.
+// Batches sized to expose all decode-cache traffic.
 std::vector<CaseConfig> inkling_suite() {
   return {
       // hidden_size=1536 (config defaults)
@@ -1316,6 +1330,15 @@ std::vector<CaseConfig> inkling_suite() {
       {"decode_h6144_tp2_dq3072_dkv256",  256, 3072, 256, 4, 0, 0, 0, 0, 32, false, true, false, true,  false, false, false},
       {"decode_h6144_tp4_dq1536_dkv128",  512, 1536, 128, 4, 0, 0, 0, 0, 32, false, true, false, true,  false, false, false},
       {"decode_h6144_tp8_dq768_dkv128",  1024,  768, 128, 4, 0, 0, 0, 0, 32, false, true, false, true,  false, false, false},
+      // shipped checkpoint (hidden_size=768, Nq=8, head_dim=128): full layers
+      // Nkv=2, SWA layers swa_num_key_value_heads=4. At P>=4 the KV heads are
+      // replicated, so full and SWA collapse onto the same dkv=128.
+      {"decode_ckpt_tp1_dq1024_dkv256",   256, 1024, 256, 4, 0, 0, 0, 0, 32, false, true, false, true,  false, false, false},
+      {"decode_ckpt_tp1_swa_dq1024_dkv512", 256, 1024, 512, 4, 0, 0, 0, 0, 32, false, true, false, true,  false, false, false},
+      {"decode_ckpt_tp2_dq512_dkv128",    512,  512, 128, 4, 0, 0, 0, 0, 32, false, true, false, true,  false, false, false},
+      {"decode_ckpt_tp2_swa_dq512_dkv256", 512,  512, 256, 4, 0, 0, 0, 0, 32, false, true, true,  true,  true,  true,  true },
+      {"decode_ckpt_tp4_dq256_dkv128",    512,  256, 128, 4, 0, 0, 0, 0, 32, false, true, false, true,  false, false, false},
+      {"decode_ckpt_tp8_dq128_dkv128",   1024,  128, 128, 4, 0, 0, 0, 0, 32, false, true, false, true,  false, false, false},
       // Behavior variants at a real Inkling shape (flagship h=1536 TP=1)
       {"decode_h1536_track",              128, 1536, 512, 4, 0, 0, 0, 0, 32, false, true, true,  true,  false, false, false},
       {"decode_h1536_no_store_swa",       128, 1536, 512, 4, 0, 0, 0, 0, 32, false, true, false, false, false, false, false},
@@ -1336,6 +1359,15 @@ std::vector<CaseConfig> perf_suite() {
       {"perf_h6144_tp2_dq3072_dkv256_t2048", 2048, 3072, 256, 4, 0, 0, 0, 0, 64, false, true, false, true, false, false, false, 390.0},
       {"perf_h6144_tp4_dq1536_dkv128_t4096", 4096, 1536, 128, 4, 0, 0, 0, 0, 64, false, true, false, true, false, false, false, 435.0},
       {"perf_h6144_tp8_dq768_dkv128_t8192",  8192,  768, 128, 4, 0, 0, 0, 0, 64, false, true, false, true, false, false, false, 445.0},
+      // Shipped-checkpoint geometry (hidden_size=768, Nq=8, Nkv=2, swa Nkv=4).
+      // target_gbps=0.0: report-only, these gates are not calibrated yet (the
+      // measuring GPU was shared, so a number here would flake CI).
+      {"perf_ckpt_tp1_dq1024_dkv256_t4096",   4096, 1024, 256, 4, 0, 0, 0, 0, 64, false, true, false, true, false, false, false, 0.0},
+      {"perf_ckpt_tp1_swa_dq1024_dkv512_t4096", 4096, 1024, 512, 4, 0, 0, 0, 0, 64, false, true, false, true, false, false, false, 0.0},
+      {"perf_ckpt_tp2_dq512_dkv128_t8192",    8192,  512, 128, 4, 0, 0, 0, 0, 64, false, true, false, true, false, false, false, 0.0},
+      {"perf_ckpt_tp2_swa_dq512_dkv256_t8192", 8192,  512, 256, 4, 0, 0, 0, 0, 64, false, true, false, true, false, false, false, 0.0},
+      {"perf_ckpt_tp4_dq256_dkv128_t8192",    8192,  256, 128, 4, 0, 0, 0, 0, 64, false, true, false, true, false, false, false, 0.0},
+      {"perf_ckpt_tp8_dq128_dkv128_t8192",    8192,  128, 128, 4, 0, 0, 0, 0, 64, false, true, false, true, false, false, false, 0.0},
   };
 }
 

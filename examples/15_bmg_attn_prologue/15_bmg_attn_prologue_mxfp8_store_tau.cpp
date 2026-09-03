@@ -1333,11 +1333,26 @@ std::vector<CaseConfig> quick_suite() {
   };
 }
 
-// Inkling MXFP8 store+tau: head_dim=128, num_kv_heads=4. dq = 128 * num_heads/tp,
-// dkv = 128 * max(1, 4/tp). hidden_size=1536 → num_heads=12 (TP∈{1,2,4});
-// hidden_size=6144 → num_heads=48 (TP∈{1,2,4,8}). MXFP8 KV pool uses page_size=128
-// (upstream_model_attn.py:430). Token counts pick verify-like (batch*draft_token_num=9),
-// extend-like (chunked prefill up to 16384), and decode-like (one token per seq).
+// Inkling MXFP8 store+tau: head_dim = 128.
+//   dq  = head_dim * (num_attention_heads / P)
+//   dkv = head_dim * max(1, num_key_value_heads / P)
+// The max(1, ...) is the real replication rule: once P > num_kv_heads the K/V
+// heads are REPLICATED across ranks, not split, so dkv floors at head_dim
+// (InklingAttention.num_tp_kv_heads and InklingConfig.tp_local_kv_conv_dim in
+// sglang). SWA (local) layers use swa_num_key_value_heads instead.
+// Geometries:
+//   config defaults  hidden_size=1536, Nq=12, Nkv=4          (TP∈{1,2,4})
+//   production       hidden_size=6144, Nq=48, Nkv=4          (TP∈{1,2,4,8})
+//   shipped ckpt     hidden_size=768,  Nq=8,  Nkv=2, swa 4   (TP∈{1,2,4,8})
+// The checkpoint geometry is thinkingmachines/Inkling config.json text_config:
+// hidden_size=768, num_attention_heads=8, head_dim=128, num_key_value_heads=2,
+// swa_num_key_value_heads=4. head_dim is set EXPLICITLY there, so it is not
+// hidden_size/Nq (InklingConfig only falls back to that when head_dim is None):
+// dq = 8 * 128 = 1024 at TP=1, wider than hidden_size.
+// MXFP8 KV pool uses page_size=128 (upstream_model_attn.py:430). Token counts pick
+// verify-like (batch*draft_token_num: 9 in production, 3 for the shipped
+// checkpoint's num_nextn_predict_layers=2), extend-like (chunked prefill up to
+// 16384), and decode-like (one token per seq).
 std::vector<CaseConfig> inkling_suite() {
   return {
       // hidden_size=1536 (config defaults) — verify-like batch*9 tokens
@@ -1349,12 +1364,24 @@ std::vector<CaseConfig> inkling_suite() {
       {"mxfp8_verify_h6144_tp2_dq3072_dkv256",  288, 3072, 256, 128, 0,  0, 16, true,  true,  false, false},
       {"mxfp8_verify_h6144_tp4_dq1536_dkv128",  576, 1536, 128, 128, 0,  0, 16, true,  true,  false, false},
       {"mxfp8_verify_h6144_tp8_dq768_dkv128",  1152,  768, 128, 128, 0,  0, 16, true,  true,  false, false},
+      // shipped checkpoint (hidden_size=768, Nq=8, head_dim=128) — verify-like
+      // batch*draft_token_num with draft_token_num=3: full layers Nkv=2, SWA layers
+      // swa_num_key_value_heads=4. At P>=4 the KV heads are replicated, so full and
+      // SWA collapse onto the same dkv=128.
+      {"mxfp8_verify_ckpt_tp1_dq1024_dkv256",      288, 1024, 256, 128, 0,  0, 16, true,  true,  false, false},
+      {"mxfp8_verify_ckpt_tp1_swa_dq1024_dkv512",  288, 1024, 512, 128, 0,  0, 16, true,  true,  false, false},
+      {"mxfp8_verify_ckpt_tp2_dq512_dkv128",       288,  512, 128, 128, 0,  0, 16, true,  true,  false, false},
+      {"mxfp8_verify_ckpt_tp2_swa_dq512_dkv256",   288,  512, 256, 128, 0,  0, 16, true,  true,  false, false},
+      {"mxfp8_verify_ckpt_tp4_dq256_dkv128",       576,  256, 128, 128, 0,  0, 16, true,  true,  false, false},
+      {"mxfp8_verify_ckpt_tp8_dq128_dkv128",      1152,  128, 128, 128, 0,  0, 16, true,  true,  false, false},
       // Decode-like: one token per active sequence
       {"mxfp8_decode_h1536_tp1_dq1536_dkv512",  512, 1536, 512, 128, 0, 64, 16, true,  true,  false, false},
       {"mxfp8_decode_h6144_tp1_dq6144_dkv512",  256, 6144, 512, 128, 0, 64, 16, true,  true,  false, false},
+      {"mxfp8_decode_ckpt_tp1_dq1024_dkv256",   512, 1024, 256, 128, 0, 64, 16, true,  true,  false, false},
       // Extend-like: chunked prefill up to max_prefill_tokens=16384; use tail-page shape
       {"mxfp8_extend_h1536_tp1_dq1536_dkv512", 8191, 1536, 512, 128, 8, 32, 16, true,  true,  false, false},
       {"mxfp8_extend_h6144_tp2_dq3072_dkv256", 8191, 3072, 256, 128, 8, 32, 16, true,  true,  false, false},
+      {"mxfp8_extend_ckpt_tp1_dq1024_dkv256",  8191, 1024, 256, 128, 8, 32, 16, true,  true,  false, false},
       // Behavior variants at a real shape
       {"mxfp8_no_tau_h1536",                    288, 1536, 512, 128, 0,  0, 16, false, true,  false, false},
       {"mxfp8_no_store_swa_h1536",              288, 1536, 512, 128, 0,  0, 16, true,  false, false, false},
@@ -1374,6 +1401,15 @@ std::vector<CaseConfig> perf_suite() {
       {"perf_h6144_tp2_dq3072_dkv256_t8192",  8192, 3072, 256, 128, 0, 64, 16, true, true, false, false, 145.0},
       {"perf_h6144_tp4_dq1536_dkv128_t16384",16384, 1536, 128, 128, 0, 64, 16, true, true, false, false, 130.0},
       {"perf_h6144_tp8_dq768_dkv128_t16384", 16384,  768, 128, 128, 0, 64, 16, true, true, false, false, 130.0},
+      // Shipped-checkpoint geometry (hidden_size=768, Nq=8, Nkv=2, swa Nkv=4).
+      // target_gbps=0.0: report-only, these gates are not calibrated yet (the
+      // measuring GPU was shared, so a number here would flake CI).
+      {"perf_ckpt_tp1_dq1024_dkv256_t16384",  16384, 1024, 256, 128, 0, 64, 16, true, true, false, false, 0.0},
+      {"perf_ckpt_tp1_swa_dq1024_dkv512_t8192", 8192, 1024, 512, 128, 0, 64, 16, true, true, false, false, 0.0},
+      {"perf_ckpt_tp2_dq512_dkv128_t16384",   16384,  512, 128, 128, 0, 64, 16, true, true, false, false, 0.0},
+      {"perf_ckpt_tp2_swa_dq512_dkv256_t16384", 16384, 512, 256, 128, 0, 64, 16, true, true, false, false, 0.0},
+      {"perf_ckpt_tp4_dq256_dkv128_t16384",   16384,  256, 128, 128, 0, 64, 16, true, true, false, false, 0.0},
+      {"perf_ckpt_tp8_dq128_dkv128_t16384",   16384,  128, 128, 128, 0, 64, 16, true, true, false, false, 0.0},
   };
 }
 
