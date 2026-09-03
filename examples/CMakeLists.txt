@@ -137,6 +137,7 @@ if (CUTLASS_ENABLE_SYCL)
       21_bmg_quantization
       22_bmg_hmlp
       23_bmg_mel_embedding_sum
+      26_bmg_shared_expert_mlp
       50_xe35_block_scaled_gemm
       51_xe35_block_scaled_grouped_gemm
       )
