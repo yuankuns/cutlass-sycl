@@ -1,3 +1,7 @@
+/***************************************************************************************************
+ * Copyright (C) 2026 Intel Corporation, All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ **************************************************************************************************/
 #include "16_bmg_moe_gate_gemv.hpp"
 
 #include <sycl/sycl.hpp>
@@ -88,6 +92,10 @@ struct DeviceBuffer {
 struct Options {
   std::string suite = "quick";
   int64_t tokens = -1;
+  int hidden = moe::kGateHiddenSpecialized;
+  // --hidden only reaches the kernel through the --tokens custom case; tracked
+  // so passing it alone is an error instead of a silent no-op.
+  bool hidden_set = false;
   int iterations = 100;
   int warmup = 10;
   int experts_per_workgroup = 0;
@@ -114,6 +122,9 @@ Options parse_options(int argc, char const** argv) {
       options.suite = value;
     } else if (key == "--tokens") {
       options.tokens = std::stoll(value);
+    } else if (key == "--hidden") {
+      options.hidden = std::stoi(value);
+      options.hidden_set = true;
     } else if (key == "--iterations") {
       options.iterations = std::stoi(value);
     } else if (key == "--warmup") {
@@ -138,6 +149,7 @@ void print_usage(char const* name) {
             << "Options:\n"
             << "  --suite=quick|full|perf      Verification and benchmark suite (default quick)\n"
             << "  --tokens=<int>               Run one custom token count instead of suite cases\n"
+            << "  --hidden=<int>               Gate contraction width for --tokens (default 6144)\n"
             << "  --iterations=<int>           Benchmark iterations (default 100)\n"
             << "  --warmup=<int>               Benchmark warmup launches (default 10)\n"
             << "  --experts-per-wg=0|1|2|4     Experts computed by one workgroup, 0 selects default\n"
@@ -149,6 +161,12 @@ void print_usage(char const* name) {
 struct CaseConfig {
   std::string name;
   int64_t tokens = 0;
+  // InklingModelConfig.hidden_size (d_model): 1536 is the config default, 6144
+  // the production checkpoint and the compile-time-specialized width.
+  int hidden = moe::kGateHiddenSpecialized;
+  // 0 keeps the CLI/default subgroup size. A few cases pin 16 to reach the
+  // multi-warp-per-token contraction slice, which 32-lane subgroups never take.
+  int subgroup = 0;
 };
 
 struct HostInputs {
@@ -158,8 +176,8 @@ struct HostInputs {
 
 HostInputs make_inputs(CaseConfig const& cfg, uint32_t seed) {
   HostInputs inputs;
-  inputs.x.resize(static_cast<std::size_t>(cfg.tokens) * moe::kGateHidden);
-  inputs.weight.resize(static_cast<std::size_t>(moe::kGateLogitsPad) * moe::kGateHidden);
+  inputs.x.resize(static_cast<std::size_t>(cfg.tokens) * cfg.hidden);
+  inputs.weight.resize(static_cast<std::size_t>(moe::kGateLogitsPad) * cfg.hidden);
 
   std::mt19937 gen(seed);
   std::uniform_real_distribution<float> x_dist(-0.05f, 0.05f);
@@ -169,15 +187,15 @@ HostInputs make_inputs(CaseConfig const& cfg, uint32_t seed) {
     v = cutlass::bfloat16_t(x_dist(gen));
   }
   for (int e = 0; e < moe::kGateLogitsPad; ++e) {
-    for (int k = 0; k < moe::kGateHidden; ++k) {
+    for (int k = 0; k < cfg.hidden; ++k) {
       float value = e < moe::kGateTotalExperts ? w_dist(gen) : 0.0f;
-      inputs.weight[static_cast<std::size_t>(e) * moe::kGateHidden + k] = cutlass::bfloat16_t(value);
+      inputs.weight[static_cast<std::size_t>(e) * cfg.hidden + k] = cutlass::bfloat16_t(value);
     }
   }
 
   if (cfg.tokens > 0) {
-    for (int k = 0; k < moe::kGateHidden; ++k) {
-      inputs.x[static_cast<std::size_t>(cfg.tokens - 1) * moe::kGateHidden + k] =
+    for (int k = 0; k < cfg.hidden; ++k) {
+      inputs.x[static_cast<std::size_t>(cfg.tokens - 1) * cfg.hidden + k] =
           cutlass::bfloat16_t(((k % 17) - 8) * 0.003f);
     }
   }
@@ -190,11 +208,10 @@ std::vector<float> reference_gemv(CaseConfig const& cfg, HostInputs const& input
   for (int64_t token = 0; token < cfg.tokens; ++token) {
     for (int expert = 0; expert < moe::kGateTotalExperts; ++expert) {
       float acc = 0.0f;
-      for (int k = 0; k < moe::kGateHidden; ++k) {
-        float xv =
-            moe::gate_bf16_to_float(inputs.x[static_cast<std::size_t>(token) * moe::kGateHidden + k]);
+      for (int k = 0; k < cfg.hidden; ++k) {
+        float xv = moe::gate_bf16_to_float(inputs.x[static_cast<std::size_t>(token) * cfg.hidden + k]);
         float wv =
-            moe::gate_bf16_to_float(inputs.weight[static_cast<std::size_t>(expert) * moe::kGateHidden + k]);
+            moe::gate_bf16_to_float(inputs.weight[static_cast<std::size_t>(expert) * cfg.hidden + k]);
         acc = std::fma(xv, wv, acc);
       }
       ref[static_cast<std::size_t>(token) * moe::kGateLogitsPad + expert] = acc;
@@ -223,6 +240,7 @@ std::vector<float> run_kernel(
   params.weight = d_weight.get();
   params.logits = d_logits.get();
   params.tokens = cfg.tokens;
+  params.hidden = cfg.hidden;
 
   if (cfg.tokens > 0) {
     moe::launch_gate_gemv(queue, params, experts_per_workgroup, subgroup_size).wait();
@@ -242,7 +260,8 @@ bool verify_case(
     CaseConfig const& cfg,
     int experts_per_workgroup,
     int subgroup_size) {
-  HostInputs inputs = make_inputs(cfg, 20260720u + static_cast<uint32_t>(cfg.tokens));
+  HostInputs inputs =
+      make_inputs(cfg, 20260720u + static_cast<uint32_t>(cfg.tokens) + 7u * static_cast<uint32_t>(cfg.hidden));
   std::vector<float> ref = reference_gemv(cfg, inputs);
   std::vector<float> got = run_kernel(queue, cfg, inputs, experts_per_workgroup, subgroup_size);
 
@@ -270,7 +289,7 @@ bool verify_case(
 
   bool passed = failures == 0;
   std::cout << "verify " << std::setw(16) << cfg.name << " tokens=" << std::setw(5) << cfg.tokens
-            << " experts_per_wg=" << moe::default_gate_gemv_experts_per_workgroup(experts_per_workgroup)
+            << " hidden=" << std::setw(4) << cfg.hidden << " experts_per_wg=" << moe::default_gate_gemv_experts_per_workgroup(experts_per_workgroup)
             << " subgroup=" << moe::default_gate_gemv_subgroup_size(subgroup_size, cfg.tokens)
             << " max_abs=" << std::scientific << std::setprecision(3) << max_abs << " max_rel=" << max_rel
             << " : " << (passed ? "PASS" : "FAIL") << std::defaultfloat << "\n";
@@ -283,18 +302,18 @@ double event_ms(sycl::event const& event) {
   return static_cast<double>(end - start) * 1.0e-6;
 }
 
-double estimated_global_bytes(int64_t tokens, int experts_per_workgroup) {
+double estimated_global_bytes(int64_t tokens, int hidden, int experts_per_workgroup) {
   int epw = moe::default_gate_gemv_experts_per_workgroup(experts_per_workgroup);
   int64_t expert_groups = (moe::kGateTotalExperts + epw - 1) / epw;
   double weight_bytes =
-      static_cast<double>(moe::kGateTotalExperts) * moe::kGateHidden * sizeof(cutlass::bfloat16_t);
-  double x_bytes = static_cast<double>(expert_groups) * tokens * moe::kGateHidden * sizeof(cutlass::bfloat16_t);
+      static_cast<double>(moe::kGateTotalExperts) * hidden * sizeof(cutlass::bfloat16_t);
+  double x_bytes = static_cast<double>(expert_groups) * tokens * hidden * sizeof(cutlass::bfloat16_t);
   double output_bytes = static_cast<double>(tokens) * moe::kGateTotalExperts * sizeof(float);
   return weight_bytes + x_bytes + output_bytes;
 }
 
-double gemv_flops(int64_t tokens) {
-  return 2.0 * static_cast<double>(tokens) * moe::kGateTotalExperts * moe::kGateHidden;
+double gemv_flops(int64_t tokens, int hidden) {
+  return 2.0 * static_cast<double>(tokens) * moe::kGateTotalExperts * hidden;
 }
 
 void benchmark_case(
@@ -308,7 +327,8 @@ void benchmark_case(
     return;
   }
 
-  HostInputs inputs = make_inputs(cfg, 20260801u + static_cast<uint32_t>(cfg.tokens));
+  HostInputs inputs =
+      make_inputs(cfg, 20260801u + static_cast<uint32_t>(cfg.tokens) + 7u * static_cast<uint32_t>(cfg.hidden));
   DeviceBuffer<cutlass::bfloat16_t> d_x(queue, inputs.x.size());
   DeviceBuffer<cutlass::bfloat16_t> d_weight(queue, inputs.weight.size());
   DeviceBuffer<float> d_logits(queue, static_cast<std::size_t>(cfg.tokens) * moe::kGateLogitsPad);
@@ -323,6 +343,7 @@ void benchmark_case(
   params.weight = d_weight.get();
   params.logits = d_logits.get();
   params.tokens = cfg.tokens;
+  params.hidden = cfg.hidden;
 
   for (int i = 0; i < warmup; ++i) {
     moe::launch_gate_gemv(queue, params, experts_per_workgroup, subgroup_size).wait();
@@ -341,56 +362,88 @@ void benchmark_case(
   }
 
   double avg_ms = total_ms / static_cast<double>(iterations);
-  double bytes = estimated_global_bytes(cfg.tokens, experts_per_workgroup);
-  double flops = gemv_flops(cfg.tokens);
+  double bytes = estimated_global_bytes(cfg.tokens, cfg.hidden, experts_per_workgroup);
+  double flops = gemv_flops(cfg.tokens, cfg.hidden);
   double gbps = bytes / (avg_ms * 1.0e-3) / 1.0e9;
   double tops = flops / (avg_ms * 1.0e-3) / 1.0e12;
   double intensity = flops / bytes;
 
   std::cout << "bench  " << std::setw(16) << cfg.name << " tokens=" << std::setw(5) << cfg.tokens
-            << " experts_per_wg=" << moe::default_gate_gemv_experts_per_workgroup(experts_per_workgroup)
+            << " hidden=" << std::setw(4) << cfg.hidden << " experts_per_wg=" << moe::default_gate_gemv_experts_per_workgroup(experts_per_workgroup)
             << " subgroup=" << moe::default_gate_gemv_subgroup_size(subgroup_size, cfg.tokens)
             << " avg_ms=" << std::fixed << std::setprecision(4) << avg_ms << " est_GB/s=" << std::setprecision(1)
             << gbps << " TOPS=" << std::setprecision(4) << tops << " flop_per_byte=" << std::setprecision(3)
             << intensity << std::defaultfloat << "\n";
 }
 
-std::vector<CaseConfig> make_suite(std::string const& suite, int64_t custom_tokens) {
+// The two shipped gate widths, both InklingModelConfig.hidden_size values:
+// 1536 (config default) and 6144 (production checkpoint, and the width
+// sglang's _INKLING_GATE_GEMV_HIDDEN shortcut is built for).
+static constexpr int kHiddenDefault = 1536;
+static constexpr int kHiddenProd = moe::kGateHiddenSpecialized;
+
+// Not a model width: an intentionally awkward one, so the generic runtime-hidden
+// path is exercised at a size that is neither the specialization nor a multiple
+// of the maximum warps-per-token slice count.
+static constexpr int kHiddenOdd = 1540;
+
+std::vector<CaseConfig> make_suite(std::string const& suite, int64_t custom_tokens, int custom_hidden) {
   if (custom_tokens >= 0) {
-    return {{"custom", custom_tokens}};
+    return {{"custom", custom_tokens, custom_hidden}};
   }
   if (suite == "quick") {
     return {
-        {"zero", 0},
-        {"decode_1", 1},
-        {"decode_2", 2},
-        {"decode_3", 3},
-        {"decode_4", 4},
-        {"boundary_8", 8},
+        {"zero", 0, kHiddenProd},
+        {"decode_1", 1, kHiddenProd},
+        {"decode_2", 2, kHiddenProd},
+        {"decode_3", 3, kHiddenProd},
+        {"decode_4", 4, kHiddenProd},
+        {"boundary_8", 8, kHiddenProd},
+        {"h1536_decode_1", 1, kHiddenDefault},
+        {"h1536_decode_4", 4, kHiddenDefault},
+        {"h1536_boundary_8", 8, kHiddenDefault},
+        // 16-lane subgroups are the only way to reach warps_per_token > 1, and
+        // an odd width is the only way its ceil-div contraction slice can drop
+        // a tail. Without these two the slice arithmetic is untested.
+        {"slice_sg16_5", 5, kHiddenOdd, 16},
+        {"slice_sg16_8", 8, kHiddenOdd, 16},
     };
   }
   if (suite == "full") {
-    return {
-        {"zero", 0},
-        {"decode_1", 1},
-        {"decode_2", 2},
-        {"decode_3", 3},
-        {"decode_4", 4},
-        {"edge_5", 5},
-        {"edge_7", 7},
-        {"boundary_8", 8},
-        {"extend_17", 17},
-        {"fused_cap_64", 64},
-    };
+    std::vector<CaseConfig> cases;
+    for (int hidden : {kHiddenProd, kHiddenDefault}) {
+      std::string tag = hidden == kHiddenProd ? "" : "h" + std::to_string(hidden) + "_";
+      cases.push_back({tag + "zero", 0, hidden});
+      cases.push_back({tag + "decode_1", 1, hidden});
+      cases.push_back({tag + "decode_2", 2, hidden});
+      cases.push_back({tag + "decode_3", 3, hidden});
+      cases.push_back({tag + "decode_4", 4, hidden});
+      cases.push_back({tag + "edge_5", 5, hidden});
+      cases.push_back({tag + "edge_7", 7, hidden});
+      cases.push_back({tag + "boundary_8", 8, hidden});
+      cases.push_back({tag + "extend_17", 17, hidden});
+      cases.push_back({tag + "fused_cap_64", 64, hidden});
+      cases.push_back({tag + "sg16_5", 5, hidden, 16});
+      cases.push_back({tag + "sg16_8", 8, hidden, 16});
+    }
+    for (int64_t tokens : {1, 4, 5, 7, 8, 17}) {
+      cases.push_back({"odd_" + std::to_string(tokens), tokens, kHiddenOdd});
+      cases.push_back({"odd_sg16_" + std::to_string(tokens), tokens, kHiddenOdd, 16});
+    }
+    return cases;
   }
   if (suite == "perf") {
     return {
-        {"decode_1", 1},
-        {"decode_2", 2},
-        {"decode_3", 3},
-        {"decode_4", 4},
-        {"larger_64", 64},
-        {"larger_512", 512},
+        {"decode_1", 1, kHiddenProd},
+        {"decode_2", 2, kHiddenProd},
+        {"decode_3", 3, kHiddenProd},
+        {"decode_4", 4, kHiddenProd},
+        {"larger_64", 64, kHiddenProd},
+        {"larger_512", 512, kHiddenProd},
+        {"h1536_decode_1", 1, kHiddenDefault},
+        {"h1536_decode_4", 4, kHiddenDefault},
+        {"h1536_larger_64", 64, kHiddenDefault},
+        {"h1536_larger_512", 512, kHiddenDefault},
     };
   }
   throw std::invalid_argument("suite must be quick, full, or perf");
@@ -406,6 +459,12 @@ int main(int argc, char const** argv) {
     if (options.iterations <= 0 || options.warmup < 0) {
       throw std::invalid_argument("--iterations must be > 0 and --warmup must be >= 0");
     }
+    if (options.hidden <= 0) {
+      throw std::invalid_argument("--hidden must be > 0");
+    }
+    if (options.hidden_set && options.tokens < 0) {
+      throw std::invalid_argument("--hidden only applies to the --tokens custom case; pass --tokens too");
+    }
     (void)moe::default_gate_gemv_experts_per_workgroup(options.experts_per_workgroup);
     (void)moe::default_gate_gemv_subgroup_size(options.subgroup_size, 1);
 
@@ -415,20 +474,28 @@ int main(int argc, char const** argv) {
 
     std::cout << "Device: " << queue.get_device().get_info<sycl::info::device::name>() << "\n";
     std::cout << "Inkling gate GEMV: bf16 x bf16 -> fp32 logits [tokens, 264], writes columns [0, 258)\n";
+    std::cout << "hidden (gate contraction width = InklingModelConfig.hidden_size) is a runtime argument: "
+                 "6144 is the production checkpoint and the compile-time-specialized case, 1536 the config "
+                 "default; 1540 cases only exercise the generic path.\n";
     std::cout << "Roofline: production M<=4 has flop/byte ~= 0.50..0.80 at experts_per_wg=1, so this is "
                  "memory-bandwidth bound; 350 GB/s is the relevant target.\n";
 
-    std::vector<CaseConfig> cases = make_suite(options.suite, options.tokens);
+    std::vector<CaseConfig> cases = make_suite(options.suite, options.tokens, options.hidden);
     bool passed = true;
+    // A case-pinned subgroup size wins over the CLI default so the table can
+    // reach configurations the default dispatch never picks.
+    auto case_subgroup = [&](CaseConfig const& cfg) {
+      return cfg.subgroup != 0 ? cfg.subgroup : options.subgroup_size;
+    };
     if (options.verify && options.suite != "perf") {
       for (auto const& cfg : cases) {
-        passed &= verify_case(queue, cfg, options.experts_per_workgroup, options.subgroup_size);
+        passed &= verify_case(queue, cfg, options.experts_per_workgroup, case_subgroup(cfg));
       }
     }
     if (options.benchmark) {
       for (auto const& cfg : cases) {
         benchmark_case(
-            queue, cfg, options.experts_per_workgroup, options.subgroup_size, options.warmup, options.iterations);
+            queue, cfg, options.experts_per_workgroup, case_subgroup(cfg), options.warmup, options.iterations);
       }
     }
 
