@@ -676,6 +676,9 @@ std::vector<CaseConfig> quick_suite() {
   //       attn/mlp scattered TP=2/4/8   D=3072 / 1536 / 768
   //   * K/V sconv (head_dim=128, num_kv_heads=4, saturates at TP>=4):
   //       D=head_dim*num_tp_kv_heads = 512 / 256 / 128 / 128 for TP=1/2/4/8
+  //   * shipped thinkingmachines/Inkling checkpoint (hidden=768, Nkv=2,
+  //     swa_Nkv=4, head_dim=128): see --suite=inkling, which carries one case per
+  //     conv stream at every TP, including the 768/8 = 96 shard.
   return {
       {"decode_b5_w3_d7", 5, 3, 7, 1, false, true, false},
       {"decode_b32_w3_d128", 32, 3, 128, 1, false, true, false},
@@ -716,6 +719,113 @@ std::vector<CaseConfig> quick_suite() {
       {"inkling_extend_mixed_prod_tp2_b8_w3_d3072_q128", 8, 3, 3072, 128, true, true, true},
       {"inkling_extend_mixed_prod_tp4_b8_w3_d1536_q128", 8, 3, 1536, 128, true, true, true},
       {"inkling_extend_mixed_prod_tp8_b8_w3_d768_q128", 8, 3, 768, 128, true, true, true},
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Shipped Inkling geometry: the six conv streams and their per-TP dims.
+//
+// srt/configs/inkling.py:215-253 (InklingModelConfig.mamba2_cache_params)
+// allocates SIX conv-state streams per layer, each (W-1, dim) in bfloat16 with
+// W-1 = sconv_kernel_size - 1 = 3 (inkling.py:238, 250):
+//
+//   SconvType (models/inkling_common/sconv.py:28-35)   dim
+//   ---------------------------------------------------------------------------
+//   K_FULL, V_FULL     dim = max(1, num_key_value_heads     / P) * head_dim
+//   K_LOCAL, V_LOCAL   dim = max(1, swa_num_key_value_heads / P) * swa_head_dim
+//   ATTN, MLP          dim = hidden_size, or hidden_size / P when
+//                            --enable-scattered-sconv is set (inkling.py:231-237)
+//
+// The max(1, ...) KV replication rule is inkling.py:222-228 and
+// models/inkling_common/attn.py:297 -- a KV head is REPLICATED once the head
+// count is exhausted, so the stream dim floors at one head_dim.
+//
+// Shipped checkpoint (thinkingmachines/Inkling config.json text_config):
+// hidden_size=768, num_hidden_layers=8, num_attention_heads=8,
+// num_key_value_heads=2, head_dim=128, swa_num_key_value_heads=4,
+// swa_head_dim=128, sconv_kernel_size=4, mtp num_nextn_predict_layers=2
+// (-> draft_token_num=3):
+//
+//   TP   K_FULL/V_FULL   K_LOCAL/V_LOCAL   ATTN/MLP (scattered)   ATTN/MLP (plain)
+//    1        256              512                768                  768
+//    2        128              256                384                  768
+//    4        128              128                192                  768
+//    8        128              128                 96                  768
+//
+// Config defaults (hidden=1536, Nkv=swa_Nkv=4, head_dim=128): K_*/V_* =
+// {512,256,128,128}, scattered ATTN/MLP = {1536,768,384,192}, plain = 1536.
+// Production (hidden=6144, same head geometry, draft_token_num=9): K_*/V_* =
+// {512,256,128,128}, scattered ATTN/MLP = {6144,3072,1536,768}, plain = 6144.
+//
+// update_sconv_cache is activation/residual agnostic (it only shifts the
+// window), so there is no activation combination to align here; the conv itself
+// is called with activation=None / use_residual=True (sconv.py:64-65 defaults,
+// unoverridden at models/inkling.py:237,:247 and
+// models/inkling_common/attn.py:359,:369).
+// ---------------------------------------------------------------------------
+std::vector<CaseConfig> inkling_suite() {
+  return {
+      // === Shipped checkpoint: one extend case per conv stream at TP={1,2,4,8}.
+      // Varied lengths + pad slots + empty ranges exercise every metadata branch.
+      {"ckpt_tp1_k_full_b8_w3_d256_q128", 8, 3, 256, 128, true, true, true},
+      {"ckpt_tp1_v_full_b8_w3_d256_q128", 8, 3, 256, 128, true, true, true},
+      {"ckpt_tp1_k_local_b8_w3_d512_q128", 8, 3, 512, 128, true, true, true},
+      {"ckpt_tp1_v_local_b8_w3_d512_q128", 8, 3, 512, 128, true, true, true},
+      {"ckpt_tp1_attn_b8_w3_d768_q128", 8, 3, 768, 128, true, true, true},
+      {"ckpt_tp1_mlp_b8_w3_d768_q128", 8, 3, 768, 128, true, true, true},
+      {"ckpt_tp2_k_full_b8_w3_d128_q128", 8, 3, 128, 128, true, true, true},
+      {"ckpt_tp2_v_full_b8_w3_d128_q128", 8, 3, 128, 128, true, true, true},
+      {"ckpt_tp2_k_local_b8_w3_d256_q128", 8, 3, 256, 128, true, true, true},
+      {"ckpt_tp2_v_local_b8_w3_d256_q128", 8, 3, 256, 128, true, true, true},
+      {"ckpt_tp2_attn_b8_w3_d384_q128", 8, 3, 384, 128, true, true, true},
+      {"ckpt_tp2_mlp_b8_w3_d384_q128", 8, 3, 384, 128, true, true, true},
+      {"ckpt_tp4_k_full_b8_w3_d128_q128", 8, 3, 128, 128, true, true, true},
+      {"ckpt_tp4_v_full_b8_w3_d128_q128", 8, 3, 128, 128, true, true, true},
+      {"ckpt_tp4_k_local_b8_w3_d128_q128", 8, 3, 128, 128, true, true, true},
+      {"ckpt_tp4_v_local_b8_w3_d128_q128", 8, 3, 128, 128, true, true, true},
+      {"ckpt_tp4_attn_b8_w3_d192_q128", 8, 3, 192, 128, true, true, true},
+      {"ckpt_tp4_mlp_b8_w3_d192_q128", 8, 3, 192, 128, true, true, true},
+      {"ckpt_tp8_k_full_b8_w3_d128_q128", 8, 3, 128, 128, true, true, true},
+      {"ckpt_tp8_v_full_b8_w3_d128_q128", 8, 3, 128, 128, true, true, true},
+      {"ckpt_tp8_k_local_b8_w3_d128_q128", 8, 3, 128, 128, true, true, true},
+      {"ckpt_tp8_v_local_b8_w3_d128_q128", 8, 3, 128, 128, true, true, true},
+      // 768/8 = 96 is the one checkpoint dim no other configuration produces.
+      {"ckpt_tp8_attn_b8_w3_d96_q128", 8, 3, 96, 128, true, true, true},
+      {"ckpt_tp8_mlp_b8_w3_d96_q128", 8, 3, 96, 128, true, true, true},
+      // Checkpoint non-scattered ATTN/MLP: dim = hidden_size = 768 at every TP.
+      {"ckpt_plain_attn_mlp_b8_w3_d768_q128", 8, 3, 768, 128, true, true, true},
+      // Checkpoint decode (qlen=1) and target-verify (draft_token_num=3) at each
+      // distinct checkpoint stream dim.
+      {"ckpt_decode_b128_w3_d96_q1", 128, 3, 96, 1, false, true, false},
+      {"ckpt_decode_b128_w3_d128_q1", 128, 3, 128, 1, false, true, false},
+      {"ckpt_decode_b128_w3_d192_q1", 128, 3, 192, 1, false, true, false},
+      {"ckpt_decode_b128_w3_d256_q1", 128, 3, 256, 1, false, true, false},
+      {"ckpt_decode_b128_w3_d384_q1", 128, 3, 384, 1, false, true, false},
+      {"ckpt_decode_b128_w3_d512_q1", 128, 3, 512, 1, false, true, false},
+      {"ckpt_decode_b128_w3_d768_q1", 128, 3, 768, 1, false, true, false},
+      {"ckpt_verify_b16_w3_d96_q3", 16, 3, 96, 3, false, true, false},
+      {"ckpt_verify_b16_w3_d128_q3", 16, 3, 128, 3, false, true, false},
+      {"ckpt_verify_b16_w3_d192_q3", 16, 3, 192, 3, false, true, false},
+      {"ckpt_verify_b16_w3_d256_q3", 16, 3, 256, 3, false, true, false},
+      {"ckpt_verify_b16_w3_d384_q3", 16, 3, 384, 3, false, true, false},
+      {"ckpt_verify_b16_w3_d512_q3", 16, 3, 512, 3, false, true, false},
+      {"ckpt_verify_b16_w3_d768_q3", 16, 3, 768, 3, false, true, false},
+      // === Config defaults (hidden=1536) and production (hidden=6144): one
+      // extend case per stream at TP={1,2,4,8}. K_*/V_* dims are identical for
+      // the full and local streams because swa_num_key_value_heads defaults to
+      // num_key_value_heads (inkling.py:82-83).
+      {"dflt_tp1_kv_b8_w3_d512_q128", 8, 3, 512, 128, true, true, true},
+      {"dflt_tp2_kv_b8_w3_d256_q128", 8, 3, 256, 128, true, true, true},
+      {"dflt_tp4_kv_b8_w3_d128_q128", 8, 3, 128, 128, true, true, true},
+      {"dflt_tp8_kv_b8_w3_d128_q128", 8, 3, 128, 128, true, true, true},
+      {"dflt_tp1_attn_mlp_b8_w3_d1536_q128", 8, 3, 1536, 128, true, true, true},
+      {"dflt_tp2_attn_mlp_b8_w3_d768_q128", 8, 3, 768, 128, true, true, true},
+      {"dflt_tp4_attn_mlp_b8_w3_d384_q128", 8, 3, 384, 128, true, true, true},
+      {"dflt_tp8_attn_mlp_b8_w3_d192_q128", 8, 3, 192, 128, true, true, true},
+      {"prod_tp1_attn_mlp_b8_w3_d6144_q128", 8, 3, 6144, 128, true, true, true},
+      {"prod_tp2_attn_mlp_b8_w3_d3072_q128", 8, 3, 3072, 128, true, true, true},
+      {"prod_tp4_attn_mlp_b8_w3_d1536_q128", 8, 3, 1536, 128, true, true, true},
+      {"prod_tp8_attn_mlp_b8_w3_d768_q128", 8, 3, 768, 128, true, true, true},
   };
 }
 
@@ -771,6 +881,56 @@ std::vector<CaseConfig> perf_suite() {
       {"inkling_verify_b128_w3_d128_q9", 128, 3, 128, 9, false, false, false},
       {"inkling_extend_b256_w3_d1536_q256", 256, 3, 1536, 256, false, false, false},
       {"inkling_extend_b256_w3_d6144_q256", 256, 3, 6144, 256, false, false, false},
+      // === Shipped checkpoint geometry (hidden=768, Nkv=2, swa_Nkv=4, hd=128):
+      // one case per conv stream at TP={1,2,4,8}. See the table above
+      // inkling_suite(). B=64 x qlen=1024 matches the pre-existing inkling_*
+      // cases above so the numbers are directly comparable.
+      //
+      // NOTE on gating: this kernel only touches the trailing (W-1) rows, so
+      // effective_bytes() is batch*(W-1)*channels*2*sizeof(Element) and does not
+      // grow with qlen. Even the widest case here (B=64, D=768) is ~0.56 MiB,
+      // far under kMinSustainedTargetBytes (32 MiB), so --target-gbps does not
+      // apply to any of these rows -- they are report-only, exactly like the
+      // pre-existing inkling_* perf cases above. Reaching the gate would need
+      // batch in the thousands, which is not a shape the model ever runs.
+      // Several rows below are byte-identical shapes under different names (the
+      // k_*/v_* pairs are always equal, and TP>=2 collapses several KV dims onto
+      // D=128); they are kept distinct so a regression is attributable to the
+      // conv stream that runs it. Use --shape= to time one distinct shape.
+      {"perf_ckpt_tp1_k_full_b64_w3_d256_q1024", 64, 3, 256, 1024, false, false, false},
+      {"perf_ckpt_tp1_v_full_b64_w3_d256_q1024", 64, 3, 256, 1024, false, false, false},
+      {"perf_ckpt_tp1_k_local_b64_w3_d512_q1024", 64, 3, 512, 1024, false, false, false},
+      {"perf_ckpt_tp1_v_local_b64_w3_d512_q1024", 64, 3, 512, 1024, false, false, false},
+      {"perf_ckpt_tp1_attn_b64_w3_d768_q1024", 64, 3, 768, 1024, false, false, false},
+      {"perf_ckpt_tp1_mlp_b64_w3_d768_q1024", 64, 3, 768, 1024, false, false, false},
+      {"perf_ckpt_tp2_k_full_b64_w3_d128_q1024", 64, 3, 128, 1024, false, false, false},
+      {"perf_ckpt_tp2_v_full_b64_w3_d128_q1024", 64, 3, 128, 1024, false, false, false},
+      {"perf_ckpt_tp2_k_local_b64_w3_d256_q1024", 64, 3, 256, 1024, false, false, false},
+      {"perf_ckpt_tp2_v_local_b64_w3_d256_q1024", 64, 3, 256, 1024, false, false, false},
+      {"perf_ckpt_tp2_attn_b64_w3_d384_q1024", 64, 3, 384, 1024, false, false, false},
+      {"perf_ckpt_tp2_mlp_b64_w3_d384_q1024", 64, 3, 384, 1024, false, false, false},
+      {"perf_ckpt_tp4_k_full_b64_w3_d128_q1024", 64, 3, 128, 1024, false, false, false},
+      {"perf_ckpt_tp4_v_full_b64_w3_d128_q1024", 64, 3, 128, 1024, false, false, false},
+      {"perf_ckpt_tp4_k_local_b64_w3_d128_q1024", 64, 3, 128, 1024, false, false, false},
+      {"perf_ckpt_tp4_v_local_b64_w3_d128_q1024", 64, 3, 128, 1024, false, false, false},
+      {"perf_ckpt_tp4_attn_b64_w3_d192_q1024", 64, 3, 192, 1024, false, false, false},
+      {"perf_ckpt_tp4_mlp_b64_w3_d192_q1024", 64, 3, 192, 1024, false, false, false},
+      {"perf_ckpt_tp8_k_full_b64_w3_d128_q1024", 64, 3, 128, 1024, false, false, false},
+      {"perf_ckpt_tp8_v_full_b64_w3_d128_q1024", 64, 3, 128, 1024, false, false, false},
+      {"perf_ckpt_tp8_k_local_b64_w3_d128_q1024", 64, 3, 128, 1024, false, false, false},
+      {"perf_ckpt_tp8_v_local_b64_w3_d128_q1024", 64, 3, 128, 1024, false, false, false},
+      {"perf_ckpt_tp8_attn_b64_w3_d96_q1024", 64, 3, 96, 1024, false, false, false},
+      {"perf_ckpt_tp8_mlp_b64_w3_d96_q1024", 64, 3, 96, 1024, false, false, false},
+      // Checkpoint non-scattered ATTN/MLP: dim = hidden_size = 768 at every TP.
+      {"perf_ckpt_plain_attn_mlp_b64_w3_d768_q1024", 64, 3, 768, 1024, false, false, false},
+      // Checkpoint target-verify: mtp num_nextn_predict_layers=2 -> draft_token_num=3.
+      {"perf_ckpt_verify_b128_w3_d96_q3", 128, 3, 96, 3, false, false, false},
+      {"perf_ckpt_verify_b128_w3_d128_q3", 128, 3, 128, 3, false, false, false},
+      {"perf_ckpt_verify_b128_w3_d192_q3", 128, 3, 192, 3, false, false, false},
+      {"perf_ckpt_verify_b128_w3_d256_q3", 128, 3, 256, 3, false, false, false},
+      {"perf_ckpt_verify_b128_w3_d384_q3", 128, 3, 384, 3, false, false, false},
+      {"perf_ckpt_verify_b128_w3_d512_q3", 128, 3, 512, 3, false, false, false},
+      {"perf_ckpt_verify_b128_w3_d768_q3", 128, 3, 768, 3, false, false, false},
   };
 }
 
@@ -863,7 +1023,8 @@ struct Options {
     out << "Inkling BMG SConv Cache Update Example\n\n"
         << "Options:\n"
         << "  --help                         Print this message\n"
-        << "  --suite=<quick|stress|perf>     Built-in shape suite (default: quick)\n"
+        << "  --suite=<quick|inkling|stress|perf>\n"
+        << "                                  Built-in shape suite (default: quick)\n"
         << "  --shape=<k=v,...>               Run one custom shape instead of a suite\n"
         << "                                  Keys: name,B,Wm1,D,qlen,mixed,pad,empty,\n"
         << "                                        xpad,cachepad,slotpad,xoff,cacheoff,random,seed\n"
@@ -909,6 +1070,8 @@ int main(int argc, char const** argv) {
     cases.push_back(cfg);
   } else if (options.suite == "quick") {
     cases = quick_suite();
+  } else if (options.suite == "inkling") {
+    cases = inkling_suite();
   } else if (options.suite == "stress") {
     cases = stress_suite();
   } else if (options.suite == "perf") {
