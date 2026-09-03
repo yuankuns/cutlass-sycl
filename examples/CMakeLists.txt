@@ -139,6 +139,7 @@ if (CUTLASS_ENABLE_SYCL)
       23_bmg_mel_embedding_sum
       24_bmg_moe_silu_and_mul
       25_bmg_moe_reorder_grouped_gemm
+      26_bmg_shared_expert_mlp
       50_xe35_block_scaled_gemm
       51_xe35_block_scaled_grouped_gemm
       )
