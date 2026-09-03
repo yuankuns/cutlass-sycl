@@ -140,6 +140,7 @@ if (CUTLASS_ENABLE_SYCL)
       24_bmg_moe_silu_and_mul
       25_bmg_moe_reorder_grouped_gemm
       26_bmg_shared_expert_mlp
+      27_bmg_hmlp_linear_gelu
       50_xe35_block_scaled_gemm
       51_xe35_block_scaled_grouped_gemm
       )
