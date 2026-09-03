@@ -8,16 +8,25 @@
  *   fold_timespace_to_depth is a reshape/permute/reshape materialization with
  *   no arithmetic. Each element is read once and written once, so arithmetic
  *   intensity is 0 FLOP/B and the useful metric is sustained effective memory
- *   bandwidth over input + output bytes. The optimized path uses ESIMD 256-512B
- *   block copies for sustained large-row shuffles, with 16-128B vector-lane
- *   fallbacks, and keeps t_fold/hw_fold runtime parameters because Inkling
- *   derives them from prime factors of the model patch sizes.
+ *   bandwidth over input + output bytes. The copy engine is plain SYCL only (no
+ *   ESIMD): each work item moves a whole number of 16B packs, and neighbouring
+ *   work items cover neighbouring packs so that one subgroup instruction lands
+ *   as a single fully-coalesced 16-lane x 16B = 256B LSC message -- exactly the
+ *   message shape the ESIMD block_load<uint32_t, 64> this file used to carry
+ *   produced from one thread. Measured on B60 the rewrite lands 1-3% under the
+ *   ESIMD it replaces on the shuffle rows (f32: 390.8 vs 399.9, 393.4 vs 397.7,
+ *   391.5 vs 402.4 GB/s; bf16/fp16 neutral), which is where the part runs out of
+ *   DRAM: the same buffers moved by plain queue.memcpy only reach 379-392 GB/s.
+ *   There is no headroom left for a wider message, so no ESIMD, inline vISA or
+ *   group_load/striped formulation can buy anything back here. t_fold/hw_fold stay
+ *   runtime parameters because Inkling derives them from the prime factors of
+ *   the model patch sizes, so non-power-of-two folds (hw_fold=5 at patch_size
+ *   40, hw_fold=7 at patch_size 14) must stay correct on the general path.
  **************************************************************************************************/
 
 #pragma once
 
 #include <sycl/sycl.hpp>
-#include <sycl/ext/intel/esimd.hpp>
 
 #include "cutlass/bfloat16.h"
 #include "cutlass/half.h"
@@ -34,11 +43,6 @@ namespace cutlass::examples::bmg_hmlp {
 
 constexpr int kBlockSize = 256;
 constexpr int kPackBytes = 16;
-constexpr int kMediumLaneBytes = 64;
-constexpr int kLargeLaneBytes = 128;
-constexpr int kEsimdCopyWords = 64;
-constexpr int kLargeEsimdCopyWords = 128;
-constexpr int64_t kLargeLaneElementsThreshold = 1 << 20;
 
 inline int64_t ceil_div(int64_t x, int64_t y) {
   return (x + y - 1) / y;
@@ -134,8 +138,6 @@ struct FoldParams {
   int w_new = 0;
   int fold_count = 1;
   int64_t total_elements = 0;
-  int64_t lanes_per_segment = 0;
-  int64_t vec_count = 0;
 };
 
 template <typename Element>
@@ -203,10 +205,10 @@ int64_t segment_count(FoldParams<Element> const& params) {
   return static_cast<int64_t>(params.B) * params.t_new * params.h_new * params.w_new * params.fold_count;
 }
 
-template <typename Element, int LaneElems>
-class FoldTimespaceToDepthKernel;
+template <typename Element, bool Packed>
+class FoldTimespaceToDepthSegmentKernel;
 
-template <typename Element, int LaneElems>
+template <typename Element, bool Packed>
 class FoldTimespaceToDepthRowSliceKernel;
 
 template <typename Element, int HwFold>
@@ -214,135 +216,6 @@ class FoldTimespaceToDepthSpatialC3T1Kernel;
 
 template <typename Element, int HwFold>
 class FoldTimespaceToDepthSpatialC3T1PairKernel;
-
-template <typename Element, int HwFold>
-class FoldTimespaceToDepthSpatialC3T1RowKernel;
-
-template <typename Element, int CopyWords>
-class FoldTimespaceToDepthSegmentEsimdKernel {
- public:
-  FoldParams<Element> params;
-  int chunks_per_segment = 0;
-
-  void operator()(sycl::item<1> item) const SYCL_ESIMD_KERNEL {
-    int linear = static_cast<int>(item.get_linear_id());
-    int segment = linear / chunks_per_segment;
-    int chunk = linear - segment * chunks_per_segment;
-
-    int fold = segment % params.fold_count;
-    int outer = segment / params.fold_count;
-    int w_out = outer % params.w_new;
-    outer /= params.w_new;
-    int h_out = outer % params.h_new;
-    outer /= params.h_new;
-    int t_out = outer % params.t_new;
-    int b = outer / params.t_new;
-
-    int wf = fold % params.hw_fold;
-    int fold_tmp = fold / params.hw_fold;
-    int hf = fold_tmp % params.hw_fold;
-    int tf = fold_tmp / params.hw_fold;
-
-    int64_t src = (((static_cast<int64_t>(b) * params.T + t_out * params.t_fold + tf) *
-                        params.H +
-                    h_out * params.hw_fold + hf) *
-                       params.W +
-                   w_out * params.hw_fold + wf) *
-        params.C;
-    int64_t dst = static_cast<int64_t>(segment) * params.C;
-
-    auto value = sycl::ext::intel::esimd::block_load<uint32_t, CopyWords>(
-        reinterpret_cast<uint32_t const*>(params.x + src) + chunk * CopyWords);
-    sycl::ext::intel::esimd::block_store<uint32_t, CopyWords>(
-        reinterpret_cast<uint32_t*>(params.out + dst) + chunk * CopyWords, value);
-  }
-};
-
-template <typename Element, int CopyWords>
-class FoldTimespaceToDepthRowSliceEsimdKernel {
- public:
-  FoldParams<Element> params;
-  int chunks_per_slice = 0;
-
-  void operator()(sycl::item<1> item) const SYCL_ESIMD_KERNEL {
-    int linear = static_cast<int>(item.get_linear_id());
-    int slice = linear / chunks_per_slice;
-    int chunk = linear - slice * chunks_per_slice;
-
-    int hf = slice % params.hw_fold;
-    slice /= params.hw_fold;
-    int tf = slice % params.t_fold;
-    int outer = slice / params.t_fold;
-    int w_out = outer % params.w_new;
-    outer /= params.w_new;
-    int h_out = outer % params.h_new;
-    outer /= params.h_new;
-    int t_out = outer % params.t_new;
-    int b = outer / params.t_new;
-
-    int64_t outer_cell = (((static_cast<int64_t>(b) * params.t_new + t_out) * params.h_new + h_out) *
-                              params.w_new +
-                          w_out);
-    int64_t dst = (outer_cell * params.fold_count +
-                   (static_cast<int64_t>(tf) * params.hw_fold + hf) * params.hw_fold) *
-        params.C;
-    int64_t src = (((static_cast<int64_t>(b) * params.T + t_out * params.t_fold + tf) *
-                        params.H +
-                    h_out * params.hw_fold + hf) *
-                       params.W +
-                   w_out * params.hw_fold) *
-        params.C;
-
-    auto value = sycl::ext::intel::esimd::block_load<uint32_t, CopyWords>(
-        reinterpret_cast<uint32_t const*>(params.x + src) + chunk * CopyWords);
-    sycl::ext::intel::esimd::block_store<uint32_t, CopyWords>(
-        reinterpret_cast<uint32_t*>(params.out + dst) + chunk * CopyWords, value);
-  }
-};
-
-template <typename Element, int CopyWords>
-class FoldTimespaceToDepthHwf2PairRowsEsimdKernel {
- public:
-  FoldParams<Element> params;
-  int chunks_per_slice = 0;
-
-  void operator()(sycl::item<1> item) const SYCL_ESIMD_KERNEL {
-    int linear = static_cast<int>(item.get_linear_id());
-    int tf_cell = linear / chunks_per_slice;
-    int chunk = linear - tf_cell * chunks_per_slice;
-
-    int tf = tf_cell % params.t_fold;
-    int outer_cell_i = tf_cell / params.t_fold;
-    int outer = outer_cell_i;
-    int w_out = outer % params.w_new;
-    outer /= params.w_new;
-    int h_out = outer % params.h_new;
-    outer /= params.h_new;
-    int t_out = outer % params.t_new;
-    int b = outer / params.t_new;
-
-    int64_t src0 = (((static_cast<int64_t>(b) * params.T + t_out * params.t_fold + tf) * params.H +
-                     h_out * 2) *
-                        params.W +
-                    w_out * 2) *
-        params.C;
-    int64_t src1 = src0 + static_cast<int64_t>(params.W) * params.C;
-    int64_t outer_cell = (((static_cast<int64_t>(b) * params.t_new + t_out) * params.h_new + h_out) *
-                              params.w_new +
-                          w_out);
-    int64_t dst0 = (outer_cell * params.fold_count + static_cast<int64_t>(tf) * 4) * params.C;
-    int64_t dst1 = dst0 + 2 * params.C;
-
-    auto row0 = sycl::ext::intel::esimd::block_load<uint32_t, CopyWords>(
-        reinterpret_cast<uint32_t const*>(params.x + src0) + chunk * CopyWords);
-    auto row1 = sycl::ext::intel::esimd::block_load<uint32_t, CopyWords>(
-        reinterpret_cast<uint32_t const*>(params.x + src1) + chunk * CopyWords);
-    sycl::ext::intel::esimd::block_store<uint32_t, CopyWords>(
-        reinterpret_cast<uint32_t*>(params.out + dst0) + chunk * CopyWords, row0);
-    sycl::ext::intel::esimd::block_store<uint32_t, CopyWords>(
-        reinterpret_cast<uint32_t*>(params.out + dst1) + chunk * CopyWords, row1);
-  }
-};
 
 template <typename Element>
 bool pointer_aligned(Element const* ptr, int bytes) {
@@ -352,32 +225,6 @@ bool pointer_aligned(Element const* ptr, int bytes) {
 template <typename Element>
 bool pointer_aligned(Element* ptr, int bytes) {
   return reinterpret_cast<std::uintptr_t>(ptr) % static_cast<std::uintptr_t>(bytes) == 0;
-}
-
-template <int CopyWords, typename Element>
-bool can_use_esimd_segment_copy(FoldParams<Element> const& params, int& chunks_per_segment) {
-  constexpr int kCopyBytes = CopyWords * static_cast<int>(sizeof(uint32_t));
-  int segment_bytes = params.C * static_cast<int>(sizeof(Element));
-  if (segment_bytes % kCopyBytes != 0 ||
-      !pointer_aligned(params.x, kPackBytes) ||
-      !pointer_aligned(params.out, kPackBytes)) {
-    return false;
-  }
-  chunks_per_segment = segment_bytes / kCopyBytes;
-  return chunks_per_segment > 0;
-}
-
-template <int CopyWords, typename Element>
-bool can_use_esimd_row_slice_copy(FoldParams<Element> const& params, int& chunks_per_slice) {
-  constexpr int kCopyBytes = CopyWords * static_cast<int>(sizeof(uint32_t));
-  int slice_bytes = params.hw_fold * params.C * static_cast<int>(sizeof(Element));
-  if (slice_bytes % kCopyBytes != 0 ||
-      !pointer_aligned(params.x, kPackBytes) ||
-      !pointer_aligned(params.out, kPackBytes)) {
-    return false;
-  }
-  chunks_per_slice = slice_bytes / kCopyBytes;
-  return chunks_per_slice > 0;
 }
 
 template <typename Element, int HwFold>
@@ -400,71 +247,33 @@ inline int spatial_c3_t1_src_index(int idx, FoldParams<Element> const& params) {
   return (((b * params.H + h_out * HwFold + hf) * params.W + w_out * HwFold + wf) * kChannels) + c;
 }
 
-template <int CopyWords, typename Element>
-sycl::event launch_fold_segment_esimd(sycl::queue& queue, FoldParams<Element> params, int chunks_per_segment) {
-  int64_t total_chunks = segment_count(params) * static_cast<int64_t>(chunks_per_segment);
-  if (total_chunks > std::numeric_limits<int>::max()) {
-    throw std::invalid_argument("fold_timespace_to_depth ESIMD segment launch exceeds 32-bit indexing");
-  }
-  FoldTimespaceToDepthSegmentEsimdKernel<Element, CopyWords> kernel{params, chunks_per_segment};
-  return queue.parallel_for<FoldTimespaceToDepthSegmentEsimdKernel<Element, CopyWords>>(
-      sycl::range<1>(static_cast<std::size_t>(total_chunks)), kernel);
-}
-
-template <int CopyWords, typename Element>
-sycl::event launch_fold_row_slice_esimd(sycl::queue& queue, FoldParams<Element> params, int chunks_per_slice) {
-  int64_t slices = static_cast<int64_t>(params.B) * params.t_new * params.h_new * params.w_new *
-      params.t_fold * params.hw_fold;
-  int64_t total_chunks = slices * static_cast<int64_t>(chunks_per_slice);
-  if (total_chunks > std::numeric_limits<int>::max()) {
-    throw std::invalid_argument("fold_timespace_to_depth ESIMD row-slice launch exceeds 32-bit indexing");
-  }
-  FoldTimespaceToDepthRowSliceEsimdKernel<Element, CopyWords> kernel{params, chunks_per_slice};
-  return queue.parallel_for<FoldTimespaceToDepthRowSliceEsimdKernel<Element, CopyWords>>(
-      sycl::range<1>(static_cast<std::size_t>(total_chunks)), kernel);
-}
-
-template <int CopyWords, typename Element>
-sycl::event launch_fold_hwf2_pair_rows_esimd(
-    sycl::queue& queue,
-    FoldParams<Element> params,
-    int chunks_per_slice) {
-  int64_t tf_cells = static_cast<int64_t>(params.B) * params.t_new * params.h_new * params.w_new * params.t_fold;
-  int64_t total_chunks = tf_cells * static_cast<int64_t>(chunks_per_slice);
-  if (total_chunks > std::numeric_limits<int>::max()) {
-    throw std::invalid_argument("fold_timespace_to_depth ESIMD hwf2 launch exceeds 32-bit indexing");
-  }
-  FoldTimespaceToDepthHwf2PairRowsEsimdKernel<Element, CopyWords> kernel{params, chunks_per_slice};
-  return queue.parallel_for<FoldTimespaceToDepthHwf2PairRowsEsimdKernel<Element, CopyWords>>(
-      sycl::range<1>(static_cast<std::size_t>(total_chunks)), kernel);
-}
-
-template <typename Element, int LaneElems>
-sycl::event launch_fold_kernel_static(sycl::queue& queue, FoldParams<Element> params) {
+template <typename Element, bool Packed>
+sycl::event launch_fold_segment_kernel(sycl::queue& queue, FoldParams<Element> params) {
+  // One work item moves one 16B pack (Packed) or one element (fallback). The
+  // lane index is the fastest-varying part of the launch index, so the 16 lanes
+  // of a subgroup cover 16 consecutive packs and the load/store issues as a
+  // single 256B LSC message. Wider per-lane copies were measured and rejected:
+  // a 64B/128B lane makes neighbouring lanes 64B/128B apart, which splits every
+  // message into 16 scattered chunks and costs 35-38% of peak on B60 -- e.g.
+  // perf_spatial_hw2_c256 f32 measures 248 GB/s with a 128B lane against 393
+  // GB/s with the one-pack lane here. (That 248 is an intermediate variant of
+  // this rewrite, not the ESIMD baseline it replaces, which was 402 GB/s.)
   constexpr int kPackElems = kPackBytes / static_cast<int>(sizeof(Element));
   constexpr int kPackWords = kPackBytes / static_cast<int>(sizeof(uint32_t));
-  constexpr int kPacksPerLane = LaneElems / kPackElems;
-  static_assert(LaneElems % kPackElems == 0, "lane must contain whole 16B packs");
+  constexpr int kLaneElems = Packed ? kPackElems : 1;
 
-  bool aligned = (params.C % kPackElems == 0) &&
-      (reinterpret_cast<std::uintptr_t>(params.x) % kPackBytes == 0) &&
-      (reinterpret_cast<std::uintptr_t>(params.out) % kPackBytes == 0);
-
-  params.vec_count = aligned ? params.C / LaneElems : 0;
-  int64_t scalar_tail = params.C - params.vec_count * LaneElems;
-  params.lanes_per_segment = params.vec_count + scalar_tail;
+  int lanes_per_segment_i = params.C / kLaneElems;
 
   int64_t segments = segment_count(params);
-  int64_t total_lanes = segments * params.lanes_per_segment;
+  int64_t total_lanes = segments * lanes_per_segment_i;
   if (total_lanes > std::numeric_limits<int>::max()) {
     throw std::invalid_argument("fold_timespace_to_depth launch grid exceeds 32-bit work-item indexing");
   }
   int64_t global = round_up(total_lanes, kBlockSize);
   int total_lanes_i = static_cast<int>(total_lanes);
-  int lanes_per_segment_i = static_cast<int>(params.lanes_per_segment);
 
   return queue.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for<FoldTimespaceToDepthKernel<Element, LaneElems>>(
+    cgh.parallel_for<FoldTimespaceToDepthSegmentKernel<Element, Packed>>(
         sycl::nd_range<1>(
             sycl::range<1>(static_cast<std::size_t>(global)),
             sycl::range<1>(static_cast<std::size_t>(kBlockSize))),
@@ -491,13 +300,7 @@ sycl::event launch_fold_kernel_static(sycl::queue& queue, FoldParams<Element> pa
           int hf = fold_tmp % params.hw_fold;
           int tf = fold_tmp / params.hw_fold;
 
-          int c = 0;
-          if (lane < params.vec_count) {
-            c = lane * LaneElems;
-          } else {
-            c = static_cast<int>(params.vec_count) * LaneElems + (lane - static_cast<int>(params.vec_count));
-          }
-
+          int c = lane * kLaneElems;
           int64_t src = (((static_cast<int64_t>(b) * params.T + t_out * params.t_fold + tf) *
                               params.H +
                           h_out * params.hw_fold + hf) *
@@ -507,14 +310,10 @@ sycl::event launch_fold_kernel_static(sycl::queue& queue, FoldParams<Element> pa
               c;
           int64_t dst = static_cast<int64_t>(segment) * params.C + c;
 
-          if (lane < params.vec_count) {
-            using pack_t = sycl::vec<uint32_t, kPackWords>;
-#pragma unroll
-            for (int pack = 0; pack < kPacksPerLane; ++pack) {
-              pack_t value;
-              value.load(0, reinterpret_cast<uint32_t const*>(params.x + src + pack * kPackElems));
-              value.store(0, reinterpret_cast<uint32_t*>(params.out + dst + pack * kPackElems));
-            }
+          if constexpr (Packed) {
+            sycl::vec<uint32_t, kPackWords> value;
+            value.load(0, reinterpret_cast<uint32_t const*>(params.x + src));
+            value.store(0, reinterpret_cast<uint32_t*>(params.out + dst));
           } else {
             params.out[dst] = params.x[src];
           }
@@ -590,99 +389,30 @@ sycl::event launch_fold_spatial_c3_t1_kernel_static(sycl::queue& queue, FoldPara
   });
 }
 
-template <typename Element, int HwFold>
-sycl::event launch_fold_spatial_c3_t1_row_kernel_static(sycl::queue& queue, FoldParams<Element> params) {
-  static_assert(HwFold > 1, "spatial C3 row fast path is only useful for spatial folds");
-  constexpr int kChannels = 3;
-  constexpr int kElemsPerOutputCell = HwFold * HwFold * kChannels;
-  constexpr int kElemsPerInputRow = HwFold * kChannels;
-
-  int64_t rows = static_cast<int64_t>(params.B) * params.h_new * params.w_new * HwFold;
-  if (rows > std::numeric_limits<int>::max()) {
-    throw std::invalid_argument("fold_timespace_to_depth spatial C3 row launch exceeds 32-bit indexing");
-  }
-  int total_rows_i = static_cast<int>(rows);
-  int64_t global = round_up(total_rows_i, kBlockSize);
-
-  return queue.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for<FoldTimespaceToDepthSpatialC3T1RowKernel<Element, HwFold>>(
-        sycl::nd_range<1>(
-            sycl::range<1>(static_cast<std::size_t>(global)),
-            sycl::range<1>(static_cast<std::size_t>(kBlockSize))),
-        [=](sycl::nd_item<1> item) {
-          int row = static_cast<int>(item.get_global_id(0));
-          if (row >= total_rows_i) {
-            return;
-          }
-
-          int hf = row % HwFold;
-          int cell = row / HwFold;
-          int outer = cell;
-          int w_out = outer % params.w_new;
-          outer /= params.w_new;
-          int h_out = outer % params.h_new;
-          int b = outer / params.h_new;
-
-          int64_t dst = static_cast<int64_t>(cell) * kElemsPerOutputCell + hf * kElemsPerInputRow;
-          int64_t src = ((static_cast<int64_t>(b) * params.H + h_out * HwFold + hf) *
-                             params.W +
-                         w_out * HwFold) *
-              kChannels;
-
-          if constexpr (sizeof(Element) == 2 && HwFold == 7) {
-            if ((src & 1) == (dst & 1)) {
-              int start = static_cast<int>(src & 1);
-              if (start != 0) {
-                params.out[dst] = params.x[src];
-              }
-              uint32_t const* src_words = reinterpret_cast<uint32_t const*>(params.x + src + start);
-              uint32_t* dst_words = reinterpret_cast<uint32_t*>(params.out + dst + start);
-#pragma unroll
-              for (int word = 0; word < (kElemsPerInputRow - 1) / 2; ++word) {
-                dst_words[word] = src_words[word];
-              }
-              if (start == 0) {
-                params.out[dst + kElemsPerInputRow - 1] = params.x[src + kElemsPerInputRow - 1];
-              }
-              return;
-            }
-          }
-#pragma unroll
-          for (int row_elem = 0; row_elem < kElemsPerInputRow; ++row_elem) {
-            params.out[dst + row_elem] = params.x[src + row_elem];
-          }
-        });
-  });
-}
-
-template <typename Element, int LaneElems>
-sycl::event launch_fold_row_slice_kernel_static(sycl::queue& queue, FoldParams<Element> params) {
+template <typename Element, bool Packed>
+sycl::event launch_fold_row_slice_kernel(sycl::queue& queue, FoldParams<Element> params) {
+  // Row-slice form: the hw_fold consecutive w positions of one input row map to
+  // hw_fold consecutive output segments, so hw_fold * C elements are contiguous
+  // on both sides and one launch index walks that whole slice. Same one-pack-per
+  // -lane rule as launch_fold_segment_kernel, for the same measured reason.
   constexpr int kPackElems = kPackBytes / static_cast<int>(sizeof(Element));
   constexpr int kPackWords = kPackBytes / static_cast<int>(sizeof(uint32_t));
-  constexpr int kPacksPerLane = LaneElems / kPackElems;
-  static_assert(LaneElems % kPackElems == 0, "lane must contain whole 16B packs");
+  constexpr int kLaneElems = Packed ? kPackElems : 1;
 
   int slice_elems = params.hw_fold * params.C;
-  bool aligned = (params.C % kPackElems == 0) &&
-      (reinterpret_cast<std::uintptr_t>(params.x) % kPackBytes == 0) &&
-      (reinterpret_cast<std::uintptr_t>(params.out) % kPackBytes == 0);
-
-  params.vec_count = aligned ? slice_elems / LaneElems : 0;
-  int64_t scalar_tail = slice_elems - params.vec_count * LaneElems;
-  params.lanes_per_segment = params.vec_count + scalar_tail;
+  int lanes_per_slice_i = slice_elems / kLaneElems;
 
   int64_t slices = static_cast<int64_t>(params.B) * params.t_new * params.h_new * params.w_new *
       params.t_fold * params.hw_fold;
-  int64_t total_lanes = slices * params.lanes_per_segment;
+  int64_t total_lanes = slices * lanes_per_slice_i;
   if (total_lanes > std::numeric_limits<int>::max()) {
     throw std::invalid_argument("fold_timespace_to_depth row-slice launch grid exceeds 32-bit work-item indexing");
   }
   int64_t global = round_up(total_lanes, kBlockSize);
   int total_lanes_i = static_cast<int>(total_lanes);
-  int lanes_per_segment_i = static_cast<int>(params.lanes_per_segment);
 
   return queue.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for<FoldTimespaceToDepthRowSliceKernel<Element, LaneElems>>(
+    cgh.parallel_for<FoldTimespaceToDepthRowSliceKernel<Element, Packed>>(
         sycl::nd_range<1>(
             sycl::range<1>(static_cast<std::size_t>(global)),
             sycl::range<1>(static_cast<std::size_t>(kBlockSize))),
@@ -692,8 +422,8 @@ sycl::event launch_fold_row_slice_kernel_static(sycl::queue& queue, FoldParams<E
             return;
           }
 
-          int slice = idx / lanes_per_segment_i;
-          int lane = idx - slice * lanes_per_segment_i;
+          int slice = idx / lanes_per_slice_i;
+          int lane = idx - slice * lanes_per_slice_i;
 
           int hf = slice % params.hw_fold;
           slice /= params.hw_fold;
@@ -706,13 +436,7 @@ sycl::event launch_fold_row_slice_kernel_static(sycl::queue& queue, FoldParams<E
           int t_out = outer % params.t_new;
           int b = outer / params.t_new;
 
-          int c = 0;
-          if (lane < params.vec_count) {
-            c = lane * LaneElems;
-          } else {
-            c = static_cast<int>(params.vec_count) * LaneElems + (lane - static_cast<int>(params.vec_count));
-          }
-
+          int c = lane * kLaneElems;
           int64_t outer_cell = (((static_cast<int64_t>(b) * params.t_new + t_out) * params.h_new + h_out) *
                                     params.w_new +
                                 w_out);
@@ -728,14 +452,10 @@ sycl::event launch_fold_row_slice_kernel_static(sycl::queue& queue, FoldParams<E
                             params.C +
               c;
 
-          if (lane < params.vec_count) {
-            using pack_t = sycl::vec<uint32_t, kPackWords>;
-#pragma unroll
-            for (int pack = 0; pack < kPacksPerLane; ++pack) {
-              pack_t value;
-              value.load(0, reinterpret_cast<uint32_t const*>(params.x + src + pack * kPackElems));
-              value.store(0, reinterpret_cast<uint32_t*>(params.out + dst + pack * kPackElems));
-            }
+          if constexpr (Packed) {
+            sycl::vec<uint32_t, kPackWords> value;
+            value.load(0, reinterpret_cast<uint32_t const*>(params.x + src));
+            value.store(0, reinterpret_cast<uint32_t*>(params.out + dst));
           } else {
             params.out[dst] = params.x[src];
           }
@@ -759,66 +479,63 @@ sycl::event launch_fold_timespace_to_depth(sycl::queue& queue, FoldParams<Elemen
     return queue.memcpy(params.out, params.x, static_cast<std::size_t>(params.total_elements * sizeof(Element)));
   }
 
-  constexpr int kSmallLaneElems = kPackBytes / static_cast<int>(sizeof(Element));
-  constexpr int kMediumLaneElems = kMediumLaneBytes / static_cast<int>(sizeof(Element));
-  constexpr int kLargeLaneElems = kLargeLaneBytes / static_cast<int>(sizeof(Element));
+  constexpr int kPackElems = kPackBytes / static_cast<int>(sizeof(Element));
+
+  // A purely spatial fold (t_fold == 1) never mixes two different t indices, and
+  // the output keeps t as the second-slowest axis, so (b, t) can be flattened
+  // into a single batch index. That is exact -- not an approximation -- and it
+  // removes one runtime division per work item from every kernel below while
+  // also letting the T > 1 shapes reach the C == 3 fast paths. The shipped
+  // patch_size=40 layer 0 fold (T=2, H=W=40, C=3, hw_fold=5) needs both.
+  if (params.t_fold == 1 && params.T > 1) {
+    if (static_cast<int64_t>(params.B) * params.T > std::numeric_limits<int>::max()) {
+      throw std::invalid_argument("fold_timespace_to_depth B*T exceeds 32-bit indexing");
+    }
+    params.B *= params.T;
+    params.T = 1;
+    params.t_new = 1;
+  }
+
   if (params.T == 1 && params.t_fold == 1 && params.C == 3) {
+    // C == 3 leaves nothing to vectorize inside a segment (6B/12B), so this
+    // path indexes the output element-wise instead: stores stay perfectly
+    // coalesced and only the loads gather. A one-work-item-per-input-row
+    // variant (3x fewer items, contiguous 2-byte word copies inside each row)
+    // was built and measured and loses at every size on B60 -- at hw_fold=5,
+    // (t=2,h=w=40,c=3) it runs 31.6/145.0/115.4 GB/s f32 at b=2/16/100 against
+    // 137.5/208.9/242.9 GB/s here, and the same ordering holds for hw_fold=7 --
+    // so there is no size threshold worth switching on.
     if (params.hw_fold == 2) {
       return launch_fold_spatial_c3_t1_kernel_static<Element, 2>(queue, params);
     }
+    if (params.hw_fold == 5) {
+      // patch_size 40 -> prime factors {2,2,2,5}; the first HMLP layer folds 5.
+      return launch_fold_spatial_c3_t1_kernel_static<Element, 5>(queue, params);
+    }
     if (params.hw_fold == 7) {
-      if (params.total_elements >= kLargeLaneElementsThreshold) {
-        return launch_fold_spatial_c3_t1_kernel_static<Element, 7>(queue, params);
-      }
-      return launch_fold_spatial_c3_t1_row_kernel_static<Element, 7>(queue, params);
+      // patch_size 14 -> prime factors {2,7}; the first layer folds 7.
+      return launch_fold_spatial_c3_t1_kernel_static<Element, 7>(queue, params);
     }
   }
+
+  // 16B packs need C to be a whole number of packs, because a segment starts at
+  // a multiple of C elements and an unaligned sycl::vec load is not allowed.
+  bool packed = (params.C % kPackElems == 0) &&
+      pointer_aligned(params.x, kPackBytes) &&
+      pointer_aligned(params.out, kPackBytes);
+
   if (params.hw_fold > 1) {
-    int slice_elems = params.hw_fold * params.C;
-    int chunks_per_slice = 0;
-    if constexpr (sizeof(Element) == 2) {
-      if (params.hw_fold == 2 &&
-          can_use_esimd_row_slice_copy<kLargeEsimdCopyWords>(params, chunks_per_slice)) {
-        return launch_fold_hwf2_pair_rows_esimd<kLargeEsimdCopyWords>(queue, params, chunks_per_slice);
-      }
-      if (params.hw_fold == 2 &&
-          can_use_esimd_row_slice_copy<kEsimdCopyWords>(params, chunks_per_slice)) {
-        return launch_fold_hwf2_pair_rows_esimd<kEsimdCopyWords>(queue, params, chunks_per_slice);
-      }
+    if (packed) {
+      return launch_fold_row_slice_kernel<Element, true>(queue, params);
     }
-    if (can_use_esimd_row_slice_copy<kLargeEsimdCopyWords>(params, chunks_per_slice)) {
-      return launch_fold_row_slice_esimd<kLargeEsimdCopyWords>(queue, params, chunks_per_slice);
-    }
-    if (can_use_esimd_row_slice_copy<kEsimdCopyWords>(params, chunks_per_slice)) {
-      return launch_fold_row_slice_esimd<kEsimdCopyWords>(queue, params, chunks_per_slice);
-    }
-    if (params.total_elements >= kLargeLaneElementsThreshold &&
-        slice_elems >= kLargeLaneElems &&
-        slice_elems % kLargeLaneElems == 0 &&
-        params.C % (kPackBytes / static_cast<int>(sizeof(Element))) == 0) {
-      return launch_fold_row_slice_kernel_static<Element, kLargeLaneElems>(queue, params);
-    }
-    if (params.total_elements >= kLargeLaneElementsThreshold && slice_elems >= kMediumLaneElems) {
-      return launch_fold_row_slice_kernel_static<Element, kMediumLaneElems>(queue, params);
-    }
-    return launch_fold_row_slice_kernel_static<Element, kSmallLaneElems>(queue, params);
+    return launch_fold_row_slice_kernel<Element, false>(queue, params);
   }
-  int chunks_per_segment = 0;
-  if (can_use_esimd_segment_copy<kLargeEsimdCopyWords>(params, chunks_per_segment)) {
-    return launch_fold_segment_esimd<kLargeEsimdCopyWords>(queue, params, chunks_per_segment);
+
+  // Pure temporal fold: only a single C-wide segment is contiguous.
+  if (packed) {
+    return launch_fold_segment_kernel<Element, true>(queue, params);
   }
-  if (can_use_esimd_segment_copy<kEsimdCopyWords>(params, chunks_per_segment)) {
-    return launch_fold_segment_esimd<kEsimdCopyWords>(queue, params, chunks_per_segment);
-  }
-  if (params.total_elements >= kLargeLaneElementsThreshold &&
-      params.C >= kLargeLaneElems &&
-      params.C % kLargeLaneElems == 0) {
-    return launch_fold_kernel_static<Element, kLargeLaneElems>(queue, params);
-  }
-  if (params.total_elements >= kLargeLaneElementsThreshold && params.C >= kMediumLaneElems) {
-    return launch_fold_kernel_static<Element, kMediumLaneElems>(queue, params);
-  }
-  return launch_fold_kernel_static<Element, kSmallLaneElems>(queue, params);
+  return launch_fold_segment_kernel<Element, false>(queue, params);
 }
 
 template <typename Element>

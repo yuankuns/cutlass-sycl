@@ -202,6 +202,14 @@ std::vector<FoldCase> quick_suite() {
       {"nonpow3_tail_c17", 3, 3, 9, 6, 17, 3, 3, 0.0},
       {"patch16_rgb_batch", 512, 1, 16, 16, 3, 1, 16, 0.0},
       {"layer_hw2_c64", 128, 1, 8, 8, 64, 1, 2, 0.0},
+      // hw_fold=5 is the non-power-of-two spatial stride the shipped
+      // patch_size=40 config uses, and the C==3 path pairs two output elements
+      // per work item for 2-byte types. These two rows pin that stride at a
+      // size far below the inkling/perf rows: one small patch count, and one
+      // odd total element count (15*15*3 = 675) so the tail work item of the
+      // paired launch is exercised.
+      {"patch40_hw5_c3_small", 4, 2, 40, 40, 3, 1, 5, 0.0},
+      {"hw5_c3_odd_total", 1, 1, 15, 15, 3, 1, 5, 0.0},
   };
 }
 
@@ -212,6 +220,31 @@ std::vector<FoldCase> inkling_suite() {
   // real per-layer fold sequence emitted by plan_out_scales() at the shipped
   // vision configs, and the patch=14 branch adds the non-pow2 hwf=7 fold.
   return {
+      // ---- Shipped checkpoint vision_config (models--thinkingmachines--Inkling
+      // config.json): vision_encoder_type=hmlp, patch_size=40,
+      // temporal_patch_size=2, n_layers=4, n_channels=3, decoder_dmodel=768.
+      //
+      // plan_out_scales(2, 40, 4, 3) builds the full (t,h,w,C) ladder
+      //   (1,1,1,3) (1,5,5,128) (1,10,10,320) (1,20,20,1216) (1,40,40,4800)
+      //   (2,40,40,9600)
+      // -- h-scales are the reversed prime factors of 40 ({2,2,2,5} -> 5, 10,
+      // 20, 40), the temporal factor 2 appends one more entry, and each channel
+      // width is ceil(h_scale^2 * 3 * t_scale / 64) * 64. With n_layers=4 the
+      // log-spaced cost matrix + linear_sum_assignment picks indices
+      // [0, 1, 2, 4, 5], i.e. it drops the h_scale=20 rung, giving the four
+      // per-layer folds (fold = end_scale / start_scale, HMLPPatchEncoder.forward):
+      //   L0 (t=1, hw=5) on (P,2,40,40,   3) -> linear   75 -> 128
+      //   L1 (t=1, hw=2) on (P,2, 8, 8, 128) -> linear  512 -> 320
+      //   L2 (t=1, hw=4) on (P,2, 4, 4, 320) -> linear 5120 -> 4800
+      //   L3 (t=2, hw=1) on (P,2, 1, 1,4800) -> linear 9600 -> 768 (decoder_dmodel)
+      // hw_fold=5 is the only non-power-of-two spatial stride the shipped config
+      // uses. L2 and L3 collapse to a pure reshape (bench reports path=memcpy)
+      // because their output grid is 1x1; they are kept so --verify=1 pins that
+      // the reshape really is contiguous at the shipped widths.
+      {"patch40_n4_L0_hw5_c3", 1024, 2, 40, 40, 3, 1, 5, 0.0},
+      {"patch40_n4_L1_hw2_c128", 512, 2, 8, 8, 128, 1, 2, 0.0},
+      {"patch40_n4_L2_hw4_c320", 512, 2, 4, 4, 320, 1, 4, 0.0},
+      {"patch40_n4_L3_tf2_c4800", 512, 2, 1, 1, 4800, 2, 1, 0.0},
       // Shipped n_layers=1 case: single 16x16 spatial fold on the RGB input.
       {"patch16_n1_rgb_8k", 8192, 1, 16, 16, 3, 1, 16, 0.0},
       // Shipped n_layers=4 case (patch_size=16, tps=1) per-layer fold sequence.
@@ -230,7 +263,12 @@ std::vector<FoldCase> inkling_suite() {
       // temporal_patch_size=2 tail fold: purely temporal fold with hw=1 (a fold
       // that reshapes but never permutes spatial dims), which used to hit the
       // identity_tail path -- covered explicitly at the shipped 16x16 grid.
-      {"tps2_L3_temporal_c768", 256, 2, 16, 16, 768, 2, 1, 0.0},
+      // The two widths are the two shipped decoder_dmodel values: 768 in the
+      // released checkpoint's vision_config (the width the last HMLP linear
+      // emits) and 6144 for the production decoder. The tower never folds
+      // decoder_dmodel itself, so these rows pin the segment path at both.
+      {"dmodel768_tps2_temporal", 16, 2, 16, 16, 768, 2, 1, 0.0},
+      {"dmodel6144_tps2_temporal", 8, 2, 8, 8, 6144, 2, 1, 0.0},
       // Legacy inkling coverage retained.
       {"spatial_stage_hw2_c128", 2048, 1, 4, 4, 128, 1, 2, 0.0},
       {"temporal_stage_tf2_c128", 1024, 4, 4, 4, 128, 2, 2, 0.0},
@@ -245,6 +283,20 @@ std::vector<FoldCase> perf_suite() {
   // paths. Sizes scale num_patches proportional to the C x hw_fold_area growth
   // so total bytes stay within a comparable band.
   return {
+      // Shipped checkpoint per-layer perf shapes (patch_size=40,
+      // temporal_patch_size=2, n_layers=4); see inkling_suite() for the
+      // plan_out_scales() derivation of the (t_fold, hw_fold, C) ladder.
+      // Gates are ~50% of the worst dtype measured on B60 (f32/bf16/fp16
+      // min: 319/196/196, 395/390/390, 376/246/271, 375/368/369, 394/329/394,
+      // 395/282/390 GB/s), which is the same headroom the pre-existing rows
+      // below use and leaves room for the contended-run spread.
+      {"perf_patch40_n4_L0_hw5", 2048, 2, 40, 40, 3, 1, 5, 100.0},
+      {"perf_patch40_n4_L1_hw2_c128", 1024, 2, 8, 8, 128, 1, 2, 190.0},
+      {"perf_patch40_n4_L2_hw4_c320", 1024, 2, 4, 4, 320, 1, 4, 120.0},
+      {"perf_patch40_n4_L3_tf2_c4800", 1024, 2, 1, 1, 4800, 2, 1, 180.0},
+      // decoder_dmodel widths, 768 (shipped checkpoint) and 6144 (production).
+      {"perf_dmodel768_tps2", 128, 2, 16, 16, 768, 2, 1, 160.0},
+      {"perf_dmodel6144_tps2", 32, 2, 8, 8, 6144, 2, 1, 140.0},
       {"perf_patch16_n1_rgb_64k", 65536, 1, 16, 16, 3, 1, 16, 170.0},
       // Shipped n_layers=4 per-layer perf shapes.
       {"perf_patch16_n4_L0_rgb", 32768, 1, 16, 16, 3, 1, 2, 140.0},
