@@ -64,11 +64,12 @@
     reduction and one-pass generation. save_intermediate_conv_windows is a
     memory-bound copy/select kernel; small and irregular rows use 16-byte
     vector copies with scalar lanes for non-divisible channel tails, while
-    sustained W - 1 = 3 aligned rows use 256-byte ESIMD block copies.
+    sustained W - 1 = 3 aligned rows use 256-byte subgroup block copies
+    (sycl::ext::oneapi::experimental::group_load / group_store, which lower to
+    the SPIR-V SubgroupBlockRead/Write intrinsics on Xe).
 */
 
 #include <sycl/sycl.hpp>
-#include <sycl/ext/intel/esimd.hpp>
 #include <cute/util/compat.hpp>
 
 #include "cutlass/bfloat16.h"
@@ -97,8 +98,23 @@ constexpr int kMetaThreads = 64;
 constexpr int kCopyBytes = 16;
 constexpr int kCopyWords = kCopyBytes / static_cast<int>(sizeof(uint32_t));
 constexpr int kPacksPerLane = 1;
-constexpr int kEsimdCopyWords = 64;
-constexpr int kEsimdMinBatch = 512;
+// Wide row path: one subgroup block copy moves kWideSubGroupSize *
+// kWideWordsPerLane dwords, i.e. 256 B, which is the widest LSC block message
+// the part offers (d32x64t). The plain-SYCL group_load/group_store pair lowers
+// to exactly that message, so this matches the byte-per-message granularity of
+// a hand-written block copy without leaving standard SYCL.
+constexpr int kWideSubGroupSize = 16;
+constexpr int kWideWordsPerLane = 4;
+constexpr int kWideCopyWords = kWideSubGroupSize * kWideWordsPerLane;
+constexpr int kWideMinBatch = 512;
+constexpr int kWideMaxGroupItems = 512;
+// The wide path passes alignment<16> to group_store, which makes the runtime
+// alignment check compile away, and it relies on the per-lane vector path's
+// kCopyBytes gate to have already proven that much alignment. Keep the two
+// tied together: a narrower kCopyBytes would certify less than the block store
+// requires and corrupt exactly the large-batch shapes.
+static_assert(kCopyBytes >= static_cast<int>(sizeof(uint32_t)) * kWideWordsPerLane,
+              "wide row path needs the alignment guaranteed by kCopyBytes");
 constexpr int kMaxWindow = 16;
 constexpr double kMinSustainedWindowBytes = 32.0 * 1024.0 * 1024.0;
 
@@ -643,27 +659,30 @@ class SaveWindowsKernel {
   }
 };
 
+// Plain-SYCL wide row copy. The work decomposition is 3D on purpose:
+// dim0 = request, dim1 = (t, w) row inside the request, dim2 = lane inside the
+// row. Every index therefore arrives from the launch geometry, so the only
+// divisions left are by compile-time constants (StaticWidthMinusOne and the
+// subgroup size); the flat 1D mapping instead divided by a runtime
+// lanes-per-row. dim2 is the fastest-varying dimension, so each subgroup
+// covers one contiguous kWideCopyWords dword chunk of the row and the block
+// load/store addresses are subgroup-uniform as group_load requires.
 template <typename Element, int StaticWidthMinusOne>
-class SaveWindowsEsimdRowKernel {
+class SaveWindowsWideRowKernel {
  public:
   WindowParams<Element> params;
-  int chunks_per_row;
 
-  void operator()(sycl::item<1> item) const SYCL_ESIMD_KERNEL {
+  using lane_vec_t = sycl::vec<uint32_t, kWideWordsPerLane>;
+
+  [[sycl::reqd_sub_group_size(kWideSubGroupSize)]]
+  void operator()(sycl::nd_item<3> item) const {
     int width = StaticWidthMinusOne > 0 ? StaticWidthMinusOne : params.width_minus_one;
-    int linear = static_cast<int>(item.get_linear_id());
-    int total_lanes = params.batch * params.draft_tokens * width * chunks_per_row;
-    if (linear >= total_lanes) {
-      return;
-    }
-
-    int row_lane = linear / chunks_per_row;
-    int chunk = linear - row_lane * chunks_per_row;
-    int rows_per_batch = params.draft_tokens * width;
-    int b = row_lane / rows_per_batch;
-    int local_row = row_lane - b * rows_per_batch;
+    int b = static_cast<int>(item.get_global_id(0));
+    int local_row = static_cast<int>(item.get_global_id(1));
+    int chunk = static_cast<int>(item.get_global_id(2)) / kWideSubGroupSize;
     int t = local_row / width;
     int w = local_row - t * width;
+
     int cache_slot = params.cache_indices[b];
     if (cache_slot == params.pad_slot_id) {
       return;
@@ -686,23 +705,82 @@ class SaveWindowsEsimdRowKernel {
         + static_cast<int64_t>(t) * params.out_stride_t
         + static_cast<int64_t>(w) * params.out_stride_w;
 
-    auto value = sycl::ext::intel::esimd::block_load<uint32_t, kEsimdCopyWords>(
-        reinterpret_cast<uint32_t const*>(src_row) + chunk * kEsimdCopyWords);
-    sycl::ext::intel::esimd::block_store<uint32_t, kEsimdCopyWords>(
-        reinterpret_cast<uint32_t*>(dst_row) + chunk * kEsimdCopyWords, value);
+    // full_group + contiguous_memory + striped placement is the exact property
+    // set that lowers group_load/group_store to SubgroupBlockRead/Write. The
+    // striped placement matters: with the default blocked placement the
+    // implementation's has_builtin test (sizeof(word) * words_per_lane <= 8)
+    // fails for 4 dwords per lane and the copy silently degrades to a per-lane
+    // d32x4 gather plus four d32 scatters, which measured 309 GB/s on
+    // b1024/T9/W-1=3/D=512 versus the 570 GB/s the block message reaches.
+    // Placement is irrelevant to a pure copy as long as load and store agree.
+    auto props = sycl::ext::oneapi::experimental::properties{
+        sycl::ext::oneapi::experimental::contiguous_memory,
+        sycl::ext::oneapi::experimental::full_group,
+        sycl::ext::oneapi::experimental::data_placement_striped,
+        sycl::ext::oneapi::experimental::alignment<sizeof(lane_vec_t)>};
+    // Decorated global pointers: from a plain raw pointer the deduced address
+    // space is generic, so the implementation emits a runtime
+    // dynamic_address_cast and keeps the whole per-lane gather/scatter fallback
+    // alongside the block message (~600 vs 404 lines of generated ISA). Naming
+    // the address space leaves only the two block messages. Throughput is
+    // unchanged within noise; this is a code-size/clarity win.
+    auto sg = item.get_sub_group();
+    auto src_words = sycl::address_space_cast<
+        sycl::access::address_space::global_space, sycl::access::decorated::yes>(
+        reinterpret_cast<uint32_t const*>(src_row) + chunk * kWideCopyWords)
+        .get_decorated();
+    auto dst_words = sycl::address_space_cast<
+        sycl::access::address_space::global_space, sycl::access::decorated::yes>(
+        reinterpret_cast<uint32_t*>(dst_row) + chunk * kWideCopyWords)
+        .get_decorated();
+    lane_vec_t value;
+    sycl::ext::oneapi::experimental::group_load(sg, src_words, value, props);
+    sycl::ext::oneapi::experimental::group_store(sg, value, dst_words, props);
   }
 };
 
+// Largest divisor of extent that keeps stride * divisor within budget. The
+// kernel carries no bounds check (a partially populated subgroup would violate
+// group_load's full_group contract), so every work-group extent has to divide
+// its global extent exactly.
+inline int wide_largest_divisor(int extent, int stride, int budget) {
+  int best = 1;
+  for (int candidate = 1; candidate <= extent; ++candidate) {
+    if (extent % candidate == 0 && candidate * stride <= budget) {
+      best = candidate;
+    }
+  }
+  return best;
+}
+
 template <typename Element, int StaticWidthMinusOne>
-sycl::event launch_save_windows_esimd_row(
+sycl::event launch_save_windows_wide_row(
     sycl::queue& q,
     WindowParams<Element> const& params,
     int chunks_per_row) {
   int width = StaticWidthMinusOne > 0 ? StaticWidthMinusOne : params.width_minus_one;
-  int total_lanes = params.batch * params.draft_tokens * width * chunks_per_row;
-  SaveWindowsEsimdRowKernel<Element, StaticWidthMinusOne> kernel{params, chunks_per_row};
-  return q.parallel_for<SaveWindowsEsimdRowKernel<Element, StaticWidthMinusOne>>(
-      sycl::range<1>(static_cast<std::size_t>(total_lanes)), kernel);
+  int rows_per_batch = params.draft_tokens * width;
+  int lanes_per_row = chunks_per_row * kWideSubGroupSize;
+  // Fill the work-group along the lanes of one row first; when the chunk count
+  // is odd (D = 384 gives 3, D = 640 gives 5) that leaves a single subgroup per
+  // group, so stack whole rows on top of it instead of launching thousands of
+  // 16-item groups.
+  int group_lanes =
+      wide_largest_divisor(chunks_per_row, kWideSubGroupSize, kWideMaxGroupItems) *
+      kWideSubGroupSize;
+  int group_rows =
+      wide_largest_divisor(rows_per_batch, group_lanes, kWideMaxGroupItems);
+  sycl::range<3> global(
+      static_cast<std::size_t>(params.batch),
+      static_cast<std::size_t>(rows_per_batch),
+      static_cast<std::size_t>(lanes_per_row));
+  sycl::range<3> local(
+      1,
+      static_cast<std::size_t>(group_rows),
+      static_cast<std::size_t>(group_lanes));
+  SaveWindowsWideRowKernel<Element, StaticWidthMinusOne> kernel{params};
+  return q.parallel_for<SaveWindowsWideRowKernel<Element, StaticWidthMinusOne>>(
+      sycl::nd_range<3>(global, local), kernel);
 }
 
 template <typename Element, int StaticWidthMinusOne>
@@ -735,17 +813,21 @@ sycl::event launch_save_windows_static(sycl::queue& q, WindowParams<Element> con
   int lanes_per_row = vec_count + scalar_tail;
   int row_bytes = params.channels * static_cast<int>(sizeof(Element));
   int row_words = row_bytes / static_cast<int>(sizeof(uint32_t));
-  int esimd_chunks_per_row = row_words / kEsimdCopyWords;
-  // ESIMD block copies amortize setup cost on sustained large-B rows; small launch-limited
-  // shapes stay on the lighter row-driven SYCL path.
-  if (params.batch >= kEsimdMinBatch &&
-      StaticWidthMinusOne == 3 &&
-      params.width_minus_one == 3 &&
-      aligned &&
-      scalar_tail == 0 &&
-      row_bytes % static_cast<int>(sizeof(uint32_t)) == 0 &&
-      row_words % kEsimdCopyWords == 0) {
-    return launch_save_windows_esimd_row<Element, StaticWidthMinusOne>(q, params, esimd_chunks_per_row);
+  int wide_chunks_per_row = row_words / kWideCopyWords;
+  // 256-byte subgroup block copies amortize per-item index setup on sustained
+  // large-B rows; small launch-limited shapes stay on the lighter row-driven
+  // per-lane vector path, which is cache-resident there and already faster.
+  // if constexpr keeps the wide kernel out of the binary for every window
+  // width the dispatch can never select.
+  if constexpr (StaticWidthMinusOne == 3) {
+    if (params.batch >= kWideMinBatch &&
+        params.width_minus_one == 3 &&
+        aligned &&
+        scalar_tail == 0 &&
+        row_bytes % static_cast<int>(sizeof(uint32_t)) == 0 &&
+        row_words % kWideCopyWords == 0) {
+      return launch_save_windows_wide_row<Element, StaticWidthMinusOne>(q, params, wide_chunks_per_row);
+    }
   }
   int rows_per_batch = params.draft_tokens * params.width_minus_one;
   int total_lanes = params.batch * rows_per_batch * lanes_per_row;
@@ -1465,6 +1547,10 @@ std::vector<WindowCase> window_quick_suite() {
       {"windows_nondiv_w7", 7, 9, 7, 257, true, 3, 5, 7},
       {"windows_inkling_d1536", 16, 9, 3, 1536, false, 0, 0, 0},
       {"windows_inkling_d512", 16, 9, 3, 512, false, 0, 0, 0},
+      // Smallest batch that selects the 256-byte subgroup block path, with pad
+      // slots on, so --verify=1 covers the wide kernel and not just the
+      // per-lane vector kernel.
+      {"windows_wide_b512_d512_pad", kWideMinBatch, 9, 3, 512, true, 0, 0, 0},
   };
 }
 
