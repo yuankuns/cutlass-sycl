@@ -19,6 +19,13 @@
  *   16-bit words for the max pass, then converts once for FP4 packing. Perf
  *   cases use production-like token/hidden sizes to avoid measuring cache-only
  *   behavior.
+ *
+ *   MXFP8 KV-cache quantization (the activation quantizer the Inkling model
+ *   actually runs) is memory-bound as well: per 32-channel group it streams one
+ *   input element, writes 32 E4M3 payload bytes, and writes one E8M0 scale byte
+ *   into the interleaved FA4 scale-factor buffer. Static per-tensor E4M3 scaling
+ *   is the cheapest of the three: no reduction at all, one multiply by a
+ *   preloaded reciprocal scale plus a byte store.
  **************************************************************************************************/
 
 #pragma once
@@ -55,6 +62,22 @@ constexpr float kE2M1Max = 6.0f;
 constexpr float kE4M3FnMax = 448.0f;
 constexpr double kMinSustainedTargetBytes = 32.0 * 1024.0 * 1024.0;
 
+// MXFP8 (float8_e4m3fn payload + float8_e8m0fnu scales) constants. The Inkling
+// KV cache quantizes 32 contiguous channels per scale byte and the FA4
+// scale-factor buffer is indexed per (page, kv head, 32-channel block).
+constexpr int kMxfp8GroupSize = 32;
+constexpr int kMxfp8HeadDim = 128;
+constexpr int kMxfp8ScalesPerHead = kMxfp8HeadDim / kMxfp8GroupSize;
+// sglang's MXFP8 quantizer floors amax so log2 never sees zero
+// (see kernels/ops/quantization/mxfp8_quant.py).
+constexpr float kMxfp8AmaxFloor = 1.0e-30f;
+// input_scale = input_amax / (448 * 6): FP8-e4m3 max times FP4-e2m1 max. This is
+// the ModelOpt NVFP4 activation *global scale* convention, which Inkling's
+// checkpoint loader reproduces for the experts' w13_input_scale / w2_input_scale
+// (models/inkling.py::_ckpt_scale_to_modelopt). It is consumed by fp4_quantize,
+// not by an E4M3 store -- see per_tensor_input_scale_from_amax() below.
+constexpr float kNvfp4InputScaleDivisor = kE4M3FnMax * kE2M1Max;
+
 enum class DType {
   kAll,
   kFloat,
@@ -62,10 +85,23 @@ enum class DType {
   kFp16
 };
 
+// Which quantizer family a run exercises. kMxfp4 is the legacy group-32 FP4
+// mapping (NOT used by the Inkling model, kept as a reference kernel). kMxfp8Kv
+// is the KV-cache quantizer Inkling runs. kFp8PerTensor is static per-tensor
+// E4M3 scaling; its NVFP4 divisor is Inkling's own scale derivation, but the
+// E4M3 payload is static_quant_fp8's (see 21_bmg_mxfp4_mapping.cpp's header).
+enum class QuantMode {
+  kAll,
+  kMxfp4,
+  kMxfp8Kv,
+  kFp8PerTensor
+};
+
 struct Options {
   std::string suite = "quick";
   std::string shape;
   DType dtype = DType::kAll;
+  QuantMode mode = QuantMode::kAll;
   int iterations = 20;
   int warmup = 5;
   bool verify = true;
@@ -167,6 +203,21 @@ float pow2_int(int exponent) {
   }
   uint32_t bits = static_cast<uint32_t>(exponent + 127) << 23;
   return sycl::bit_cast<float>(bits);
+}
+
+// Exact scaling by a power of two. Used instead of `x / descale` in the MXFP8
+// payload path: icpx lowers device fp32 division to an approximation that can
+// land ~1 ulp away from the host's std::div, which flips a payload code whenever
+// the quotient sits on a rounding boundary. ldexp/scalb is exact on both sides
+// (a pure exponent adjust) for every power-of-two scale, including the ones whose
+// reciprocal would be subnormal and could not be formed as a float at all.
+CUTLASS_HOST_DEVICE
+float scalb_f(float x, int exponent) {
+#if defined(__SYCL_DEVICE_ONLY__)
+  return sycl::ldexp(x, exponent);
+#else
+  return std::ldexp(x, exponent);
+#endif
 }
 
 CUTLASS_HOST_DEVICE
@@ -312,6 +363,44 @@ inline bool parse_dtype(std::string const& text, DType& dtype) {
   return false;
 }
 
+inline char const* mode_text(QuantMode mode) {
+  switch (mode) {
+    case QuantMode::kAll:
+      return "all";
+    case QuantMode::kMxfp4:
+      return "mxfp4";
+    case QuantMode::kMxfp8Kv:
+      return "mxfp8_kv";
+    case QuantMode::kFp8PerTensor:
+      return "fp8_pertensor";
+  }
+  return "unknown";
+}
+
+inline bool parse_mode(std::string const& text, QuantMode& mode) {
+  if (text == "all") {
+    mode = QuantMode::kAll;
+    return true;
+  }
+  if (text == "mxfp4") {
+    mode = QuantMode::kMxfp4;
+    return true;
+  }
+  if (text == "mxfp8_kv" || text == "mxfp8-kv" || text == "mxfp8") {
+    mode = QuantMode::kMxfp8Kv;
+    return true;
+  }
+  if (text == "fp8_pertensor" || text == "fp8-pertensor" || text == "fp8") {
+    mode = QuantMode::kFp8PerTensor;
+    return true;
+  }
+  return false;
+}
+
+inline bool mode_selected(QuantMode selected, QuantMode family) {
+  return selected == QuantMode::kAll || selected == family;
+}
+
 inline bool parse_bool(std::string const& value) {
   if (value == "1" || value == "true" || value == "on" || value == "yes") {
     return true;
@@ -365,6 +454,10 @@ inline Options parse_common_options(int argc, char const** argv) {
       if (!parse_dtype(value, options.dtype)) {
         throw std::invalid_argument("unknown dtype: " + value);
       }
+    } else if (key == "mode") {
+      if (!parse_mode(value, options.mode)) {
+        throw std::invalid_argument("unknown mode: " + value);
+      }
     } else if (key == "iterations") {
       options.iterations = std::stoi(value);
     } else if (key == "warmup") {
@@ -386,13 +479,23 @@ inline Options parse_common_options(int argc, char const** argv) {
   return options;
 }
 
-inline void print_common_usage(char const* name, char const* suites, char const* shape_text) {
+// `show_mode` is opt-in because --mode only does something in a binary that
+// consults Options::mode; advertising it unconditionally would promise a flag
+// that other consumers of this header silently ignore.
+inline void print_common_usage(
+    char const* name, char const* suites, char const* shape_text, bool show_mode = false) {
   std::cout
       << "Usage: " << name << " [options]\n\n"
       << "Options:\n"
       << "  --suite=" << suites << "       Built-in suite (default quick)\n"
       << "  --shape=" << shape_text << "\n"
-      << "  --dtype=all|float|bf16|fp16   Element dtype (default all)\n"
+      << "  --dtype=all|float|bf16|fp16   Element dtype (default all)\n";
+  if (show_mode) {
+    std::cout
+        << "  --mode=all|mxfp4|mxfp8_kv|fp8_pertensor\n"
+        << "                                Quantizer family to run (default all)\n";
+  }
+  std::cout
       << "  --iterations=<int>            Timed kernel iterations (default 20)\n"
       << "  --warmup=<int>                Warmup launches before timing (default 5)\n"
       << "  --verify=0|1                  Run CPU reference comparison (default 1)\n"
@@ -699,11 +802,12 @@ uint8_t e4m3fn_encode_positive(float x) {
     return 0x7eu;
   }
 
-  constexpr float kMinNormal = 0.015625f;      // 2^-6
-  constexpr float kSubnormalStep = 0.001953125f;  // 2^-9
+  constexpr float kMinNormal = 0.015625f;  // 2^-6
 
   if (x < kMinNormal) {
-    int mantissa = round_nearest_even_int(x / kSubnormalStep);
+    // x / 2^-9 as an exact exponent adjust; a device fp32 divide here could land
+    // a ulp off the host and flip the subnormal payload code.
+    int mantissa = round_nearest_even_int(scalb_f(x, 9));
     if (mantissa <= 0) {
       return 0u;
     }
@@ -733,6 +837,21 @@ uint8_t e4m3fn_encode_positive(float x) {
     return 0x7eu;
   }
   return static_cast<uint8_t>((exponent_field << 3) | mantissa);
+}
+
+// Sign-magnitude E4M3 encode built on the pure-bit-op positive encoder. Unlike
+// e4m3fn_encode() the normal path needs no float division, reciprocal or floor,
+// which matters because the MXFP8 and per-tensor FP8 kernels below are
+// encode-bound rather than bandwidth-bound. Checked against e4m3fn_encode()
+// over every third finite float bit pattern (1.43e9 values): identical for all
+// of them. The only input where the two differ is -0.0f, which this form maps
+// to 0x80 (signed zero, matching torch's .to(float8_e4m3fn)) instead of 0x00.
+CUTLASS_HOST_DEVICE
+uint8_t e4m3fn_encode_signed(float value) {
+  uint32_t bits = sycl::bit_cast<uint32_t>(value);
+  uint8_t sign = static_cast<uint8_t>((bits >> 24) & 0x80u);
+  float magnitude = sycl::bit_cast<float>(bits & 0x7fffffffu);
+  return static_cast<uint8_t>(sign | e4m3fn_encode_positive(magnitude));
 }
 
 struct E4M3FnEncodeInvResult {
@@ -877,6 +996,117 @@ uint8_t encode_ue8m0_exponent(int exponent) {
 CUTLASS_HOST_DEVICE
 int decode_ue8m0_exponent(uint8_t scale) {
   return static_cast<int>(scale) - 127;
+}
+
+// ---------------------------------------------------------------------------
+// MXFP8 (E4M3 payload + E8M0 scales) helpers.
+//
+// Scale rule, transcribed from sglang
+// python/sglang/kernels/ops/quantization/mxfp8_quant.py::_mxfp8_quant_kernel:
+//
+//   amax          = max(|x| over the 32-element group, 1e-30)
+//   scale_biased  = clamp(ceil(log2(amax / 448.0)) + 127.0, 0.0, 254.0)
+//   descale       = exp2(scale_biased - 127.0)
+//   payload       = e4m3(clamp(x / descale, -448.0, 448.0))
+//                   (applied as scalb_f(x, -(scale_biased - 127)); descale is a
+//                    power of two, so this is the same value computed exactly)
+//   scale byte    = uint8(scale_biased)          // float8_e8m0fnu, bias 127
+//
+// The scale byte is the raw biased exponent, so 254 is the largest value ever
+// written and 0xFF (E8M0 NaN) never appears.
+//
+// Example 15 (15_bmg_attn_prologue_mxfp8_store_tau.cpp) quantizes the same KV
+// cache and carries its own private copies of this rule and of the interleaved
+// offset (its mxfp8_scale_byte / kv_scale_offset). The two agree numerically on
+// every value the suites exercise, but nothing enforces that: if you change
+// either side, change both. Its copy still uses the float log2 discussed below.
+// ---------------------------------------------------------------------------
+// ceil(log2(amax / 448)) evaluated exactly with integer arithmetic instead of a
+// libm log2. This matters because the scale byte and its 32-byte payload group
+// are compared byte-for-byte between the host reference and the device kernel:
+// std::log2 and sycl::log2 differ by ~1-4 ulp, so whenever amax/448 lands just
+// above a power of two the two sides ceil() to different integers, the byte
+// differs by one and the whole group mismatches. With e = floor_log2(amax) and
+// the mantissa m = amax / 2^e in [1, 2), amax/448 = (m / 1.75) * 2^(e - 8), and
+// log2(m / 1.75) is <= 0 exactly when m <= 1.75, hence
+//
+//   ceil(log2(amax / 448)) == e - 8 + (m > 1.75 ? 1 : 0)
+//
+// and m > 1.75 is the mantissa-field compare (bits & 0x7fffff) > 0x600000.
+// The MXFP4 helpers in this header avoid libm the same way.
+//
+// Checked against the ceil(std::log2(...)) form over every third non-negative
+// finite float (7.13e8 values): they agree everywhere except 1848 inputs whose
+// mantissa sits within a few ulp above 0x600000, i.e. amax just above 1.75*2^e.
+// There the float form returns the ceil of a log2 that rounded down onto the
+// integer, so it is the float form that is off by one; this one is exact.
+CUTLASS_HOST_DEVICE
+int mxfp8_ceil_log2_ratio(float amax) {
+  uint32_t bits = sycl::bit_cast<uint32_t>(amax);
+  int exponent = static_cast<int>((bits >> 23) & 0xffu) - 127;
+  bool mantissa_above_1p75 = (bits & 0x007fffffu) > 0x00600000u;
+  return exponent - 8 + (mantissa_above_1p75 ? 1 : 0);
+}
+
+// Returns the E8M0 scale byte and, in `descale_exponent`, the unbiased exponent
+// it encodes: descale == 2^descale_exponent. Divide the payload with
+// scalb_f(x, -descale_exponent) rather than `x / pow2_int(descale_exponent)`, so
+// the host reference and the device kernel agree bit for bit.
+CUTLASS_HOST_DEVICE
+uint8_t mxfp8_scale_byte(float amax, int& descale_exponent) {
+  // The 1e-30 floor is normal in fp32, so mxfp8_ceil_log2_ratio() never sees a
+  // subnormal (and the resulting byte is >= 19, never 0).
+  float safe_amax = amax > kMxfp8AmaxFloor ? amax : kMxfp8AmaxFloor;
+  int biased = mxfp8_ceil_log2_ratio(safe_amax) + 127;
+  biased = biased < 0 ? 0 : (biased > 254 ? 254 : biased);
+  descale_exponent = biased - 127;
+  return static_cast<uint8_t>(biased);
+}
+
+// Byte offset of the E8M0 scale for KV slot `slot`, channel `channel` in the
+// interleaved FA4 BlockScaledBasicChunk buffer
+//
+//   (slots / page_size, dkv / 128, 32, page_size / 32, 128 / 32)
+//
+// which is how sglang's MXFP8 KV pool allocates k_scale_buffer / v_scale_buffer
+// at page_size == 128 (srt/mem_cache/memory_pool.py) and how
+// mxfp8_interleave_sf.py / _mxfp8_quant_store_qkv_kernel index it. Matches
+// example 15's kv_scale_offset().
+CUTLASS_HOST_DEVICE
+int64_t mxfp8_interleaved_sf_offset(int64_t slot, int channel, int dkv, int page_size) {
+  int heads = dkv / kMxfp8HeadDim;
+  int page_chunks = page_size / kMxfp8GroupSize;
+  int64_t page = slot / page_size;
+  int64_t page_offset = slot % page_size;
+  int head = channel / kMxfp8HeadDim;
+  int block = (channel % kMxfp8HeadDim) / kMxfp8GroupSize;
+  return ((page * heads + head) * (kMxfp8GroupSize * page_chunks * kMxfp8ScalesPerHead)) +
+      ((page_offset % kMxfp8GroupSize) * (page_chunks * kMxfp8ScalesPerHead)) +
+      ((page_offset / kMxfp8GroupSize) * kMxfp8ScalesPerHead) +
+      block;
+}
+
+// Static per-tensor activation scale from a checkpoint amax. Two divisors ship:
+//
+//   kE4M3FnMax (448)                the plain per-tensor FP8-E4M3 convention,
+//                                   scale = amax / e4m3_max, whose runtime is
+//                                   static_quant_fp8 (kernels/ops/quantization/
+//                                   fp8_kernel.py) -- it multiplies by
+//                                   1 / scale and clamps to +-448.
+//   kNvfp4InputScaleDivisor (448*6) input_scale for Inkling's NVFP4 experts
+//                                   (models/inkling.py::_ckpt_scale_to_modelopt,
+//                                   gated on ".experts." / ".shared_experts.").
+//                                   This is the only per-tensor activation scale
+//                                   Inkling derives; Inkling instantiates no FP8
+//                                   linear method. Its consumer is fp4_quantize
+//                                   (modelopt_quant.py), i.e. an E2M1 payload
+//                                   plus per-16 E4M3 block scales, so do not
+//                                   read this divisor as an FP8 store rule: the
+//                                   trailing 6 is the E2M1 max, and feeding it
+//                                   to an E4M3 store saturates everything above
+//                                   amax / 6.
+inline float per_tensor_input_scale_from_amax(float amax, float amax_divisor) {
+  return amax / amax_divisor;
 }
 
 inline ByteCompareResult compare_bytes(std::vector<uint8_t> const& got, std::vector<uint8_t> const& expected) {

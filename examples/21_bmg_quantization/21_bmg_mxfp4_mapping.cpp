@@ -3,6 +3,67 @@
  * SPDX-License-Identifier: BSD-3-Clause
  **************************************************************************************************/
 
+/*! \file
+    \brief Inkling activation quantizers for CUTLASS SYCL on BMG.
+
+    IMPORTANT -- what the Inkling model actually runs:
+
+      MXFP4 activation quantization (E2M1 payload + UE8M0 scales, group 32) is
+      *not* used by the Inkling model. Inkling never quantizes activations to
+      FP4; only weights are FP4 (NVFP4, see 21_bmg_nvfp4_layout.cpp). The MXFP4
+      mapping below is retained as a standalone reference kernel because other
+      work references it, but it does not mirror an Inkling op.
+
+      Inkling uses exactly two activation quantizers, both implemented here:
+
+      1) --mode=mxfp8_kv -- MXFP8 KV cache. K and V rows are quantized to
+         float8_e4m3fn with one float8_e8m0fnu scale per 32 channels and
+         scattered into the paged cache at loc[t]. At the production
+         page_size == 128 the scale-factor buffer is the interleaved FA4
+         BlockScaledBasicChunk layout
+             (slots / 128, dkv / 128, 32, page_size / 32, 4)
+         written by sglang's quant_store_kv_mxfp8 / store_sf_interleaved
+         (python/sglang/kernels/ops/quantization/mxfp8_quant.py,
+          mxfp8_interleave_sf.py) and read by FA4's block-scaled QK / V dequant.
+         Q is quantized with the same per-32-channel rule but its scales stay
+         flat per token (they ride q_descale), so this example only models the
+         KV-cache scatter, which is where the layout is non-trivial.
+         Example 15 (15_bmg_attn_prologue_mxfp8_store_tau.cpp) stores the same
+         bytes from inside the fused attention prologue. It carries its own
+         private copies of the scale rule and the interleaved offset rather than
+         calling the shared helpers, so the agreement between the two examples is
+         checked by eye, not by construction -- change one, change the other.
+
+      2) --mode=fp8_pertensor -- static per-tensor activation scaling to E4M3.
+         Two conventions ship, selected per case by amax_divisor:
+
+           amax / 448          static_quant_fp8 (kernels/ops/quantization/
+                               fp8_kernel.py), the plain per-tensor FP8-E4M3
+                               quantizer: scale = amax / e4m3_max, then
+                               q = e4m3(clamp(x * (1 / scale), +-448)).
+
+           amax / (448 * 6)    input_scale for the NVFP4 experts
+                               (models/inkling.py::_ckpt_scale_to_modelopt); 6
+                               is the E2M1 max. This is the only per-tensor
+                               activation scale Inkling itself derives -- it
+                               ships no FP8 linear method. Its consumer is
+                               fp4_quantize (modelopt_quant.py), which emits an
+                               E2M1 payload plus swizzled per-16 E4M3 block
+                               scales, NOT the E4M3 bytes stored here; that
+                               payload and layout are 21_bmg_nvfp4_layout's.
+                               So for these cases only the scale derivation is
+                               one-for-one with Inkling; the byte store is
+                               static_quant_fp8's, kept so both conventions are
+                               measured by the same kernel. Note the extra
+                               factor of 6 makes an E4M3 store saturate at
+                               |x| > amax / 6.
+
+    All three families are pure SYCL: no sycl::ext::intel::esimd. BMG has no
+    native FP8 arithmetic here, so E4M3/E8M0 encoding is done in software and
+    the kernels are byte-store kernels, not FP8 matmuls. Performance is reported
+    as effective GB/s.
+*/
+
 #include "21_bmg_quantization_common.hpp"
 
 namespace quant = cutlass::examples::bmg_quantization;
@@ -651,8 +712,14 @@ std::vector<Mxfp4Case> quick_suite() {
 }
 
 std::vector<Mxfp4Case> inkling_suite() {
-  // MXFP4 per-token activation quantization runs at two call sites in the
-  // Inkling forward path:
+  // NOTE: MXFP4 activation quantization is NOT an Inkling op -- see the file
+  // header. The shapes below are the *hypothetical* per-token activation-quant
+  // call sites (they follow Inkling's hidden/intermediate geometry so the
+  // kernel is exercised at realistic sizes), kept for regression parity of this
+  // reference kernel. The two quantizers Inkling really runs are covered by
+  // --mode=mxfp8_kv and --mode=fp8_pertensor below.
+  //
+  // Shape provenance (geometry only):
   //   1) hidden state before an MoE/dense gate_up GEMM:
   //        rows = T tokens, cols = hidden (non-scattered) or hidden/tp
   //        (scattered sconv).
@@ -1171,6 +1238,900 @@ bool run_cases(sycl::queue& queue, std::vector<Mxfp4Case> const& cases, quant::O
   return all_passed;
 }
 
+// ===========================================================================
+// Shared vector loads for the MXFP8 / FP8 paths.
+// ===========================================================================
+
+constexpr int kFp8VecElems = 8;
+// Consecutive 8-element vectors handled by one work item in the per-tensor FP8
+// kernel; see launch_fp8_per_tensor() for why one vector per item is too little.
+constexpr int kFp8ChunksPerItem = 4;
+
+template <typename Element>
+CUTLASS_DEVICE void load_vec8(Element const* src, float (&out)[kFp8VecElems]) {
+  if constexpr (std::is_same_v<Element, cutlass::bfloat16_t> ||
+                std::is_same_v<Element, cutlass::half_t>) {
+    using RawWords = sycl::vec<uint64_t, 2>;
+    Element const* aligned = static_cast<Element const*>(__builtin_assume_aligned(src, 16));
+    RawWords words = *reinterpret_cast<RawWords const*>(aligned);
+#pragma unroll
+    for (int word = 0; word < 2; ++word) {
+      uint64_t raw = words[word];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        out[word * 4 + j] = quant::raw16_to_float<Element>(static_cast<uint16_t>(raw >> (16 * j)));
+      }
+    }
+  } else {
+    using FloatWords = sycl::vec<float, kFp8VecElems>;
+    Element const* aligned = static_cast<Element const*>(__builtin_assume_aligned(src, 32));
+    FloatWords words = *reinterpret_cast<FloatWords const*>(aligned);
+#pragma unroll
+    for (int j = 0; j < kFp8VecElems; ++j) {
+      out[j] = words[j];
+    }
+  }
+}
+
+// Pack eight already-scaled floats into eight E4M3 bytes with one 64-bit store.
+CUTLASS_DEVICE void store_e4m3_vec8(float const (&scaled)[kFp8VecElems], uint8_t* dst) {
+  uint64_t raw = 0;
+#pragma unroll
+  for (int j = 0; j < kFp8VecElems; ++j) {
+    raw |= static_cast<uint64_t>(quant::e4m3fn_encode_signed(scaled[j])) << (8 * j);
+  }
+  *reinterpret_cast<uint64_t*>(dst) = raw;
+}
+
+// ===========================================================================
+// MXFP8 KV cache (the Inkling activation quantizer).
+//
+//   K/V rows (tokens, dkv) bf16/fp16/fp32 -> paged float8_e4m3fn cache at
+//   loc[t] plus float8_e8m0fnu scales in the interleaved FA4 layout
+//   (slots / page_size, dkv / 128, 32, page_size / 32, 4).
+//
+// This mirrors sglang's quant_store_kv_mxfp8: one launch quantizes both K and V
+// and scatters payload + scales.
+//
+// loc[t] < 0 marks a padded token, which this kernel skips. That is a deliberate
+// divergence: sglang's _mxfp8_quant_store_qkv_kernel has no such guard and would
+// scatter out of bounds for a negative loc (only its
+// _mxfp8_v_cache_update_kernel masks on loc >= 0). The guard is what lets the
+// suites run a fixed grid over padded tokens the way a CUDA-graph capture would,
+// and --shape=neg_loc=0 covers the no-padding path.
+// ===========================================================================
+
+struct Mxfp8KvCase {
+  std::string name;
+  int tokens = 1;
+  int dkv = 256;
+  int slots = 1024;
+  int page_size = 128;
+  bool include_negative_loc = false;
+  double target_gbps = 0.0;
+};
+
+template <typename Element>
+struct Mxfp8KvParams {
+  Element const* __restrict k = nullptr;
+  Element const* __restrict v = nullptr;
+  int64_t const* __restrict loc = nullptr;
+  uint8_t* __restrict k_cache = nullptr;
+  uint8_t* __restrict v_cache = nullptr;
+  uint8_t* __restrict sfk = nullptr;
+  uint8_t* __restrict sfv = nullptr;
+  int tokens = 0;
+  int dkv = 0;
+  int page_size = 128;
+  int blocks_per_token = 0;
+  int total_blocks = 0;
+};
+
+template <typename Element>
+class Mxfp8KvStoreKernel;
+
+// Quantize one 32-channel MXFP8 group: writes 32 E4M3 payload bytes and returns
+// the E8M0 scale byte.
+template <typename Element>
+CUTLASS_DEVICE uint8_t quantize_mxfp8_group(Element const* src, uint8_t* dst) {
+  float values[quant::kMxfp8GroupSize];
+#pragma unroll
+  for (int chunk = 0; chunk < quant::kMxfp8GroupSize / kFp8VecElems; ++chunk) {
+    float chunk_values[kFp8VecElems];
+    load_vec8<Element>(src + chunk * kFp8VecElems, chunk_values);
+#pragma unroll
+    for (int j = 0; j < kFp8VecElems; ++j) {
+      values[chunk * kFp8VecElems + j] = chunk_values[j];
+    }
+  }
+
+  float amax = 0.0f;
+#pragma unroll
+  for (int i = 0; i < quant::kMxfp8GroupSize; ++i) {
+    float ax = quant::abs_f(values[i]);
+    amax = ax > amax ? ax : amax;
+  }
+
+  int descale_exponent = 0;
+  uint8_t scale_byte = quant::mxfp8_scale_byte(amax, descale_exponent);
+
+#pragma unroll
+  for (int chunk = 0; chunk < quant::kMxfp8GroupSize / kFp8VecElems; ++chunk) {
+    float scaled[kFp8VecElems];
+#pragma unroll
+    for (int j = 0; j < kFp8VecElems; ++j) {
+      scaled[j] = quant::clamp_f(
+          quant::scalb_f(values[chunk * kFp8VecElems + j], -descale_exponent),
+          -quant::kE4M3FnMax,
+          quant::kE4M3FnMax);
+    }
+    store_e4m3_vec8(scaled, dst + chunk * kFp8VecElems);
+  }
+  return scale_byte;
+}
+
+template <typename Element>
+sycl::event launch_mxfp8_kv_store(sycl::queue& queue, Mxfp8KvParams<Element> const& params) {
+  int global = quant::round_up(params.total_blocks, quant::kDefaultBlock);
+  return queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<Mxfp8KvStoreKernel<Element>>(
+        sycl::nd_range<1>(
+            sycl::range<1>(static_cast<std::size_t>(global)),
+            sycl::range<1>(static_cast<std::size_t>(quant::kDefaultBlock))),
+        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+          int gid = static_cast<int>(item.get_global_id(0));
+          if (gid >= params.total_blocks) {
+            return;
+          }
+          int blocks_per_row = 2 * params.blocks_per_token;
+          int token = gid / blocks_per_row;
+          int rem = gid - token * blocks_per_row;
+          bool is_v = rem >= params.blocks_per_token;
+          int block = is_v ? rem - params.blocks_per_token : rem;
+
+          int64_t slot = params.loc[token];
+          if (slot < 0) {
+            return;
+          }
+
+          int channel = block * quant::kMxfp8GroupSize;
+          Element const* src = (is_v ? params.v : params.k) +
+              static_cast<int64_t>(token) * params.dkv + channel;
+          uint8_t* dst = (is_v ? params.v_cache : params.k_cache) +
+              slot * params.dkv + channel;
+          uint8_t scale_byte = quantize_mxfp8_group<Element>(src, dst);
+
+          uint8_t* sf_base = is_v ? params.sfv : params.sfk;
+          sf_base[quant::mxfp8_interleaved_sf_offset(slot, channel, params.dkv, params.page_size)] =
+              scale_byte;
+        });
+  });
+}
+
+// Host reference: identical arithmetic, straight loops, explicit index math.
+template <typename Element>
+void mxfp8_kv_reference(
+    Mxfp8KvCase const& cfg,
+    std::vector<Element> const& k,
+    std::vector<Element> const& v,
+    std::vector<int64_t> const& loc,
+    std::size_t cache_bytes,
+    std::size_t sf_bytes,
+    std::vector<uint8_t>& ref_k_cache,
+    std::vector<uint8_t>& ref_v_cache,
+    std::vector<uint8_t>& ref_sfk,
+    std::vector<uint8_t>& ref_sfv) {
+  ref_k_cache.assign(cache_bytes, 0);
+  ref_v_cache.assign(cache_bytes, 0);
+  ref_sfk.assign(sf_bytes, 0);
+  ref_sfv.assign(sf_bytes, 0);
+
+  int blocks = cfg.dkv / quant::kMxfp8GroupSize;
+  for (int token = 0; token < cfg.tokens; ++token) {
+    int64_t slot = loc[static_cast<std::size_t>(token)];
+    if (slot < 0) {
+      continue;
+    }
+    for (int side = 0; side < 2; ++side) {
+      std::vector<Element> const& src = side == 0 ? k : v;
+      std::vector<uint8_t>& cache = side == 0 ? ref_k_cache : ref_v_cache;
+      std::vector<uint8_t>& sf = side == 0 ? ref_sfk : ref_sfv;
+      for (int block = 0; block < blocks; ++block) {
+        int channel = block * quant::kMxfp8GroupSize;
+        std::size_t base = static_cast<std::size_t>(token) * cfg.dkv + channel;
+        float amax = 0.0f;
+        for (int i = 0; i < quant::kMxfp8GroupSize; ++i) {
+          amax = std::max(amax, std::fabs(quant::to_float(src[base + i])));
+        }
+        int descale_exponent = 0;
+        uint8_t scale_byte = quant::mxfp8_scale_byte(amax, descale_exponent);
+
+        std::size_t dst = static_cast<std::size_t>(slot) * cfg.dkv + channel;
+        for (int i = 0; i < quant::kMxfp8GroupSize; ++i) {
+          float scaled = quant::clamp_f(
+              quant::scalb_f(quant::to_float(src[base + i]), -descale_exponent),
+              -quant::kE4M3FnMax,
+              quant::kE4M3FnMax);
+          cache[dst + i] = quant::e4m3fn_encode_signed(scaled);
+        }
+        sf[static_cast<std::size_t>(
+            quant::mxfp8_interleaved_sf_offset(slot, channel, cfg.dkv, cfg.page_size))] =
+            scale_byte;
+      }
+    }
+  }
+}
+
+void validate_mxfp8_kv_case(Mxfp8KvCase& cfg) {
+  if (cfg.name.empty()) {
+    cfg.name = "custom_mxfp8_kv";
+  }
+  if (cfg.tokens <= 0 || cfg.dkv <= 0 || cfg.slots <= 0) {
+    throw std::invalid_argument("tokens, dkv and slots must be positive");
+  }
+  if (cfg.dkv % quant::kMxfp8HeadDim != 0) {
+    throw std::invalid_argument("dkv must be a multiple of head_dim 128");
+  }
+  if (cfg.page_size <= 0 || cfg.page_size % quant::kMxfp8GroupSize != 0) {
+    throw std::invalid_argument("page_size must be a positive multiple of 32");
+  }
+  if (cfg.slots % cfg.page_size != 0) {
+    throw std::invalid_argument("slots must be a multiple of page_size");
+  }
+  if (cfg.tokens > cfg.slots) {
+    throw std::invalid_argument("tokens must not exceed slots (one slot per token)");
+  }
+}
+
+// Distinct destination slots, deterministically scrambled so the scatter is not
+// a straight copy (real allocations hand out pages out of order).
+std::vector<int64_t> make_kv_loc(Mxfp8KvCase const& cfg) {
+  std::vector<int64_t> slots(static_cast<std::size_t>(cfg.slots));
+  for (int i = 0; i < cfg.slots; ++i) {
+    slots[static_cast<std::size_t>(i)] = i;
+  }
+  std::mt19937 gen(20260601u + static_cast<uint32_t>(cfg.tokens));
+  std::shuffle(slots.begin(), slots.end(), gen);
+  slots.resize(static_cast<std::size_t>(cfg.tokens));
+  if (cfg.include_negative_loc) {
+    for (int t = 3; t < cfg.tokens; t += 7) {
+      slots[static_cast<std::size_t>(t)] = -1;
+    }
+  }
+  return slots;
+}
+
+template <typename Element>
+void seed_mxfp8_edge_values(std::vector<Element>& input, int dkv) {
+  if (static_cast<int>(input.size()) < 3 * dkv || dkv < quant::kMxfp8GroupSize) {
+    return;
+  }
+  // Group 0 of token 0: a huge amax forces the top E8M0 exponents and payload
+  //                     saturation.
+  // Group 0 of token 1: all zeros exercises the 1e-30 amax floor.
+  // Group 0 of token 2: tiny values exercise E4M3 subnormals after scaling.
+  for (int i = 0; i < quant::kMxfp8GroupSize; ++i) {
+    input[static_cast<std::size_t>(i)] =
+        quant::from_float<Element>(i == 0 ? 30000.0f : (i % 3 == 0 ? -1.5f : 0.75f));
+    input[static_cast<std::size_t>(dkv + i)] = quant::from_float<Element>(0.0f);
+    input[static_cast<std::size_t>(2 * dkv + i)] =
+        quant::from_float<Element>((i % 2 == 0 ? 1.0f : -1.0f) * 1.0e-4f * (i + 1));
+  }
+}
+
+template <typename Element>
+bool run_mxfp8_kv_case_for_dtype(sycl::queue& queue, Mxfp8KvCase cfg, quant::Options const& options) {
+  validate_mxfp8_kv_case(cfg);
+
+  int heads = cfg.dkv / quant::kMxfp8HeadDim;
+  int blocks_per_token = cfg.dkv / quant::kMxfp8GroupSize;
+  int pages = cfg.slots / cfg.page_size;
+  std::size_t row_count = static_cast<std::size_t>(cfg.tokens) * cfg.dkv;
+  std::size_t cache_bytes = static_cast<std::size_t>(cfg.slots) * cfg.dkv;
+  std::size_t sf_bytes = static_cast<std::size_t>(pages) * heads * quant::kMxfp8GroupSize *
+      (cfg.page_size / quant::kMxfp8GroupSize) * quant::kMxfp8ScalesPerHead;
+
+  std::vector<Element> h_k = quant::make_input<Element>(row_count, 20260601u, -4.0f, 4.0f);
+  std::vector<Element> h_v = quant::make_input<Element>(row_count, 20260602u, -4.0f, 4.0f);
+  seed_mxfp8_edge_values(h_k, cfg.dkv);
+  seed_mxfp8_edge_values(h_v, cfg.dkv);
+  std::vector<int64_t> h_loc = make_kv_loc(cfg);
+
+  quant::DeviceBuffer<Element> d_k(queue, row_count);
+  quant::DeviceBuffer<Element> d_v(queue, row_count);
+  quant::DeviceBuffer<int64_t> d_loc(queue, h_loc.size());
+  quant::DeviceBuffer<uint8_t> d_k_cache(queue, cache_bytes);
+  quant::DeviceBuffer<uint8_t> d_v_cache(queue, cache_bytes);
+  quant::DeviceBuffer<uint8_t> d_sfk(queue, sf_bytes);
+  quant::DeviceBuffer<uint8_t> d_sfv(queue, sf_bytes);
+  d_k.copy_from(h_k);
+  d_v.copy_from(h_v);
+  d_loc.copy_from(h_loc);
+
+  Mxfp8KvParams<Element> params;
+  params.k = d_k.get();
+  params.v = d_v.get();
+  params.loc = d_loc.get();
+  params.k_cache = d_k_cache.get();
+  params.v_cache = d_v_cache.get();
+  params.sfk = d_sfk.get();
+  params.sfv = d_sfv.get();
+  params.tokens = cfg.tokens;
+  params.dkv = cfg.dkv;
+  params.page_size = cfg.page_size;
+  params.blocks_per_token = blocks_per_token;
+  params.total_blocks = cfg.tokens * 2 * blocks_per_token;
+
+  auto launch = [&]() -> sycl::event { return launch_mxfp8_kv_store<Element>(queue, params); };
+
+  bool passed = true;
+  if (options.verify) {
+    // Zero-init matters: unwritten scale bytes must stay 0, never 0xFF (E8M0 NaN).
+    d_k_cache.zero();
+    d_v_cache.zero();
+    d_sfk.zero();
+    d_sfv.zero();
+    launch().wait();
+
+    std::vector<uint8_t> h_k_cache(cache_bytes);
+    std::vector<uint8_t> h_v_cache(cache_bytes);
+    std::vector<uint8_t> h_sfk(sf_bytes);
+    std::vector<uint8_t> h_sfv(sf_bytes);
+    d_k_cache.copy_to(h_k_cache);
+    d_v_cache.copy_to(h_v_cache);
+    d_sfk.copy_to(h_sfk);
+    d_sfv.copy_to(h_sfv);
+
+    std::vector<uint8_t> ref_k_cache;
+    std::vector<uint8_t> ref_v_cache;
+    std::vector<uint8_t> ref_sfk;
+    std::vector<uint8_t> ref_sfv;
+    mxfp8_kv_reference(
+        cfg, h_k, h_v, h_loc, cache_bytes, sf_bytes, ref_k_cache, ref_v_cache, ref_sfk, ref_sfv);
+
+    quant::ByteCompareResult k_cmp = quant::compare_bytes(h_k_cache, ref_k_cache);
+    quant::ByteCompareResult v_cmp = quant::compare_bytes(h_v_cache, ref_v_cache);
+    quant::ByteCompareResult sfk_cmp = quant::compare_bytes(h_sfk, ref_sfk);
+    quant::ByteCompareResult sfv_cmp = quant::compare_bytes(h_sfv, ref_sfv);
+    if (!k_cmp.passed || !v_cmp.passed || !sfk_cmp.passed || !sfv_cmp.passed) {
+      std::cerr << "  [FAIL] dtype=" << quant::element_dtype_text<Element>()
+                << " mxfp8_kv_case=" << cfg.name << "\n";
+      quant::print_byte_compare("k_cache", k_cmp);
+      quant::print_byte_compare("v_cache", v_cmp);
+      quant::print_byte_compare("sfk", sfk_cmp);
+      quant::print_byte_compare("sfv", sfv_cmp);
+      passed = false;
+    }
+  }
+
+  double mean_ms = 0.0;
+  double gbps = 0.0;
+  if (options.benchmark) {
+    mean_ms = quant::benchmark_ms(launch, options.warmup, options.iterations);
+    // Touched bytes: K+V reads, K+V payload writes, K+V scale writes.
+    double moved_bytes = 2.0 * static_cast<double>(row_count) * sizeof(Element) +
+        2.0 * static_cast<double>(row_count) +
+        2.0 * static_cast<double>(cfg.tokens) * blocks_per_token;
+    gbps = quant::effective_gbps(moved_bytes, mean_ms);
+    double target = options.target_gbps_set ? options.target_gbps : cfg.target_gbps;
+    if (target > 0.0 && gbps < target && moved_bytes >= quant::kMinSustainedTargetBytes) {
+      passed = false;
+    }
+  }
+
+  std::cout << "  [" << (passed ? "PASS" : "FAIL") << "] dtype=" << quant::element_dtype_text<Element>()
+            << " mode=mxfp8_kv case=" << cfg.name
+            << " tokens=" << cfg.tokens
+            << " dkv=" << cfg.dkv
+            << " kv_heads=" << heads
+            << " slots=" << cfg.slots
+            << " page=" << cfg.page_size;
+  if (options.benchmark) {
+    std::cout << " mean_ms=" << std::fixed << std::setprecision(4) << mean_ms
+              << " effective_gbps=" << std::setprecision(2) << gbps;
+  }
+  std::cout << "\n";
+  return passed;
+}
+
+// dkv = max(1, Nkv / TP) * head_dim with head_dim = 128. Verified Inkling
+// configs: checkpoint (hidden 768, Nq 8, Nkv 2, swa_num_key_value_heads 4),
+// defaults (hidden 1536, Nq 12, Nkv 4), production (hidden 6144, Nq 48, Nkv 4).
+// GQA floors Nkv_local at 1, so TP >= Nkv all share one local KV head.
+//
+// head_dim is 128 in every one of those configs because the checkpoint sets it
+// explicitly; it is not hidden_size / Nq (which would give 96 for the
+// checkpoint). InklingConfig only falls back to hidden_size // num_attention_heads
+// when head_dim is absent, and swa_head_dim defaults to head_dim, so the SWA
+// layers are 128 too -- which is what makes them eligible for the fused MXFP8
+// prologue at all (models/inkling.py skips any layer with head_dim != 128).
+// The ckpt_swa_* cases differ from the ckpt_* ones only in Nkv
+// (swa_num_key_value_heads=4 vs num_key_value_heads=2), hence dkv 512 vs 256;
+// they coincide with the nkv4_* shapes by construction, and are named separately
+// so the provenance of each shape stays readable.
+std::vector<Mxfp8KvCase> mxfp8_kv_quick_suite() {
+  return {
+      // One page, one KV head: smallest shape that still spans the interleaved
+      // (32, page_size/32, 4) scale tile.
+      {"single_page_128x128", 128, 128, 128, 128, false, 0.0},
+      // Two KV heads, scattered across pages, with padded (loc < 0) tokens.
+      {"scatter_96x256_neg_loc", 96, 256, 1024, 128, true, 0.0},
+      // Four KV heads (defaults / production Nkv=4 at TP=1).
+      {"scatter_144x512", 144, 512, 2048, 128, false, 0.0},
+      // Non-128 page size exercises the flat-chunk arithmetic
+      // (sglang only interleaves at page_size==128, but the offset formula is
+      // general in page_size and this pins that).
+      {"page64_128x256", 128, 256, 1024, 64, false, 0.0},
+  };
+}
+
+std::vector<Mxfp8KvCase> mxfp8_kv_inkling_suite() {
+  return {
+      // Checkpoint config, Nkv=2 -> dkv 256 at TP=1, 128 at TP>=2.
+      {"ckpt_nkv2_tp1_decode_96x256", 96, 256, 8192, 128, false, 0.0},
+      {"ckpt_nkv2_tp2_decode_96x128", 96, 128, 8192, 128, false, 0.0},
+      {"ckpt_nkv2_tp4_decode_96x128", 96, 128, 8192, 128, false, 0.0},
+      {"ckpt_nkv2_tp8_decode_96x128", 96, 128, 8192, 128, false, 0.0},
+      // Checkpoint SWA layers, swa_num_key_value_heads=4 -> dkv 512 at TP=1.
+      {"ckpt_swa_nkv4_tp1_decode_96x512", 96, 512, 8192, 128, false, 0.0},
+      {"ckpt_swa_nkv4_tp2_decode_96x256", 96, 256, 8192, 128, false, 0.0},
+      {"ckpt_swa_nkv4_tp4_decode_96x128", 96, 128, 8192, 128, false, 0.0},
+      {"ckpt_swa_nkv4_tp8_decode_96x128", 96, 128, 8192, 128, false, 0.0},
+      // Defaults (hidden 1536, Nkv 4) and production (hidden 6144, Nkv 4) share
+      // the same KV geometry: dkv = 512 / 256 / 128 / 128 for TP = 1 / 2 / 4 / 8.
+      {"nkv4_tp1_verify_144x512", 144, 512, 8192, 128, false, 0.0},
+      {"nkv4_tp2_verify_144x256", 144, 256, 8192, 128, false, 0.0},
+      {"nkv4_tp4_verify_144x128", 144, 128, 8192, 128, false, 0.0},
+      {"nkv4_tp8_verify_144x128", 144, 128, 8192, 128, false, 0.0},
+      // Prefill-chunk band with padded tokens (target-verify pads the batch).
+      {"nkv4_tp1_chunk_4096x512", 4096, 512, 8192, 128, true, 0.0},
+      {"nkv4_tp2_chunk_4096x256", 4096, 256, 8192, 128, true, 0.0},
+      {"nkv4_tp4_chunk_4096x128", 4096, 128, 8192, 128, true, 0.0},
+      // Wide-KV geometry: dkv = 6144 / TP, i.e. an MHA-style layer whose local
+      // KV width tracks production hidden_size. Named in the KV-geometry audit;
+      // covers head counts far above the GQA configs above.
+      {"wide_tp1_512x6144", 512, 6144, 2048, 128, false, 0.0},
+      {"wide_tp2_512x3072", 512, 3072, 2048, 128, false, 0.0},
+      {"wide_tp4_512x1536", 512, 1536, 2048, 128, false, 0.0},
+      {"wide_tp8_512x768", 512, 768, 2048, 128, false, 0.0},
+  };
+}
+
+std::vector<Mxfp8KvCase> mxfp8_kv_perf_suite() {
+  // Prefill-cap band T=16384 (max_prefill_tokens) at the shipped KV widths.
+  // GB/s gates are 0.0 (report-only) until a BMG baseline is captured; a
+  // guessed number would flake CI (see 17_bmg_relative_attention_backend).
+  return {
+      {"perf_nkv4_tp1_16384x512", 16384, 512, 32768, 128, false, 0.0},
+      {"perf_nkv4_tp2_16384x256", 16384, 256, 32768, 128, false, 0.0},
+      {"perf_nkv4_tp4_16384x128", 16384, 128, 32768, 128, false, 0.0},
+      {"perf_ckpt_nkv2_tp1_16384x256", 16384, 256, 32768, 128, false, 0.0},
+      {"perf_wide_tp1_4096x6144", 4096, 6144, 8192, 128, false, 0.0},
+      {"perf_wide_tp2_4096x3072", 4096, 3072, 8192, 128, false, 0.0},
+      {"perf_wide_tp4_4096x1536", 4096, 1536, 8192, 128, false, 0.0},
+      {"perf_wide_tp8_4096x768", 4096, 768, 8192, 128, false, 0.0},
+  };
+}
+
+std::vector<Mxfp8KvCase> make_mxfp8_kv_suite(std::string const& suite) {
+  if (suite == "quick") {
+    return mxfp8_kv_quick_suite();
+  }
+  if (suite == "inkling") {
+    return mxfp8_kv_inkling_suite();
+  }
+  if (suite == "perf") {
+    return mxfp8_kv_perf_suite();
+  }
+  return {};
+}
+
+bool parse_mxfp8_kv_shape(std::string const& text, Mxfp8KvCase& cfg) {
+  if (text.empty()) {
+    return true;
+  }
+  for (std::string const& item : quant::split(text, ',')) {
+    auto eq = item.find('=');
+    if (eq == std::string::npos) {
+      return false;
+    }
+    std::string key = item.substr(0, eq);
+    std::string value = item.substr(eq + 1);
+    if (key == "name") {
+      cfg.name = value;
+    } else if (key == "tokens" || key == "t" || key == "rows") {
+      cfg.tokens = std::stoi(value);
+    } else if (key == "dkv") {
+      cfg.dkv = std::stoi(value);
+    } else if (key == "slots") {
+      cfg.slots = std::stoi(value);
+    } else if (key == "page_size" || key == "page") {
+      cfg.page_size = std::stoi(value);
+    } else if (key == "neg_loc") {
+      cfg.include_negative_loc = quant::parse_bool(value);
+    } else if (key == "target_gbps" || key == "target-gbps") {
+      cfg.target_gbps = std::stod(value);
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool run_mxfp8_kv_cases(
+    sycl::queue& queue,
+    std::vector<Mxfp8KvCase> const& cases,
+    quant::Options const& options) {
+  bool all_passed = true;
+  for (Mxfp8KvCase const& cfg : cases) {
+    if (options.dtype == quant::DType::kAll || options.dtype == quant::DType::kFloat) {
+      all_passed &= run_mxfp8_kv_case_for_dtype<float>(queue, cfg, options);
+    }
+    if (options.dtype == quant::DType::kAll || options.dtype == quant::DType::kBf16) {
+      all_passed &= run_mxfp8_kv_case_for_dtype<cutlass::bfloat16_t>(queue, cfg, options);
+    }
+    if (options.dtype == quant::DType::kAll || options.dtype == quant::DType::kFp16) {
+      all_passed &= run_mxfp8_kv_case_for_dtype<cutlass::half_t>(queue, cfg, options);
+    }
+  }
+  return all_passed;
+}
+
+// ===========================================================================
+// Static per-tensor activation scaling to E4M3.
+//
+//   input_scale = input_amax / amax_divisor       (loaded from the checkpoint)
+//   q           = e4m3(clamp(x * (1 / input_scale), -448, 448))
+//
+// The reciprocal is formed once (as static_quant_fp8 does) and there is no
+// reduction at all: the scale is static per linear, not per batch.
+//
+// amax_divisor selects the convention (see the file header for the full
+// provenance):
+//   kE4M3FnMax (448)               static_quant_fp8, the plain per-tensor FP8
+//                                  quantizer -- payload and scale both belong to
+//                                  this kernel.
+//   kNvfp4InputScaleDivisor (2688) Inkling's NVFP4 expert input_scale. Only the
+//                                  scale derivation is Inkling's here; the real
+//                                  consumer (fp4_quantize) emits E2M1 plus
+//                                  per-16 block scales, which is
+//                                  21_bmg_nvfp4_layout's subject, so an E4M3
+//                                  store under this divisor saturates above
+//                                  input_amax / 6 by construction.
+// ===========================================================================
+
+struct Fp8PerTensorCase {
+  std::string name;
+  int rows = 1;
+  int cols = 128;
+  float input_amax = 24.0f;
+  float amax_divisor = quant::kE4M3FnMax;
+  double target_gbps = 0.0;
+};
+
+template <typename Element>
+struct Fp8PerTensorParams {
+  Element const* __restrict x = nullptr;
+  uint8_t* __restrict q = nullptr;
+  int64_t count = 0;
+  int64_t vectors = 0;
+  float inv_scale = 1.0f;
+};
+
+template <typename Element>
+class Fp8PerTensorVecKernel;
+
+template <typename Element>
+class Fp8PerTensorScalarKernel;
+
+template <typename Element>
+sycl::event launch_fp8_per_tensor(sycl::queue& queue, Fp8PerTensorParams<Element> const& params) {
+  if (params.vectors > 0) {
+    // Each work item owns kFp8ChunksPerItem consecutive 8-element vectors. One
+    // vector per item measured 2.7x slower than the MXFP4 kernel on identical
+    // traffic: at 16 B loaded per item there is not enough memory-level
+    // parallelism in flight per thread to cover the E4M3 encode.
+    int64_t items = (params.vectors + kFp8ChunksPerItem - 1) / kFp8ChunksPerItem;
+    int64_t global = quant::round_up(static_cast<int>(items), quant::kDefaultBlock);
+    return queue.submit([&](sycl::handler& cgh) {
+      cgh.parallel_for<Fp8PerTensorVecKernel<Element>>(
+          sycl::nd_range<1>(
+              sycl::range<1>(static_cast<std::size_t>(global)),
+              sycl::range<1>(static_cast<std::size_t>(quant::kDefaultBlock))),
+          [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+            int64_t first = static_cast<int64_t>(item.get_global_id(0)) * kFp8ChunksPerItem;
+#pragma unroll
+            for (int c = 0; c < kFp8ChunksPerItem; ++c) {
+              int64_t vec = first + c;
+              if (vec >= params.vectors) {
+                break;
+              }
+              int64_t base = vec * kFp8VecElems;
+              float values[kFp8VecElems];
+              load_vec8<Element>(params.x + base, values);
+#pragma unroll
+              for (int j = 0; j < kFp8VecElems; ++j) {
+                values[j] = quant::clamp_f(
+                    values[j] * params.inv_scale, -quant::kE4M3FnMax, quant::kE4M3FnMax);
+              }
+              store_e4m3_vec8(values, params.q + base);
+            }
+          });
+    });
+  }
+
+  int64_t global = quant::round_up(static_cast<int>(params.count), quant::kDefaultBlock);
+  return queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<Fp8PerTensorScalarKernel<Element>>(
+        sycl::nd_range<1>(
+            sycl::range<1>(static_cast<std::size_t>(global)),
+            sycl::range<1>(static_cast<std::size_t>(quant::kDefaultBlock))),
+        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+          int64_t idx = static_cast<int64_t>(item.get_global_id(0));
+          if (idx >= params.count) {
+            return;
+          }
+          float scaled = quant::clamp_f(
+              quant::to_float(params.x[idx]) * params.inv_scale,
+              -quant::kE4M3FnMax,
+              quant::kE4M3FnMax);
+          params.q[idx] = quant::e4m3fn_encode_signed(scaled);
+        });
+  });
+}
+
+template <typename Element>
+void fp8_per_tensor_reference(
+    std::vector<Element> const& x,
+    float inv_scale,
+    std::vector<uint8_t>& out) {
+  out.assign(x.size(), 0);
+  for (std::size_t i = 0; i < x.size(); ++i) {
+    float scaled = quant::clamp_f(
+        quant::to_float(x[i]) * inv_scale, -quant::kE4M3FnMax, quant::kE4M3FnMax);
+    out[i] = quant::e4m3fn_encode_signed(scaled);
+  }
+}
+
+void validate_fp8_per_tensor_case(Fp8PerTensorCase& cfg) {
+  if (cfg.name.empty()) {
+    cfg.name = "custom_fp8_pertensor";
+  }
+  if (cfg.rows <= 0 || cfg.cols <= 0) {
+    throw std::invalid_argument("rows and cols must be positive");
+  }
+  if (!(cfg.input_amax > 0.0f)) {
+    throw std::invalid_argument("input_amax must be positive");
+  }
+  if (!(cfg.amax_divisor > 0.0f)) {
+    throw std::invalid_argument("amax_divisor must be positive");
+  }
+}
+
+template <typename Element>
+bool run_fp8_per_tensor_case_for_dtype(
+    sycl::queue& queue,
+    Fp8PerTensorCase cfg,
+    quant::Options const& options) {
+  validate_fp8_per_tensor_case(cfg);
+
+  std::size_t count = static_cast<std::size_t>(cfg.rows) * cfg.cols;
+  float input_scale = quant::per_tensor_input_scale_from_amax(cfg.input_amax, cfg.amax_divisor);
+  float inv_scale = 1.0f / input_scale;
+
+  std::vector<Element> h_x = quant::make_input<Element>(count, 20260603u, -4.0f, 4.0f);
+  // Force saturation on both signs plus an exact-zero and a subnormal-after-
+  // scaling value, so the E4M3 corner cases are covered at every shape.
+  if (count >= 4) {
+    h_x[0] = quant::from_float<Element>(cfg.input_amax);
+    h_x[1] = quant::from_float<Element>(-cfg.input_amax);
+    h_x[2] = quant::from_float<Element>(0.0f);
+    h_x[3] = quant::from_float<Element>(input_scale * 0.001953125f);
+  }
+
+  quant::DeviceBuffer<Element> d_x(queue, count);
+  quant::DeviceBuffer<uint8_t> d_q(queue, count);
+  d_x.copy_from(h_x);
+
+  Fp8PerTensorParams<Element> params;
+  params.x = d_x.get();
+  params.q = d_q.get();
+  params.count = static_cast<int64_t>(count);
+  params.vectors = (count % kFp8VecElems == 0) ? static_cast<int64_t>(count / kFp8VecElems) : 0;
+  params.inv_scale = inv_scale;
+
+  auto launch = [&]() -> sycl::event { return launch_fp8_per_tensor<Element>(queue, params); };
+
+  bool passed = true;
+  if (options.verify) {
+    d_q.zero();
+    launch().wait();
+
+    std::vector<uint8_t> h_q(count);
+    d_q.copy_to(h_q);
+
+    std::vector<uint8_t> ref_q;
+    fp8_per_tensor_reference(h_x, inv_scale, ref_q);
+    quant::ByteCompareResult cmp = quant::compare_bytes(h_q, ref_q);
+    if (!cmp.passed) {
+      std::cerr << "  [FAIL] dtype=" << quant::element_dtype_text<Element>()
+                << " fp8_pertensor_case=" << cfg.name << "\n";
+      quant::print_byte_compare("q", cmp);
+      passed = false;
+    }
+  }
+
+  double mean_ms = 0.0;
+  double gbps = 0.0;
+  if (options.benchmark) {
+    mean_ms = quant::benchmark_ms(launch, options.warmup, options.iterations);
+    double moved_bytes = static_cast<double>(count) * (sizeof(Element) + 1);
+    gbps = quant::effective_gbps(moved_bytes, mean_ms);
+    double target = options.target_gbps_set ? options.target_gbps : cfg.target_gbps;
+    if (target > 0.0 && gbps < target && moved_bytes >= quant::kMinSustainedTargetBytes) {
+      passed = false;
+    }
+  }
+
+  std::cout << "  [" << (passed ? "PASS" : "FAIL") << "] dtype=" << quant::element_dtype_text<Element>()
+            << " mode=fp8_pertensor case=" << cfg.name
+            << " rows=" << cfg.rows
+            << " cols=" << cfg.cols
+            << " input_amax=" << std::fixed << std::setprecision(3) << cfg.input_amax
+            << " amax_divisor=" << std::fixed << std::setprecision(1) << cfg.amax_divisor
+            << " input_scale=" << std::scientific << std::setprecision(4) << input_scale
+            << std::defaultfloat;
+  if (options.benchmark) {
+    std::cout << " mean_ms=" << std::fixed << std::setprecision(4) << mean_ms
+              << " effective_gbps=" << std::setprecision(2) << gbps;
+  }
+  std::cout << "\n";
+  return passed;
+}
+
+// Activation widths of the quantized linears. Column-parallel linears (qkv_proj,
+// gate_up_proj) see the full hidden_size; row-parallel ones (o_proj, down_proj)
+// see their shard, hidden/TP or intermediate/TP. hidden_size is 1536 (defaults)
+// or 6144 (production); the checkpoint's own hidden_size is 768.
+//
+// kFp8Div    = static_quant_fp8's scale = amax / e4m3_max.
+// kNvfp4Div  = Inkling's NVFP4 expert input_scale = amax / (e4m3_max * e2m1_max).
+// Only the second is a scale Inkling itself derives; see the section comment
+// above for why its payload is fp4_quantize's and not the bytes stored here.
+constexpr float kFp8Div = quant::kE4M3FnMax;
+constexpr float kNvfp4Div = quant::kNvfp4InputScaleDivisor;
+
+std::vector<Fp8PerTensorCase> fp8_per_tensor_quick_suite() {
+  return {
+      {"single_row_1x768", 1, 768, 24.0f, kFp8Div, 0.0},
+      {"tail_37x1536", 37, 1536, 24.0f, kFp8Div, 0.0},
+      {"unaligned_cols_5x101", 5, 101, 24.0f, kFp8Div, 0.0},
+      {"tight_amax_128x1536", 128, 1536, 4.0f, kFp8Div, 0.0},
+      // Same shapes under the NVFP4 divisor, where everything above amax/6
+      // saturates: exercises the saturating branch of the encoder at scale.
+      {"nvfp4in_tail_37x1536", 37, 1536, 24.0f, kNvfp4Div, 0.0},
+      {"nvfp4in_unaligned_cols_5x101", 5, 101, 24.0f, kNvfp4Div, 0.0},
+  };
+}
+
+std::vector<Fp8PerTensorCase> fp8_per_tensor_inkling_suite() {
+  // The nvfp4in_* cases carry Inkling's own divisor; the fp8lin_* cases at the
+  // end carry static_quant_fp8's, so both conventions are verified per dtype.
+  return {
+      // Checkpoint hidden_size=768 (column-parallel input is unsharded).
+      {"nvfp4in_ckpt_h768_colparallel_96x768", 96, 768, 24.0f, kNvfp4Div, 0.0},
+      {"nvfp4in_ckpt_h768_rowparallel_tp2_96x384", 96, 384, 24.0f, kNvfp4Div, 0.0},
+      {"nvfp4in_ckpt_h768_rowparallel_tp4_96x192", 96, 192, 24.0f, kNvfp4Div, 0.0},
+      {"nvfp4in_ckpt_h768_rowparallel_tp8_96x96", 96, 96, 24.0f, kNvfp4Div, 0.0},
+      // Defaults hidden_size=1536.
+      {"nvfp4in_cfg_h1536_colparallel_decode_96x1536", 96, 1536, 24.0f, kNvfp4Div, 0.0},
+      {"nvfp4in_cfg_h1536_rowparallel_tp2_96x768", 96, 768, 24.0f, kNvfp4Div, 0.0},
+      {"nvfp4in_cfg_h1536_rowparallel_tp4_96x384", 96, 384, 24.0f, kNvfp4Div, 0.0},
+      {"nvfp4in_cfg_h1536_rowparallel_tp8_96x192", 96, 192, 24.0f, kNvfp4Div, 0.0},
+      {"nvfp4in_cfg_h1536_colparallel_verify_144x1536", 144, 1536, 24.0f, kNvfp4Div, 0.0},
+      {"nvfp4in_cfg_h1536_colparallel_chunk_4096x1536", 4096, 1536, 24.0f, kNvfp4Div, 0.0},
+      // Production hidden_size=6144.
+      {"nvfp4in_prod_h6144_colparallel_decode_96x6144", 96, 6144, 24.0f, kNvfp4Div, 0.0},
+      {"nvfp4in_prod_h6144_rowparallel_tp2_96x3072", 96, 3072, 24.0f, kNvfp4Div, 0.0},
+      {"nvfp4in_prod_h6144_rowparallel_tp4_96x1536", 96, 1536, 24.0f, kNvfp4Div, 0.0},
+      {"nvfp4in_prod_h6144_rowparallel_tp8_96x768", 96, 768, 24.0f, kNvfp4Div, 0.0},
+      {"nvfp4in_prod_h6144_colparallel_verify_144x6144", 144, 6144, 24.0f, kNvfp4Div, 0.0},
+      {"nvfp4in_prod_h6144_colparallel_chunk_4096x6144", 4096, 6144, 24.0f, kNvfp4Div, 0.0},
+      // down_proj input = intermediate/TP; intermediate is 768 (defaults) and
+      // 6144 (production) per the shipped configs.
+      {"nvfp4in_cfg_downproj_tp2_96x384", 96, 384, 24.0f, kNvfp4Div, 0.0},
+      {"nvfp4in_prod_downproj_tp2_96x3072", 96, 3072, 24.0f, kNvfp4Div, 0.0},
+      {"nvfp4in_prod_downproj_tp8_96x768", 96, 768, 24.0f, kNvfp4Div, 0.0},
+      // static_quant_fp8's own convention across the three hidden_size values.
+      {"fp8lin_ckpt_h768_96x768", 96, 768, 24.0f, kFp8Div, 0.0},
+      {"fp8lin_cfg_h1536_96x1536", 96, 1536, 24.0f, kFp8Div, 0.0},
+      {"fp8lin_prod_h6144_96x6144", 96, 6144, 24.0f, kFp8Div, 0.0},
+      {"fp8lin_prod_h6144_chunk_4096x6144", 4096, 6144, 24.0f, kFp8Div, 0.0},
+  };
+}
+
+std::vector<Fp8PerTensorCase> fp8_per_tensor_perf_suite() {
+  // Prefill-cap band. Gates report-only (0.0) until a BMG baseline is captured.
+  // The divisor changes no work, so only one case repeats under kNvfp4Div.
+  return {
+      {"perf_prod_prefill_tp1_16384x6144", 16384, 6144, 24.0f, kFp8Div, 0.0},
+      {"perf_prod_prefill_tp2_16384x3072", 16384, 3072, 24.0f, kFp8Div, 0.0},
+      {"perf_prod_prefill_tp4_16384x1536", 16384, 1536, 24.0f, kFp8Div, 0.0},
+      {"perf_prod_prefill_tp8_16384x768", 16384, 768, 24.0f, kFp8Div, 0.0},
+      {"perf_cfg_prefill_tp1_16384x1536", 16384, 1536, 24.0f, kFp8Div, 0.0},
+      {"perf_cfg_prefill_tp4_16384x384", 16384, 384, 24.0f, kFp8Div, 0.0},
+      {"perf_nvfp4in_prod_prefill_tp1_16384x6144", 16384, 6144, 24.0f, kNvfp4Div, 0.0},
+  };
+}
+
+std::vector<Fp8PerTensorCase> make_fp8_per_tensor_suite(std::string const& suite) {
+  if (suite == "quick") {
+    return fp8_per_tensor_quick_suite();
+  }
+  if (suite == "inkling") {
+    return fp8_per_tensor_inkling_suite();
+  }
+  if (suite == "perf") {
+    return fp8_per_tensor_perf_suite();
+  }
+  return {};
+}
+
+bool parse_fp8_per_tensor_shape(std::string const& text, Fp8PerTensorCase& cfg) {
+  if (text.empty()) {
+    return true;
+  }
+  for (std::string const& item : quant::split(text, ',')) {
+    auto eq = item.find('=');
+    if (eq == std::string::npos) {
+      return false;
+    }
+    std::string key = item.substr(0, eq);
+    std::string value = item.substr(eq + 1);
+    if (key == "name") {
+      cfg.name = value;
+    } else if (key == "rows" || key == "m" || key == "tokens") {
+      cfg.rows = std::stoi(value);
+    } else if (key == "cols" || key == "n" || key == "k") {
+      cfg.cols = std::stoi(value);
+    } else if (key == "amax" || key == "input_amax") {
+      cfg.input_amax = std::stof(value);
+    } else if (key == "divisor" || key == "amax_divisor") {
+      if (value == "fp8") {
+        cfg.amax_divisor = kFp8Div;
+      } else if (value == "nvfp4") {
+        cfg.amax_divisor = kNvfp4Div;
+      } else {
+        cfg.amax_divisor = std::stof(value);
+      }
+    } else if (key == "target_gbps" || key == "target-gbps") {
+      cfg.target_gbps = std::stod(value);
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool run_fp8_per_tensor_cases(
+    sycl::queue& queue,
+    std::vector<Fp8PerTensorCase> const& cases,
+    quant::Options const& options) {
+  bool all_passed = true;
+  for (Fp8PerTensorCase const& cfg : cases) {
+    if (options.dtype == quant::DType::kAll || options.dtype == quant::DType::kFloat) {
+      all_passed &= run_fp8_per_tensor_case_for_dtype<float>(queue, cfg, options);
+    }
+    if (options.dtype == quant::DType::kAll || options.dtype == quant::DType::kBf16) {
+      all_passed &= run_fp8_per_tensor_case_for_dtype<cutlass::bfloat16_t>(queue, cfg, options);
+    }
+    if (options.dtype == quant::DType::kAll || options.dtype == quant::DType::kFp16) {
+      all_passed &= run_fp8_per_tensor_case_for_dtype<cutlass::half_t>(queue, cfg, options);
+    }
+  }
+  return all_passed;
+}
+
 }  // namespace
 
 int main(int argc, char const** argv) {
@@ -1178,11 +2139,21 @@ int main(int argc, char const** argv) {
   try {
     options = quant::parse_common_options(argc, argv);
     if (options.help) {
-      std::cout << "21_bmg_mxfp4_mapping: subgroup MXFP4 E2M1 pack plus UE8M0 scale mapping\n\n";
+      std::cout << "21_bmg_mxfp4_mapping: Inkling activation quantizers -- MXFP8 KV cache and\n"
+                << "static per-tensor E4M3 scaling (NVFP4 expert input_scale = amax/(448*6),\n"
+                << "or static_quant_fp8's amax/448), plus the (non-Inkling) MXFP4 E2M1 + UE8M0\n"
+                << "reference mapping.\n\n";
       quant::print_common_usage(
           argv[0],
           "quick|inkling|perf|inkling_batched",
-          "rows=<int>,cols=<int>,layout=row|column,eps=<float>");
+          "mxfp4:         rows=<int>,cols=<int>,layout=row|column,eps=<float>\n"
+          "                                mxfp8_kv:      tokens=<int>,dkv=<int>,slots=<int>,"
+          "page_size=<int>,neg_loc=0|1\n"
+          "                                fp8_pertensor: rows=<int>,cols=<int>,amax=<float>,"
+          "divisor=fp8|nvfp4|<float>",
+          /*show_mode=*/true);
+      std::cout << "\nWith --shape, --mode selects which family the shape describes"
+                << " (default mxfp4).\n";
       return 0;
     }
   } catch (std::exception const& e) {
@@ -1190,22 +2161,53 @@ int main(int argc, char const** argv) {
     return -1;
   }
 
-  std::vector<Mxfp4Case> cases;
+  std::vector<Mxfp4Case> mxfp4_cases;
+  std::vector<Mxfp8KvCase> mxfp8_kv_cases;
+  std::vector<Fp8PerTensorCase> fp8_cases;
   bool run_batched = false;
   if (!options.shape.empty()) {
-    Mxfp4Case cfg;
-    cfg.name = "custom_mxfp4";
-    if (!parse_mx_shape(options.shape, cfg)) {
-      std::cerr << "Invalid --shape string: " << options.shape << "\n";
+    // A single custom shape belongs to exactly one family; --mode picks it.
+    if (options.mode == quant::QuantMode::kMxfp8Kv) {
+      Mxfp8KvCase cfg;
+      if (!parse_mxfp8_kv_shape(options.shape, cfg)) {
+        std::cerr << "Invalid --shape string for mode=mxfp8_kv: " << options.shape << "\n";
+        return -1;
+      }
+      mxfp8_kv_cases.push_back(cfg);
+    } else if (options.mode == quant::QuantMode::kFp8PerTensor) {
+      Fp8PerTensorCase cfg;
+      if (!parse_fp8_per_tensor_shape(options.shape, cfg)) {
+        std::cerr << "Invalid --shape string for mode=fp8_pertensor: " << options.shape << "\n";
+        return -1;
+      }
+      fp8_cases.push_back(cfg);
+    } else {
+      Mxfp4Case cfg;
+      cfg.name = "custom_mxfp4";
+      if (!parse_mx_shape(options.shape, cfg)) {
+        std::cerr << "Invalid --shape string: " << options.shape << "\n";
+        return -1;
+      }
+      mxfp4_cases.push_back(cfg);
+    }
+  } else if (options.suite == "inkling_batched" || options.suite == "inkling-batched") {
+    if (options.mode != quant::QuantMode::kAll && options.mode != quant::QuantMode::kMxfp4) {
+      std::cerr << "Suite inkling_batched only exists for mode=mxfp4\n";
       return -1;
     }
-    cases.push_back(cfg);
-  } else if (options.suite == "inkling_batched" || options.suite == "inkling-batched") {
-    cases = inkling_batched_suite();
+    mxfp4_cases = inkling_batched_suite();
     run_batched = true;
   } else {
-    cases = make_suite(options.suite);
-    if (cases.empty()) {
+    if (quant::mode_selected(options.mode, quant::QuantMode::kMxfp4)) {
+      mxfp4_cases = make_suite(options.suite);
+    }
+    if (quant::mode_selected(options.mode, quant::QuantMode::kMxfp8Kv)) {
+      mxfp8_kv_cases = make_mxfp8_kv_suite(options.suite);
+    }
+    if (quant::mode_selected(options.mode, quant::QuantMode::kFp8PerTensor)) {
+      fp8_cases = make_fp8_per_tensor_suite(options.suite);
+    }
+    if (mxfp4_cases.empty() && mxfp8_kv_cases.empty() && fp8_cases.empty()) {
       std::cerr << "Unknown suite: " << options.suite << "\n";
       return -1;
     }
@@ -1214,17 +2216,29 @@ int main(int argc, char const** argv) {
   try {
     sycl::queue queue = quant::make_queue();
     std::cout << "Device: " << queue.get_device().get_info<sycl::info::device::name>() << "\n";
-    std::cout << "21_bmg_mxfp4_mapping: group=32 packed E2M1, UE8M0 scales, row/column scale layout\n";
+    std::cout << "21_bmg_mxfp4_mapping: mxfp8_kv (Inkling KV cache), fp8_pertensor (static"
+              << " per-tensor E4M3; divisor 2688 is Inkling's NVFP4 expert input_scale,"
+              << " 448 is static_quant_fp8's), mxfp4 (reference only, not an Inkling op)\n";
     std::cout << "Suite=" << options.suite
+              << " mode=" << quant::mode_text(options.mode)
               << " dtype=" << quant::dtype_text(options.dtype)
               << " iterations=" << options.iterations
               << " warmup=" << options.warmup
               << " verify=" << quant::bool_text(options.verify)
               << " benchmark=" << quant::bool_text(options.benchmark) << "\n";
 
-    bool passed = run_batched
-        ? run_batched_row_major_cases(queue, cases, options)
-        : run_cases(queue, cases, options);
+    bool passed = true;
+    if (run_batched) {
+      passed &= run_batched_row_major_cases(queue, mxfp4_cases, options);
+    } else if (!mxfp4_cases.empty()) {
+      passed &= run_cases(queue, mxfp4_cases, options);
+    }
+    if (!mxfp8_kv_cases.empty()) {
+      passed &= run_mxfp8_kv_cases(queue, mxfp8_kv_cases, options);
+    }
+    if (!fp8_cases.empty()) {
+      passed &= run_fp8_per_tensor_cases(queue, fp8_cases, options);
+    }
     return passed ? 0 : -1;
   } catch (std::exception const& e) {
     std::cerr << "Error: " << e.what() << "\n";
