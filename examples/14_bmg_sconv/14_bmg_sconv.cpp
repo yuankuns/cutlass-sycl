@@ -1096,21 +1096,75 @@ std::vector<CaseConfig> quick_suite() {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Shipped Inkling geometry, and how the six conv streams map onto sconv D.
+//
+// srt/configs/inkling.py:215-253 (InklingModelConfig.mamba2_cache_params)
+// allocates SIX conv-state streams per layer, each (W-1, dim) in bfloat16 with
+// W-1 = sconv_kernel_size - 1 = 3 (inkling.py:238, 250):
+//
+//   SconvType (models/inkling_common/sconv.py:28-35)   dim
+//   ---------------------------------------------------------------------------
+//   K_FULL, V_FULL     dim = max(1, num_key_value_heads     / P) * head_dim
+//   K_LOCAL, V_LOCAL   dim = max(1, swa_num_key_value_heads / P) * swa_head_dim
+//   ATTN, MLP          dim = hidden_size, or hidden_size / P when
+//                            --enable-scattered-sconv is set (inkling.py:231-237)
+//
+// The max(1, ...) KV replication rule is inkling.py:222-228
+// (tp_local_kv_conv_dim) and models/inkling_common/attn.py:297
+// (num_tp_kv_heads = max(1, num_total_kv_heads // tp_size)), i.e. a KV head is
+// REPLICATED once the head count is exhausted rather than the dim being split.
+//
+// Three shipped geometries:
+//   * shipped checkpoint  thinkingmachines/Inkling config.json text_config:
+//                         hidden_size=768, num_hidden_layers=8,
+//                         num_attention_heads=8, num_key_value_heads=2,
+//                         head_dim=128, swa_num_key_value_heads=4,
+//                         swa_head_dim=128, sconv_kernel_size=4,
+//                         mtp_config.num_nextn_predict_layers=2 -> draft_token_num=3
+//   * config defaults     hidden_size=1536, num_key_value_heads=4, head_dim=128
+//                         (inkling.py:26-31; head_dim = 1536/12 = 128)
+//   * production          hidden_size=6144, num_key_value_heads=4, head_dim=128
+//                         (attested by _INKLING_GATE_GEMV_HIDDEN=6144,
+//                          _INKLING_AR_SSCONV_OUT_REGION=16384*6144, and the
+//                          'hidden_size=6144 in BF16' comment in inkling.py),
+//                         num_nextn_predict_layers=8 -> draft_token_num=9
+//
+// Per-stream sconv D at TP in {1,2,4,8}:
+//
+//   shipped checkpoint (hidden=768, Nkv=2, swa_Nkv=4, head_dim=128)
+//     TP   K_FULL/V_FULL   K_LOCAL/V_LOCAL   ATTN/MLP (scattered)   ATTN/MLP (plain)
+//      1        256              512                768                  768
+//      2        128              256                384                  768
+//      4        128              128                192                  768
+//      8        128              128                 96                  768
+//
+//   config defaults (hidden=1536, Nkv=swa_Nkv=4, head_dim=128)
+//     TP   K_*/V_* (full and local)   ATTN/MLP (scattered)   ATTN/MLP (plain)
+//      1            512                     1536                  1536
+//      2            256                      768                  1536
+//      4            128                      384                  1536
+//      8            128                      192                  1536
+//
+//   production (hidden=6144, Nkv=swa_Nkv=4, head_dim=128)
+//     TP   K_*/V_*   ATTN/MLP (scattered)   ATTN/MLP (plain)
+//      1     512            6144                 6144
+//      2     256            3072                 6144
+//      4     128            1536                 6144
+//      8     128             768                 6144
+//
+// The model always constructs ShortConvolution with activation=None and
+// use_residual=True: sconv.py:64-65 declares those defaults and none of the four
+// construction sites (models/inkling.py:237, :247 for ATTN/MLP;
+// models/inkling_common/attn.py:359, :369 for K_*/V_*) passes either argument.
+// Every case below named ckpt_/kv_/scattered_/perf_ therefore runs
+// silu=false, residual=true. Cases named silu_* / no_residual_* are SYNTHETIC
+// robustness coverage for the kernel's template switches -- the model never
+// requests them.
+//
+// Chunked prefill caps extend T at max_prefill_tokens=16384 (comm.py:876).
+// ---------------------------------------------------------------------------
 std::vector<CaseConfig> inkling_suite() {
-  // Inkling has two shipped configurations:
-  //   * config defaults          : hidden_size=1536, head_dim=128, num_kv_heads=4
-  //   * production checkpoint    : hidden_size=6144, head_dim=128, num_kv_heads=4
-  //                                (attested by _INKLING_GATE_GEMV_HIDDEN=6144,
-  //                                _INKLING_AR_SSCONV_OUT_REGION=16384*6144, and the
-  //                                'hidden_size=6144 in BF16' comment in inkling.py).
-  // sconv_kernel_size=4, draft_token_num=9, and chunked prefill caps extend T at
-  // max_prefill_tokens=16384 (comm.py:876). TP sharding (attn.py:264):
-  // num_tp_kv_heads = max(1, num_kv_heads/tp), scattered_sconv shard = hidden_size / tp.
-  // Effective per-layer sconv D at each TP:
-  //   attn/mlp non-scattered : D=1536 (default) / 6144 (prod)  — same for TP=1..8
-  //   attn/mlp scattered     : D=hidden/tp = {1536,768,384,192} / {6144,3072,1536,768}
-  //   k/v_sconv              : D=head_dim*num_tp_kv_heads = {512,256,128,128}
-  //                            (num_kv_heads=4 saturates to num_tp_kv_heads=1 at TP>=4)
   return {
       {"reference_w3_tiny", 7, 4, 3, 2, 1, false, true, true, false},
       {"decode_b64_d128", 64, 128, 4, 64, 1, false, false, true, true},
@@ -1152,6 +1206,60 @@ std::vector<CaseConfig> inkling_suite() {
       {"kv_tp2_extend_b8_l128_d256", 1024, 256, 4, 8, 128, true, false, true, false},
       {"kv_tp4_extend_b8_l128_d128", 1024, 128, 4, 8, 128, true, false, true, false},
       {"kv_tp4_decode_b128_d128", 128, 128, 4, 128, 1, false, false, true, true},
+      // === Shipped checkpoint geometry (hidden=768, Nkv=2, swa_Nkv=4, hd=128) ===
+      // One extend case per conv stream at every TP in {1,2,4,8}; see the table
+      // above the suite. All run activation=None / use_residual=True, matching
+      // how the model constructs every ShortConvolution.
+      {"ckpt_tp1_k_full_d256", 1024, 256, 4, 8, 128, true, false, true, false},
+      {"ckpt_tp1_v_full_d256", 1024, 256, 4, 8, 128, true, false, true, false},
+      {"ckpt_tp1_k_local_d512", 1024, 512, 4, 8, 128, true, false, true, false},
+      {"ckpt_tp1_v_local_d512", 1024, 512, 4, 8, 128, true, false, true, false},
+      {"ckpt_tp1_attn_d768", 1024, 768, 4, 8, 128, true, false, true, false},
+      {"ckpt_tp1_mlp_d768", 1024, 768, 4, 8, 128, true, false, true, false},
+      {"ckpt_tp2_k_full_d128", 1024, 128, 4, 8, 128, true, false, true, false},
+      {"ckpt_tp2_v_full_d128", 1024, 128, 4, 8, 128, true, false, true, false},
+      {"ckpt_tp2_k_local_d256", 1024, 256, 4, 8, 128, true, false, true, false},
+      {"ckpt_tp2_v_local_d256", 1024, 256, 4, 8, 128, true, false, true, false},
+      {"ckpt_tp2_attn_d384", 1024, 384, 4, 8, 128, true, false, true, false},
+      {"ckpt_tp2_mlp_d384", 1024, 384, 4, 8, 128, true, false, true, false},
+      {"ckpt_tp4_k_full_d128", 1024, 128, 4, 8, 128, true, false, true, false},
+      {"ckpt_tp4_v_full_d128", 1024, 128, 4, 8, 128, true, false, true, false},
+      {"ckpt_tp4_k_local_d128", 1024, 128, 4, 8, 128, true, false, true, false},
+      {"ckpt_tp4_v_local_d128", 1024, 128, 4, 8, 128, true, false, true, false},
+      {"ckpt_tp4_attn_d192", 1024, 192, 4, 8, 128, true, false, true, false},
+      {"ckpt_tp4_mlp_d192", 1024, 192, 4, 8, 128, true, false, true, false},
+      {"ckpt_tp8_k_full_d128", 1024, 128, 4, 8, 128, true, false, true, false},
+      {"ckpt_tp8_v_full_d128", 1024, 128, 4, 8, 128, true, false, true, false},
+      {"ckpt_tp8_k_local_d128", 1024, 128, 4, 8, 128, true, false, true, false},
+      {"ckpt_tp8_v_local_d128", 1024, 128, 4, 8, 128, true, false, true, false},
+      // TP=8 scattered ATTN/MLP shard: 768/8 = 96, the one checkpoint dim that
+      // is neither a multiple of 128 nor covered by any other configuration.
+      {"ckpt_tp8_attn_d96", 1024, 96, 4, 8, 128, true, false, true, false},
+      {"ckpt_tp8_mlp_d96", 1024, 96, 4, 8, 128, true, false, true, false},
+      // Checkpoint non-scattered ATTN/MLP: dim = hidden_size = 768 at every TP.
+      {"ckpt_plain_attn_mlp_d768", 1024, 768, 4, 8, 128, true, false, true, false},
+      // Checkpoint decode (T = batch) at each distinct checkpoint stream dim.
+      {"ckpt_decode_b128_d96", 128, 96, 4, 128, 1, false, false, true, true},
+      {"ckpt_decode_b128_d128", 128, 128, 4, 128, 1, false, false, true, true},
+      {"ckpt_decode_b128_d192", 128, 192, 4, 128, 1, false, false, true, true},
+      {"ckpt_decode_b128_d256", 128, 256, 4, 128, 1, false, false, true, true},
+      {"ckpt_decode_b128_d384", 128, 384, 4, 128, 1, false, false, true, true},
+      {"ckpt_decode_b128_d512", 128, 512, 4, 128, 1, false, false, true, true},
+      {"ckpt_decode_b128_d768", 128, 768, 4, 128, 1, false, false, true, true},
+      // Checkpoint target-verify: mtp num_nextn_predict_layers=2 -> draft_token_num=3,
+      // so T = B * 3 (the production checkpoint's 9 is covered by verify_* above).
+      {"ckpt_verify_b16_q3_d96", 48, 96, 4, 16, 3, false, false, true, false},
+      {"ckpt_verify_b16_q3_d128", 48, 128, 4, 16, 3, false, false, true, false},
+      {"ckpt_verify_b16_q3_d192", 48, 192, 4, 16, 3, false, false, true, false},
+      {"ckpt_verify_b16_q3_d256", 48, 256, 4, 16, 3, false, false, true, false},
+      {"ckpt_verify_b16_q3_d384", 48, 384, 4, 16, 3, false, false, true, false},
+      {"ckpt_verify_b16_q3_d512", 48, 512, 4, 16, 3, false, false, true, false},
+      {"ckpt_verify_b16_q3_d768", 48, 768, 4, 16, 3, false, false, true, false},
+      // Checkpoint chunked-prefill ceiling (max_prefill_tokens=16384, comm.py:876)
+      // at the widest checkpoint stream dim (non-scattered ATTN/MLP, D=768).
+      {"ckpt_extend_b16_l1024_d768_prefill_cap", 16384, 768, 4, 16, 1024, true, false, true, false},
+      // === Synthetic robustness cases: the model never uses silu, and never
+      // runs with use_residual=False (sconv.py:64-65 + all four call sites). ===
       {"silu_residual_b8_l128_d256", 1024, 256, 4, 8, 128, true, true, true, false},
       {"decode_odd_b65_d257", 65, 257, 4, 65, 1, false, false, true, true},
       {"w3_medium_b8_l128_d256", 1024, 256, 3, 8, 128, false, false, true, false},
@@ -1161,17 +1269,10 @@ std::vector<CaseConfig> inkling_suite() {
 }
 
 std::vector<CaseConfig> perf_suite() {
-  // Inkling has two shipped configurations:
-  //   * config defaults          : hidden_size=1536, head_dim=128, num_kv_heads=4
-  //   * production checkpoint    : hidden_size=6144, head_dim=128, num_kv_heads=4
-  // sconv_kernel_size=4. Chunked prefill caps extend T at max_prefill_tokens=16384
-  // (comm.py:876). Per-layer sconvs across TP={1,2,4,8}:
-  //   attn/mlp non-scattered : D=1536 / 6144  (same across TP)
-  //   attn/mlp scattered     : D=hidden/tp
-  //                            defaults: {1536,768,384,192}
-  //                            prod    : {6144,3072,1536,768}
-  //   k/v_sconv              : D=head_dim*num_tp_kv_heads = {512,256,128,128}
-  // Draft speculative decode: target-verify has T = B * draft_token_num, Q=9.
+  // See the geometry table above inkling_suite() for the three shipped
+  // configurations and the six-stream / TP dim derivation. Draft speculative
+  // decode: target-verify has T = B * draft_token_num (9 production, 3 for the
+  // shipped checkpoint). All cases run activation=None / use_residual=True.
   return {
       // Non-scattered attn/mlp sconv at both configs.
       {"perf_extend_t65536_d1536", 65536, 1536, 4, 64, 1024, false, false, true, false},
@@ -1200,6 +1301,54 @@ std::vector<CaseConfig> perf_suite() {
       {"perf_verify_b128_q9_d128", 1152, 128, 4, 128, 9, false, false, true, false},
       {"perf_verify_b128_q9_d6144", 1152, 6144, 4, 128, 9, false, false, true, false},
       {"perf_verify_b128_q9_d3072", 1152, 3072, 4, 128, 9, false, false, true, false},
+      // === Shipped checkpoint geometry (hidden=768, Nkv=2, swa_Nkv=4, hd=128) ===
+      // One sustained-bandwidth extend case per conv stream at TP={1,2,4,8}.
+      // T=65536 (B=64 x L=1024) matches the pre-existing perf_* extend cases so
+      // the numbers are directly comparable. minimum_streaming_bytes() here is
+      // ~3*T*D*sizeof(Element) with use_residual=true, i.e. 36 MiB at D=96 up to
+      // 288 MiB at D=768 -- large enough that the working set does not stay
+      // resident after warmup. This example gates on --target-gbps for every
+      // case (there is no minimum-bytes carve-out), and --target-gbps defaults
+      // to 0.0, so these rows are report-only until someone calibrates a number.
+      // Several rows below are byte-identical shapes under different names (the
+      // k_*/v_* pairs are always equal, and TP>=2 collapses several KV dims onto
+      // D=128). They are timed separately on purpose: the audit requirement is
+      // one row per (conv stream, TP) so a shape regression can be attributed to
+      // the stream that runs it. Use --shape= to time a single distinct shape.
+      {"perf_ckpt_tp1_k_full_t65536_d256", 65536, 256, 4, 64, 1024, false, false, true, false},
+      {"perf_ckpt_tp1_v_full_t65536_d256", 65536, 256, 4, 64, 1024, false, false, true, false},
+      {"perf_ckpt_tp1_k_local_t65536_d512", 65536, 512, 4, 64, 1024, false, false, true, false},
+      {"perf_ckpt_tp1_v_local_t65536_d512", 65536, 512, 4, 64, 1024, false, false, true, false},
+      {"perf_ckpt_tp1_attn_t65536_d768", 65536, 768, 4, 64, 1024, false, false, true, false},
+      {"perf_ckpt_tp1_mlp_t65536_d768", 65536, 768, 4, 64, 1024, false, false, true, false},
+      {"perf_ckpt_tp2_k_full_t65536_d128", 65536, 128, 4, 64, 1024, false, false, true, false},
+      {"perf_ckpt_tp2_v_full_t65536_d128", 65536, 128, 4, 64, 1024, false, false, true, false},
+      {"perf_ckpt_tp2_k_local_t65536_d256", 65536, 256, 4, 64, 1024, false, false, true, false},
+      {"perf_ckpt_tp2_v_local_t65536_d256", 65536, 256, 4, 64, 1024, false, false, true, false},
+      {"perf_ckpt_tp2_attn_t65536_d384", 65536, 384, 4, 64, 1024, false, false, true, false},
+      {"perf_ckpt_tp2_mlp_t65536_d384", 65536, 384, 4, 64, 1024, false, false, true, false},
+      {"perf_ckpt_tp4_k_full_t65536_d128", 65536, 128, 4, 64, 1024, false, false, true, false},
+      {"perf_ckpt_tp4_v_full_t65536_d128", 65536, 128, 4, 64, 1024, false, false, true, false},
+      {"perf_ckpt_tp4_k_local_t65536_d128", 65536, 128, 4, 64, 1024, false, false, true, false},
+      {"perf_ckpt_tp4_v_local_t65536_d128", 65536, 128, 4, 64, 1024, false, false, true, false},
+      {"perf_ckpt_tp4_attn_t65536_d192", 65536, 192, 4, 64, 1024, false, false, true, false},
+      {"perf_ckpt_tp4_mlp_t65536_d192", 65536, 192, 4, 64, 1024, false, false, true, false},
+      {"perf_ckpt_tp8_k_full_t65536_d128", 65536, 128, 4, 64, 1024, false, false, true, false},
+      {"perf_ckpt_tp8_v_full_t65536_d128", 65536, 128, 4, 64, 1024, false, false, true, false},
+      {"perf_ckpt_tp8_k_local_t65536_d128", 65536, 128, 4, 64, 1024, false, false, true, false},
+      {"perf_ckpt_tp8_v_local_t65536_d128", 65536, 128, 4, 64, 1024, false, false, true, false},
+      {"perf_ckpt_tp8_attn_t65536_d96", 65536, 96, 4, 64, 1024, false, false, true, false},
+      {"perf_ckpt_tp8_mlp_t65536_d96", 65536, 96, 4, 64, 1024, false, false, true, false},
+      // Checkpoint non-scattered ATTN/MLP: dim = hidden_size = 768 at every TP.
+      {"perf_ckpt_plain_attn_mlp_t65536_d768", 65536, 768, 4, 64, 1024, false, false, true, false},
+      // Checkpoint target-verify (draft_token_num=3) at each distinct stream dim.
+      {"perf_ckpt_verify_b128_q3_d96", 384, 96, 4, 128, 3, false, false, true, false},
+      {"perf_ckpt_verify_b128_q3_d128", 384, 128, 4, 128, 3, false, false, true, false},
+      {"perf_ckpt_verify_b128_q3_d192", 384, 192, 4, 128, 3, false, false, true, false},
+      {"perf_ckpt_verify_b128_q3_d256", 384, 256, 4, 128, 3, false, false, true, false},
+      {"perf_ckpt_verify_b128_q3_d384", 384, 384, 4, 128, 3, false, false, true, false},
+      {"perf_ckpt_verify_b128_q3_d512", 384, 512, 4, 128, 3, false, false, true, false},
+      {"perf_ckpt_verify_b128_q3_d768", 384, 768, 4, 128, 3, false, false, true, false},
   };
 }
 

@@ -876,6 +876,12 @@ bool run_case(
   return passed;
 }
 
+// Cases whose name is not prefixed ckpt_/dflt_/prod_ and that set use_silu=true
+// or use_residual=false are SYNTHETIC robustness coverage for the kernel's
+// template switches. The model never asks for them: ShortConvolution defaults to
+// activation=None / use_residual=True (models/inkling_common/sconv.py:64-65) and
+// none of its four construction sites overrides either argument
+// (models/inkling.py:237, :247; models/inkling_common/attn.py:359, :369).
 std::vector<CaseConfig> quick_suite() {
   return {
       make_case("tiny_w2_d7_pad_track", 5, 7, 2, true, false, true, true, true),
@@ -885,6 +891,93 @@ std::vector<CaseConfig> quick_suite() {
       make_case("dynamic_w5_d65_masked", 13, 65, 5, true, true, true, true, true),
       make_case("inkling_decode_b128_d1536", 128, 1536, 4, true, true, true, true, true),
       make_case("inkling_kv_decode_b128_d512", 128, 512, 4, false, false, true, true, false),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Shipped Inkling geometry: the six conv streams and their per-TP dims.
+//
+// srt/configs/inkling.py:215-253 (InklingModelConfig.mamba2_cache_params)
+// allocates SIX conv-state streams per layer, each (W-1, dim) in bfloat16 with
+// W-1 = sconv_kernel_size - 1 = 3, i.e. W = 4 (inkling.py:238, 250):
+//
+//   SconvType (models/inkling_common/sconv.py:28-35)   dim
+//   ---------------------------------------------------------------------------
+//   K_FULL, V_FULL     dim = max(1, num_key_value_heads     / P) * head_dim
+//   K_LOCAL, V_LOCAL   dim = max(1, swa_num_key_value_heads / P) * swa_head_dim
+//   ATTN, MLP          dim = hidden_size, or hidden_size / P when
+//                            --enable-scattered-sconv is set (inkling.py:231-237)
+//
+// The max(1, ...) KV replication rule is inkling.py:222-228 and
+// models/inkling_common/attn.py:297 -- a KV head is REPLICATED once the head
+// count is exhausted, so the stream dim floors at one head_dim.
+//
+// Shipped checkpoint (thinkingmachines/Inkling config.json text_config):
+// hidden_size=768, num_hidden_layers=8, num_attention_heads=8,
+// num_key_value_heads=2, head_dim=128, swa_num_key_value_heads=4,
+// swa_head_dim=128, sconv_kernel_size=4:
+//
+//   TP   K_FULL/V_FULL   K_LOCAL/V_LOCAL   ATTN/MLP (scattered)   ATTN/MLP (plain)
+//    1        256              512                768                  768
+//    2        128              256                384                  768
+//    4        128              128                192                  768
+//    8        128              128                 96                  768
+//
+// Config defaults (hidden=1536, Nkv=swa_Nkv=4, head_dim=128): K_*/V_* =
+// {512,256,128,128}, scattered ATTN/MLP = {1536,768,384,192}, plain = 1536.
+// Production (hidden=6144, same head geometry): K_*/V_* = {512,256,128,128},
+// scattered ATTN/MLP = {6144,3072,1536,768}, plain = 6144.
+//
+// This kernel is the fused DECODE path (one token per sequence), so T is the
+// decode batch. Every case below runs use_silu=false / use_residual=true, which
+// is how sconv.py calls it.
+// ---------------------------------------------------------------------------
+std::vector<CaseConfig> inkling_suite() {
+  return {
+      // === Shipped checkpoint: one decode case per conv stream at TP={1,2,4,8}.
+      make_case("ckpt_tp1_k_full_b128_d256", 128, 256, 4, true, true, false, true, true),
+      make_case("ckpt_tp1_v_full_b128_d256", 128, 256, 4, true, true, false, true, true),
+      make_case("ckpt_tp1_k_local_b128_d512", 128, 512, 4, true, true, false, true, true),
+      make_case("ckpt_tp1_v_local_b128_d512", 128, 512, 4, true, true, false, true, true),
+      make_case("ckpt_tp1_attn_b128_d768", 128, 768, 4, true, true, false, true, true),
+      make_case("ckpt_tp1_mlp_b128_d768", 128, 768, 4, true, true, false, true, true),
+      make_case("ckpt_tp2_k_full_b128_d128", 128, 128, 4, true, true, false, true, true),
+      make_case("ckpt_tp2_v_full_b128_d128", 128, 128, 4, true, true, false, true, true),
+      make_case("ckpt_tp2_k_local_b128_d256", 128, 256, 4, true, true, false, true, true),
+      make_case("ckpt_tp2_v_local_b128_d256", 128, 256, 4, true, true, false, true, true),
+      make_case("ckpt_tp2_attn_b128_d384", 128, 384, 4, true, true, false, true, true),
+      make_case("ckpt_tp2_mlp_b128_d384", 128, 384, 4, true, true, false, true, true),
+      make_case("ckpt_tp4_k_full_b128_d128", 128, 128, 4, true, true, false, true, true),
+      make_case("ckpt_tp4_v_full_b128_d128", 128, 128, 4, true, true, false, true, true),
+      make_case("ckpt_tp4_k_local_b128_d128", 128, 128, 4, true, true, false, true, true),
+      make_case("ckpt_tp4_v_local_b128_d128", 128, 128, 4, true, true, false, true, true),
+      make_case("ckpt_tp4_attn_b128_d192", 128, 192, 4, true, true, false, true, true),
+      make_case("ckpt_tp4_mlp_b128_d192", 128, 192, 4, true, true, false, true, true),
+      make_case("ckpt_tp8_k_full_b128_d128", 128, 128, 4, true, true, false, true, true),
+      make_case("ckpt_tp8_v_full_b128_d128", 128, 128, 4, true, true, false, true, true),
+      make_case("ckpt_tp8_k_local_b128_d128", 128, 128, 4, true, true, false, true, true),
+      make_case("ckpt_tp8_v_local_b128_d128", 128, 128, 4, true, true, false, true, true),
+      // 768/8 = 96 is the one checkpoint dim no other configuration produces.
+      make_case("ckpt_tp8_attn_b128_d96", 128, 96, 4, true, true, false, true, true),
+      make_case("ckpt_tp8_mlp_b128_d96", 128, 96, 4, true, true, false, true, true),
+      // Checkpoint non-scattered ATTN/MLP: dim = hidden_size = 768 at every TP.
+      make_case("ckpt_plain_attn_mlp_b128_d768", 128, 768, 4, true, true, false, true, true),
+      // === Config defaults (hidden=1536) and production (hidden=6144): one
+      // decode case per stream at TP={1,2,4,8}. K_*/V_* full and local dims
+      // coincide because swa_num_key_value_heads defaults to
+      // num_key_value_heads (inkling.py:82-83).
+      make_case("dflt_tp1_kv_b128_d512", 128, 512, 4, true, true, false, true, true),
+      make_case("dflt_tp2_kv_b128_d256", 128, 256, 4, true, true, false, true, true),
+      make_case("dflt_tp4_kv_b128_d128", 128, 128, 4, true, true, false, true, true),
+      make_case("dflt_tp8_kv_b128_d128", 128, 128, 4, true, true, false, true, true),
+      make_case("dflt_tp1_attn_mlp_b128_d1536", 128, 1536, 4, true, true, false, true, true),
+      make_case("dflt_tp2_attn_mlp_b128_d768", 128, 768, 4, true, true, false, true, true),
+      make_case("dflt_tp4_attn_mlp_b128_d384", 128, 384, 4, true, true, false, true, true),
+      make_case("dflt_tp8_attn_mlp_b128_d192", 128, 192, 4, true, true, false, true, true),
+      make_case("prod_tp1_attn_mlp_b128_d6144", 128, 6144, 4, true, true, false, true, true),
+      make_case("prod_tp2_attn_mlp_b128_d3072", 128, 3072, 4, true, true, false, true, true),
+      make_case("prod_tp4_attn_mlp_b128_d1536", 128, 1536, 4, true, true, false, true, true),
+      make_case("prod_tp8_attn_mlp_b128_d768", 128, 768, 4, true, true, false, true, true),
   };
 }
 
@@ -911,6 +1004,48 @@ std::vector<CaseConfig> perf_suite() {
       make_case("perf_kv_t131072_d512", 131072, 512, 4, false, false, true, true, false),
       make_case("perf_kv_t131072_d256", 131072, 256, 4, false, false, true, true, false),
       make_case("perf_kv_t262144_d128", 262144, 128, 4, false, false, true, true, false),
+      // === Shipped checkpoint geometry (hidden=768, Nkv=2, swa_Nkv=4, hd=128):
+      // one sustained decode case per conv stream at TP={1,2,4,8}. See the table
+      // above inkling_suite(). T is scaled up for narrow D so each case stays
+      // past kMinSustainedTargetBytes. All run activation=None / residual=True,
+      // matching the model (unlike the silu cases above, which are synthetic).
+      // Several rows below are byte-identical shapes under different names (the
+      // k_*/v_* pairs are always equal, and TP>=2 collapses several KV dims onto
+      // D=128); they are kept distinct so a regression is attributable to the
+      // conv stream that runs it. Use --shape= to time one distinct shape.
+      make_case("perf_ckpt_tp1_k_full_t131072_d256", 131072, 256, 4, false, false, false, true, false),
+      make_case("perf_ckpt_tp1_v_full_t131072_d256", 131072, 256, 4, false, false, false, true, false),
+      make_case("perf_ckpt_tp1_k_local_t131072_d512", 131072, 512, 4, false, false, false, true, false),
+      make_case("perf_ckpt_tp1_v_local_t131072_d512", 131072, 512, 4, false, false, false, true, false),
+      make_case("perf_ckpt_tp1_attn_t65536_d768", 65536, 768, 4, false, false, false, true, false),
+      make_case("perf_ckpt_tp1_mlp_t65536_d768", 65536, 768, 4, false, false, false, true, false),
+      make_case("perf_ckpt_tp2_k_full_t262144_d128", 262144, 128, 4, false, false, false, true, false),
+      make_case("perf_ckpt_tp2_v_full_t262144_d128", 262144, 128, 4, false, false, false, true, false),
+      make_case("perf_ckpt_tp2_k_local_t131072_d256", 131072, 256, 4, false, false, false, true, false),
+      make_case("perf_ckpt_tp2_v_local_t131072_d256", 131072, 256, 4, false, false, false, true, false),
+      make_case("perf_ckpt_tp2_attn_t131072_d384", 131072, 384, 4, false, false, false, true, false),
+      make_case("perf_ckpt_tp2_mlp_t131072_d384", 131072, 384, 4, false, false, false, true, false),
+      make_case("perf_ckpt_tp4_k_full_t262144_d128", 262144, 128, 4, false, false, false, true, false),
+      make_case("perf_ckpt_tp4_v_full_t262144_d128", 262144, 128, 4, false, false, false, true, false),
+      make_case("perf_ckpt_tp4_k_local_t262144_d128", 262144, 128, 4, false, false, false, true, false),
+      make_case("perf_ckpt_tp4_v_local_t262144_d128", 262144, 128, 4, false, false, false, true, false),
+      make_case("perf_ckpt_tp4_attn_t262144_d192", 262144, 192, 4, false, false, false, true, false),
+      make_case("perf_ckpt_tp4_mlp_t262144_d192", 262144, 192, 4, false, false, false, true, false),
+      make_case("perf_ckpt_tp8_k_full_t262144_d128", 262144, 128, 4, false, false, false, true, false),
+      make_case("perf_ckpt_tp8_v_full_t262144_d128", 262144, 128, 4, false, false, false, true, false),
+      make_case("perf_ckpt_tp8_k_local_t262144_d128", 262144, 128, 4, false, false, false, true, false),
+      make_case("perf_ckpt_tp8_v_local_t262144_d128", 262144, 128, 4, false, false, false, true, false),
+      // D=96 needs T=393216 (not 262144) to clear kMinSustainedTargetBytes:
+      // effective_bytes() here is 20*T*D, and 20*262144*96 = 480 MiB < 512 MiB.
+      make_case("perf_ckpt_tp8_attn_t393216_d96", 393216, 96, 4, false, false, false, true, false),
+      make_case("perf_ckpt_tp8_mlp_t393216_d96", 393216, 96, 4, false, false, false, true, false),
+      // Checkpoint non-scattered ATTN/MLP: dim = hidden_size = 768 at every TP.
+      make_case("perf_ckpt_plain_attn_mlp_t65536_d768", 65536, 768, 4, false, false, false, true, false),
+      // Production (hidden=6144) non-scattered ATTN/MLP + scattered TP={2,4,8}.
+      make_case("perf_prod_tp1_attn_mlp_t16384_d6144", 16384, 6144, 4, false, false, false, true, false),
+      make_case("perf_prod_tp2_attn_mlp_t32768_d3072", 32768, 3072, 4, false, false, false, true, false),
+      make_case("perf_prod_tp4_attn_mlp_t65536_d1536", 65536, 1536, 4, false, false, false, true, false),
+      make_case("perf_prod_tp8_attn_mlp_t65536_d768", 65536, 768, 4, false, false, false, true, false),
   };
 }
 
@@ -993,7 +1128,8 @@ struct Options {
     out << "Inkling BMG Fused Decode SConv Update Example\n\n"
         << "Options:\n"
         << "  --help                         Print this message\n"
-        << "  --suite=<quick|stress|perf>     Built-in shape suite (default: quick)\n"
+        << "  --suite=<quick|inkling|stress|perf>\n"
+        << "                                  Built-in shape suite (default: quick)\n"
         << "  --shape=<k=v,...>               Run one custom shape instead of a suite\n"
         << "                                  Keys: name,T,D,W,pad,masked,silu,residual,track,seed\n"
         << "  --dtype=<all|bf16|fp16>         Input/cache/output dtype (default: all)\n"
@@ -1038,6 +1174,8 @@ int main(int argc, char const** argv) {
     cases.push_back(cfg);
   } else if (options.suite == "quick") {
     cases = quick_suite();
+  } else if (options.suite == "inkling") {
+    cases = inkling_suite();
   } else if (options.suite == "stress") {
     cases = stress_suite();
   } else if (options.suite == "perf") {
